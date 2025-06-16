@@ -34,3 +34,5 @@ django>=5.0.0
 
 aiohttp==3.11.10
 requests==2.32.3
+
+brotli==1.1.0

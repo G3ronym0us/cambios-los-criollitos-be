@@ -40,7 +40,7 @@ class BinanceP2PScraperService:
             print(f"❌ Error inicializando scraper HTTP: {e}")
             return False
 
-    async def _get_p2p_data(self, fiat: Currency, crypto: Currency = Currency.USDT, trade_type: str = 'BUY', payment_method: List[str] = [], amount: Optional[float] = None):
+    async def _get_p2p_data(self, fiat: str, crypto: str = 'USDT', trade_type: str = 'BUY', payment_method: List[str] = [], amount: Optional[float] = None):
         """Obtener datos de P2P usando la API interna de Binance"""
         
         # URL de la API interna de Binance P2P
@@ -57,17 +57,14 @@ class BinanceP2PScraperService:
             "publisherType": None,
             "merchantCheck": False,
             "countries": [],
+            "transAmount": amount
         }
-        
-        # Agregar monto si se especifica
-        if amount is not None:
-            payload["transAmount"] = amount
         
         try:
             if not self.session:
                 await self.initialize()
             
-            print(f"🔍 Consultando API Binance P2P: {fiat.value} {trade_type} {payment_method or 'ALL'}")
+            print(f"🔍 Consultando API P2P: {fiat} {trade_type} {payment_method or 'ALL'}")
             
             async with self.session.post(url, json=payload) as response:
                 if response.status == 200:
@@ -78,38 +75,27 @@ class BinanceP2PScraperService:
                         
                         if ads:
                             # Tomar el primer anuncio (mejor precio)
-                            first_ad = ads[0]
+                            first_ad = ads[0] if len(ads) > 0 else None
                             price = float(first_ad['adv']['price'])
                             
-                            # Información adicional del anuncio
-                            merchant_name = first_ad['advertiser']['nickName']
-                            completion_rate = first_ad['advertiser']['monthFinishRate']
-                            orders_count = first_ad['advertiser']['monthOrderCount']
-                            
-                            print(f"✅ Precio Binance obtenido para {fiat.value} {trade_type}: {price}")
-                            print(f"   📊 Comerciante: {merchant_name}")
-                            print(f"   ⭐ Tasa completación mensual: {completion_rate}")
-                            print(f"   📦 Órdenes del mes: {orders_count}")
-                            
+                            print(f"✅ Precio obtenido para {fiat} {trade_type}: {price}")
                             return price
                         else:
-                            print(f"⚠️ No se encontraron anuncios para {fiat.value} {trade_type}")
+                            print(f"⚠️ No se encontraron anuncios para {fiat} {trade_type}")
                             return None
                     else:
-                        print(f"❌ Respuesta API Binance inválida: {data}")
+                        print(f"❌ Respuesta API inválida: {data}")
                         return None
                 else:
-                    print(f"❌ Error HTTP Binance {response.status}")
-                    response_text = await response.text()
-                    print(f"   Respuesta: {response_text[:200]}...")
+                    print(f"❌ Error HTTP {response.status}")
                     return None
                     
         except Exception as e:
-            print(f"❌ Error consultando API Binance P2P: {e}")
+            print(f"❌ Error consultando API P2P: {e}")
             return None
 
     async def get_offers(self, fiat: Currency, crypto: Currency, payment_method: List[str], side: str = 'buy', amount: Optional[float] = None):
-        """Obtener ofertas P2P de Binance"""
+        """Obtener ofertas P2P"""
         
         # Mapear side a trade_type
         trade_type = 'BUY' if side.lower() == 'buy' else 'SELL'
@@ -119,14 +105,14 @@ class BinanceP2PScraperService:
         
         return price
 
-    async def get_all_rates(self) -> List[ExchangeRate]:
-        """Obtener todas las tasas de cambio usando solo Binance P2P"""
+    async def get_all_rates(self) -> Dict[str, Dict[str, float]]:
+        """Obtener todas las tasas de manera asíncrona"""
         
         if not self.session:
             success = await self.initialize()
             if not success:
                 print("❌ No se pudo inicializar el scraper HTTP")
-                return []
+                return {}
         
         try:
             print("🔄 Obteniendo tasas de Binance P2P via API...")
@@ -134,141 +120,78 @@ class BinanceP2PScraperService:
             # Crear tareas para obtener todos los precios en paralelo
             tasks = []
             
-            # Precios VES (Bolívares Venezolanos)
-            tasks.append(self.get_offers(Currency.VES, Currency.USDT, ['BANK', 'SpecificBank'], 'buy', 20000))
-            tasks.append(self.get_offers(Currency.VES, Currency.USDT, ['BANK', 'SpecificBank'], 'sell', 20000))
+            # Precios VES
+            tasks.append(self.get_offers(Currency.VES, Currency.USDT, ['BANK', "SpecificBank"], 'buy', 20000))
+            tasks.append(self.get_offers(Currency.VES, Currency.USDT, ['BANK', "SpecificBank"], 'sell', 20000))
             
-            # Precios COP (Pesos Colombianos)
+            # Precios COP
             tasks.append(self.get_offers(Currency.COP, Currency.USDT, ['BancolombiaSA'], 'buy', 500000))
             tasks.append(self.get_offers(Currency.COP, Currency.USDT, ['BancolombiaSA'], 'sell', 500000))
             
-            # Precios BRL (Reales Brasileños)
+            # Precios BRL
             tasks.append(self.get_offers(Currency.BRL, Currency.USDT, ['PIX'], 'buy', 500))
             tasks.append(self.get_offers(Currency.BRL, Currency.USDT, ['PIX'], 'sell', 500))
             
             # Ejecutar todas las tareas en paralelo
-            print("⏳ Ejecutando consultas en paralelo...")
             results = await asyncio.gather(*tasks, return_exceptions=True)
             
             # Procesar resultados
             ves_buy, ves_sell, cop_buy, cop_sell, brl_buy, brl_sell = results
 
-            # Función para validar precios
-            def safe_price(price):
-                if isinstance(price, Exception):
-                    print(f"⚠️ Excepción capturada: {price}")
-                    return None
-                return price if isinstance(price, (int, float)) and price is not None and price > 0 else None
-            
-            # Validar todos los precios
-            ves_buy = safe_price(ves_buy)
-            ves_sell = safe_price(ves_sell)
-            cop_buy = safe_price(cop_buy)
-            cop_sell = safe_price(cop_sell)
-            brl_buy = safe_price(brl_buy)
-            brl_sell = safe_price(brl_sell)
-
-            print(f"📊 Precios base obtenidos:")
-            print(f"   💰 VES/USDT: Buy={ves_buy}, Sell={ves_sell}")
-            print(f"   💰 COP/USDT: Buy={cop_buy}, Sell={cop_sell}")
-            print(f"   💰 BRL/USDT: Buy={brl_buy}, Sell={brl_sell}")
-
             rates: List[ExchangeRate] = []
 
-            # === TASAS PRINCIPALES CON USDT ===
-            if ves_buy:
-                rates.append(ExchangeRate.create_safe(Currency.VES, Currency.USDT, ves_buy))
-            if ves_sell:
-                rates.append(ExchangeRate.create_safe(Currency.USDT, Currency.VES, ves_sell))
-            if cop_buy:
-                rates.append(ExchangeRate.create_safe(Currency.COP, Currency.USDT, cop_buy))
-            if cop_sell:
-                rates.append(ExchangeRate.create_safe(Currency.USDT, Currency.COP, cop_sell))
-            if brl_buy:
-                rates.append(ExchangeRate.create_safe(Currency.BRL, Currency.USDT, brl_buy))
-            if brl_sell:
-                rates.append(ExchangeRate.create_safe(Currency.USDT, Currency.BRL, brl_sell))
+            rates.append(ExchangeRate.create_safe(Currency.VES, Currency.USDT, ves_buy))
+            rates.append(ExchangeRate.create_safe(Currency.USDT, Currency.VES, ves_sell))
+            rates.append(ExchangeRate.create_safe(Currency.COP, Currency.USDT, cop_buy))
+            rates.append(ExchangeRate.create_safe(Currency.USDT, Currency.COP, cop_sell))
+            rates.append(ExchangeRate.create_safe(Currency.BRL, Currency.USDT, brl_buy))
+            rates.append(ExchangeRate.create_safe(Currency.USDT, Currency.BRL, brl_sell))
 
-            # === TASAS DERIVADAS CON ZELLE ===
-            print("💳 Calculando tasas derivadas con Zelle...")
-            if ves_buy:
-                rates.append(ExchangeRate.create_safe(Currency.VES, Currency.ZELLE, ves_buy, 5, inverse_percentage=True))
-            if ves_sell:
-                rates.append(ExchangeRate.create_safe(Currency.ZELLE, Currency.VES, ves_sell, 10))
-            if cop_buy:
-                rates.append(ExchangeRate.create_safe(Currency.COP, Currency.ZELLE, cop_buy, 10))
-            if cop_sell:
-                rates.append(ExchangeRate.create_safe(Currency.ZELLE, Currency.COP, cop_sell, 10))
-            if brl_buy:
-                rates.append(ExchangeRate.create_safe(Currency.BRL, Currency.ZELLE, brl_buy, 10))
-            if brl_sell:
-                rates.append(ExchangeRate.create_safe(Currency.ZELLE, Currency.BRL, brl_sell, 10))
+            rates.append(ExchangeRate.create_safe(Currency.VES, Currency.ZELLE, ves_buy, 5, inverse_percentage=True))
+            rates.append(ExchangeRate.create_safe(Currency.ZELLE, Currency.VES, ves_sell, 10))
+            rates.append(ExchangeRate.create_safe(Currency.COP, Currency.ZELLE, cop_buy, 10))
+            rates.append(ExchangeRate.create_safe(Currency.ZELLE, Currency.COP, cop_sell, 10))
+            rates.append(ExchangeRate.create_safe(Currency.BRL, Currency.ZELLE, brl_buy, 10))
+            rates.append(ExchangeRate.create_safe(Currency.ZELLE, Currency.BRL, brl_sell, 10))
 
-            # === TASAS DERIVADAS CON PAYPAL ===
-            print("💳 Calculando tasas derivadas con PayPal...")
-            if ves_buy:
-                rates.append(ExchangeRate.create_safe(Currency.VES, Currency.PAYPAL, ves_buy, 8, inverse_percentage=True))
-            if ves_sell:
-                rates.append(ExchangeRate.create_safe(Currency.PAYPAL, Currency.VES, ves_sell, 13))
-            if cop_buy:
-                rates.append(ExchangeRate.create_safe(Currency.COP, Currency.PAYPAL, cop_buy, 13))
-            if cop_sell:
-                rates.append(ExchangeRate.create_safe(Currency.PAYPAL, Currency.COP, cop_sell, 13))
-            if brl_buy:
-                rates.append(ExchangeRate.create_safe(Currency.BRL, Currency.PAYPAL, brl_buy, 13))
-            if brl_sell:
-                rates.append(ExchangeRate.create_safe(Currency.PAYPAL, Currency.BRL, brl_sell, 13))
+            rates.append(ExchangeRate.create_safe(Currency.VES, Currency.PAYPAL, ves_buy, 8, inverse_percentage=True))
+            rates.append(ExchangeRate.create_safe(Currency.PAYPAL, Currency.VES, ves_sell, 13))
+            rates.append(ExchangeRate.create_safe(Currency.COP, Currency.PAYPAL, cop_buy, 13))
+            rates.append(ExchangeRate.create_safe(Currency.PAYPAL, Currency.COP, cop_sell, 13))
+            rates.append(ExchangeRate.create_safe(Currency.BRL, Currency.PAYPAL, brl_buy, 13))
+            rates.append(ExchangeRate.create_safe(Currency.PAYPAL, Currency.BRL, brl_sell, 13))
 
-            # === TASAS CRUZADAS ENTRE FIAT ===
-            print("🔄 Calculando tasas cruzadas entre monedas fiat...")
-            if all(x is not None for x in [ves_buy, ves_sell, cop_buy, cop_sell, brl_buy, brl_sell]):
-                # VES <-> COP
-                ves_to_cop = cop_sell / ves_buy if cop_sell and ves_buy else None
-                cop_to_ves = ves_sell / cop_buy if ves_sell and cop_buy else None
-                
-                # VES <-> BRL
-                ves_to_brl = brl_sell / ves_buy if brl_sell and ves_buy else None
-                brl_to_ves = ves_sell / brl_buy if ves_sell and brl_buy else None
-                
-                # COP <-> BRL
-                cop_to_brl = brl_sell / cop_buy if brl_sell and cop_buy else None
-                brl_to_cop = cop_sell / brl_buy if cop_sell and brl_buy else None
+            ves_to_cop = cop_sell / ves_buy if cop_sell > ves_buy else ves_buy / cop_sell
+            cop_to_ves = ves_sell / cop_buy if ves_sell > cop_buy else cop_buy / ves_sell
+            brl_to_ves = ves_sell / brl_buy if ves_sell > brl_buy else brl_buy / ves_sell
+            ves_to_brl = brl_sell / ves_buy if brl_sell > ves_buy else ves_buy / brl_sell
+            cop_to_brl = cop_sell / brl_buy if cop_sell > brl_buy else brl_buy / cop_sell
+            brl_to_cop = brl_sell / cop_buy if brl_sell > cop_buy else cop_buy / brl_sell
 
-                if ves_to_cop:
-                    rates.append(ExchangeRate.create_safe(Currency.VES, Currency.COP, ves_to_cop, 8))
-                if cop_to_ves:
-                    rates.append(ExchangeRate.create_safe(Currency.COP, Currency.VES, cop_to_ves, 8))
-                if ves_to_brl:
-                    rates.append(ExchangeRate.create_safe(Currency.VES, Currency.BRL, ves_to_brl, 6))
-                if brl_to_ves:
-                    rates.append(ExchangeRate.create_safe(Currency.BRL, Currency.VES, brl_to_ves, 6))
-                if cop_to_brl:
-                    rates.append(ExchangeRate.create_safe(Currency.COP, Currency.BRL, cop_to_brl, 8))
-                if brl_to_cop:
-                    rates.append(ExchangeRate.create_safe(Currency.BRL, Currency.COP, brl_to_cop, 8))
+            rates.append(ExchangeRate.create_safe(Currency.VES, Currency.BRL, ves_to_brl, 6, inverse_percentage=ves_sell > brl_buy))
+            rates.append(ExchangeRate.create_safe(Currency.BRL, Currency.VES, brl_to_ves, 6, inverse_percentage=brl_sell > ves_buy))
+            rates.append(ExchangeRate.create_safe(Currency.COP, Currency.BRL, cop_to_brl, 8, inverse_percentage=cop_sell > brl_buy))
+            rates.append(ExchangeRate.create_safe(Currency.BRL, Currency.COP, brl_to_cop, 8, inverse_percentage=brl_sell > cop_buy))
+            rates.append(ExchangeRate.create_safe(Currency.COP, Currency.VES, cop_to_ves, 8, inverse_percentage=cop_sell > ves_buy))
+            rates.append(ExchangeRate.create_safe(Currency.VES, Currency.COP, ves_to_cop, 8, inverse_percentage=ves_sell > cop_buy))
             
-            # Filtrar valores válidos
-            valid_rates = [rate for rate in rates if rate is not None]
-            valid_count = len(valid_rates)
+            # Filtrar excepciones   
+            def safe_price(price):
+                return price if isinstance(price, (int, float)) and price is not None else None
             
-            if valid_count > 0:
-                print(f"✅ {valid_count} tasas calculadas exitosamente")
-                print(f"📈 Resumen de tasas:")
-                print(f"   🔹 USDT: {sum(1 for r in valid_rates if 'USDT' in [r.from_currency.value, r.to_currency.value])} tasas")
-                print(f"   🔹 Zelle: {sum(1 for r in valid_rates if 'ZELLE' in [r.from_currency.value, r.to_currency.value])} tasas")
-                print(f"   🔹 PayPal: {sum(1 for r in valid_rates if 'PAYPAL' in [r.from_currency.value, r.to_currency.value])} tasas")
-                print(f"   🔹 Cruzadas: {sum(1 for r in valid_rates if all(c in ['VES', 'COP', 'BRL'] for c in [r.from_currency.value, r.to_currency.value]))} tasas")
-                
-                return valid_rates
+            # Verificar que obtuvimos al menos algunos precios
+            valid_prices = sum(1 for value in rates if value is not None)
+            
+            if valid_prices > 0:
+                print(f"📊 {valid_prices}/6 precios obtenidos exitosamente")
+                return rates
             else:
-                print("❌ No se pudieron obtener tasas válidas")
-                return []
+                print("❌ No se pudieron obtener precios válidos")
+                return {}
             
         except Exception as e:
             print(f"❌ Error obteniendo tasas: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
+            return {}
 
     async def close(self):
         """Cerrar sesión HTTP"""

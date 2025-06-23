@@ -69,9 +69,8 @@ class BinanceP2PScraperService:
             async with self.session.post(url, json=payload) as response:
                 if response.status == 200:
                     data = await response.json()
-                    
-                    if data.get('success') and data.get('data'):
-                        ads = data['data']
+                    if data.get('success'):
+                        ads = data.get('data', [])
                         
                         if ads:
                             # Tomar el primer anuncio (mejor precio)
@@ -84,6 +83,8 @@ class BinanceP2PScraperService:
                             print(f"⚠️ No se encontraron anuncios para {fiat} {trade_type}")
                             return None
                     else:
+                        print(f"�� Respuesta API P2P: {data.get('success')}")
+                        print(f"�� Respuesta API P2P: {data.get('data')}")
                         print(f"❌ Respuesta API inválida: {data}")
                         return None
                 else:
@@ -104,6 +105,32 @@ class BinanceP2PScraperService:
         price = await self._get_p2p_data(fiat, crypto, trade_type, payment_method, amount)
         
         return price
+    
+    def add_rate_to_rates(
+        self, 
+        rates: List[ExchangeRate], 
+        from_currency: Currency, 
+        to_currency: Currency, 
+        rate: float, 
+        percentage: float = None, 
+        inverse_percentage: bool = False
+    ):
+        if rate is not None:
+            rates.append(ExchangeRate.create_safe(from_currency, to_currency, rate, percentage=percentage, inverse_percentage=inverse_percentage))
+
+    def add_cross_rate_to_rates(
+        self, 
+        rates: List[ExchangeRate], 
+        from_currency: Currency, 
+        from_rate: float,
+        to_currency: Currency, 
+        to_rate: float, 
+        percentage: float = 0,
+    ):
+        if from_rate is not None and to_rate is not None:
+            rate = from_rate / to_rate if from_rate > to_rate else to_rate / from_rate
+            inverse_percentage = from_rate > to_rate
+            self.add_rate_to_rates(rates, from_currency, to_currency, rate, percentage, inverse_percentage)
 
     async def get_all_rates(self) -> Dict[str, Dict[str, float]]:
         """Obtener todas las tasas de manera asíncrona"""
@@ -140,41 +167,35 @@ class BinanceP2PScraperService:
 
             rates: List[ExchangeRate] = []
 
-            rates.append(ExchangeRate.create_safe(Currency.VES, Currency.USDT, ves_buy))
-            rates.append(ExchangeRate.create_safe(Currency.USDT, Currency.VES, ves_sell))
-            rates.append(ExchangeRate.create_safe(Currency.COP, Currency.USDT, cop_buy))
-            rates.append(ExchangeRate.create_safe(Currency.USDT, Currency.COP, cop_sell))
-            rates.append(ExchangeRate.create_safe(Currency.BRL, Currency.USDT, brl_buy))
-            rates.append(ExchangeRate.create_safe(Currency.USDT, Currency.BRL, brl_sell))
 
-            rates.append(ExchangeRate.create_safe(Currency.VES, Currency.ZELLE, ves_buy, 5, inverse_percentage=True))
-            rates.append(ExchangeRate.create_safe(Currency.ZELLE, Currency.VES, ves_sell, 10))
-            rates.append(ExchangeRate.create_safe(Currency.COP, Currency.ZELLE, cop_buy, 10))
-            rates.append(ExchangeRate.create_safe(Currency.ZELLE, Currency.COP, cop_sell, 10))
-            rates.append(ExchangeRate.create_safe(Currency.BRL, Currency.ZELLE, brl_buy, 10))
-            rates.append(ExchangeRate.create_safe(Currency.ZELLE, Currency.BRL, brl_sell, 10))
+            self.add_rate_to_rates(rates, Currency.VES, Currency.USDT, ves_buy)
+            self.add_rate_to_rates(rates, Currency.USDT, Currency.VES, ves_sell)
+            self.add_rate_to_rates(rates, Currency.COP, Currency.USDT, cop_buy)
+            self.add_rate_to_rates(rates, Currency.USDT, Currency.COP, cop_sell)
+            self.add_rate_to_rates(rates, Currency.BRL, Currency.USDT, brl_buy)
+            self.add_rate_to_rates(rates, Currency.USDT, Currency.BRL, brl_sell)
 
-            rates.append(ExchangeRate.create_safe(Currency.VES, Currency.PAYPAL, ves_buy, 8, inverse_percentage=True))
-            rates.append(ExchangeRate.create_safe(Currency.PAYPAL, Currency.VES, ves_sell, 13))
-            rates.append(ExchangeRate.create_safe(Currency.COP, Currency.PAYPAL, cop_buy, 13))
-            rates.append(ExchangeRate.create_safe(Currency.PAYPAL, Currency.COP, cop_sell, 13))
-            rates.append(ExchangeRate.create_safe(Currency.BRL, Currency.PAYPAL, brl_buy, 13))
-            rates.append(ExchangeRate.create_safe(Currency.PAYPAL, Currency.BRL, brl_sell, 13))
+            self.add_rate_to_rates(rates, Currency.VES, Currency.ZELLE, ves_buy, 5, inverse_percentage=True)
+            self.add_rate_to_rates(rates, Currency.ZELLE, Currency.VES, ves_sell, 10)
+            self.add_rate_to_rates(rates, Currency.COP, Currency.ZELLE, cop_buy, 10)
+            self.add_rate_to_rates(rates, Currency.ZELLE, Currency.COP, cop_sell, 10)
+            self.add_rate_to_rates(rates, Currency.BRL, Currency.ZELLE, brl_buy, 10)
+            self.add_rate_to_rates(rates, Currency.ZELLE, Currency.BRL, brl_sell, 10)
 
-            ves_to_cop = cop_sell / ves_buy if cop_sell > ves_buy else ves_buy / cop_sell
-            cop_to_ves = ves_sell / cop_buy if ves_sell > cop_buy else cop_buy / ves_sell
-            brl_to_ves = ves_sell / brl_buy if ves_sell > brl_buy else brl_buy / ves_sell
-            ves_to_brl = brl_sell / ves_buy if brl_sell > ves_buy else ves_buy / brl_sell
-            cop_to_brl = cop_sell / brl_buy if cop_sell > brl_buy else brl_buy / cop_sell
-            brl_to_cop = brl_sell / cop_buy if brl_sell > cop_buy else cop_buy / brl_sell
+            self.add_rate_to_rates(rates, Currency.VES, Currency.PAYPAL, ves_buy, 8, inverse_percentage=True)
+            self.add_rate_to_rates(rates, Currency.PAYPAL, Currency.VES, ves_sell, 13)
+            self.add_rate_to_rates(rates, Currency.COP, Currency.PAYPAL, cop_buy, 13)
+            self.add_rate_to_rates(rates, Currency.PAYPAL, Currency.COP, cop_sell, 13)
+            self.add_rate_to_rates(rates, Currency.BRL, Currency.PAYPAL, brl_buy, 13)
+            self.add_rate_to_rates(rates, Currency.PAYPAL, Currency.BRL, brl_sell, 13)
 
-            rates.append(ExchangeRate.create_safe(Currency.VES, Currency.BRL, ves_to_brl, 6, inverse_percentage=ves_sell > brl_buy))
-            rates.append(ExchangeRate.create_safe(Currency.BRL, Currency.VES, brl_to_ves, 6, inverse_percentage=brl_sell > ves_buy))
-            rates.append(ExchangeRate.create_safe(Currency.COP, Currency.BRL, cop_to_brl, 8, inverse_percentage=cop_sell > brl_buy))
-            rates.append(ExchangeRate.create_safe(Currency.BRL, Currency.COP, brl_to_cop, 8, inverse_percentage=brl_sell > cop_buy))
-            rates.append(ExchangeRate.create_safe(Currency.COP, Currency.VES, cop_to_ves, 8, inverse_percentage=cop_sell > ves_buy))
-            rates.append(ExchangeRate.create_safe(Currency.VES, Currency.COP, ves_to_cop, 8, inverse_percentage=ves_sell > cop_buy))
-            
+            self.add_cross_rate_to_rates(rates, Currency.VES, ves_buy, Currency.COP, cop_sell, 8)
+            self.add_cross_rate_to_rates(rates, Currency.COP, cop_buy, Currency.VES, ves_sell, 8)
+            self.add_cross_rate_to_rates(rates, Currency.BRL, brl_buy, Currency.VES, ves_sell, 6)
+            self.add_cross_rate_to_rates(rates, Currency.VES, ves_buy, Currency.BRL, brl_sell, 6)
+            self.add_cross_rate_to_rates(rates, Currency.COP, cop_buy, Currency.BRL, brl_sell, 8)
+            self.add_cross_rate_to_rates(rates, Currency.BRL, brl_buy, Currency.COP, cop_sell, 8)
+
             # Filtrar excepciones   
             def safe_price(price):
                 return price if isinstance(price, (int, float)) and price is not None else None

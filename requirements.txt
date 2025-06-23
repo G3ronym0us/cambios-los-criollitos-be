@@ -5,6 +5,7 @@ python-multipart==0.0.6
 
 # Validación de datos
 pydantic==2.5.0
+pydantic-settings==2.0.1
 
 # WebSockets
 websockets==12.0
@@ -36,3 +37,5 @@ aiohttp==3.11.10
 requests==2.32.3
 
 brotli==1.1.0
+
+alembic==1.13.0

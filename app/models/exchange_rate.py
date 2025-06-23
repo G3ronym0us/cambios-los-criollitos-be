@@ -1,69 +1,39 @@
-from dataclasses import dataclass
-from typing import Optional
-from app.enums.currency_enun import Currency
+from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean
+from sqlalchemy.sql import func
+from app.database.connection import Base
 
-@dataclass
-class ExchangeRate:
-    """
-    Clase que representa una tasa de cambio entre dos monedas.
-    
-    Attributes:
-        from_currency (Currency): Moneda de origen
-        to_currency (Currency): Moneda de destino
-        value (float): Valor de la tasa de cambio
-    """
-    from_currency: Currency
-    to_currency: Currency
-    value: float
-    inverse: bool = False
+class ExchangeRate(Base):
+    __tablename__ = "exchange_rates"
 
-    def __post_init__(self):
-        """
-        Validación post-inicialización para asegurar que el valor sea positivo.
-        """
-        if self.value <= 0:
-            raise ValueError("El valor de la tasa de cambio debe ser positivo")
+    id = Column(Integer, primary_key=True, index=True)
+    from_currency = Column(String(10), nullable=False, index=True)
+    to_currency = Column(String(10), nullable=False, index=True)
+    rate = Column(Float, nullable=False)
+    source = Column(String(50), nullable=False)  # 'binance', 'manual', etc.
+    is_active = Column(Boolean, default=True)
+    inverse_percentage = Column(Float, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    def __repr__(self):
+        return f"<ExchangeRate({self.from_currency}->{self.to_currency}: {self.rate})>"
 
     @classmethod
-    def create_safe(
-        cls,
-        from_currency: Currency,
-        to_currency: Currency,
-        value: Optional[float],
-        percentage: Optional[float] = None,
-        inverse_percentage: Optional[bool] = False,
-        min_value: Optional[float] = None
-    ) -> Optional['ExchangeRate']:
-        """
-        Crea una instancia de ExchangeRate de manera segura, retornando None si el valor es None o inválido.
-        
-        Args:
-            from_currency (Currency): Moneda de origen
-            to_currency (Currency): Moneda de destino
-            value (Optional[float]): Valor de la tasa de cambio
-            percentage (Optional[float]): Porcentaje de la tasa de cambio
-        Returns:
-            Optional[ExchangeRate]: Instancia de ExchangeRate o None si el valor es inválido
-        """
-        if value is None or not isinstance(value, (int, float)) or value <= 0:
+    def create_safe(cls, from_currency, to_currency, rate, source="binance", percentage=None, inverse_percentage=False):
+        """Método factory para crear tasas de cambio de forma segura"""
+        if rate is None or rate <= 0:
             return None
+        
         if percentage is not None:
             if inverse_percentage:
-                value = value * (1 + (percentage / 100))
+                rate = rate * (1 + (percentage / 100))
             else:
-                value = value * (1 - (percentage / 100))
-        return cls(from_currency=from_currency, to_currency=to_currency, value=value, inverse=inverse_percentage)
-
-    def to_dict(self) -> dict:
-        """
-        Convierte la instancia a un diccionario.
-        
-        Returns:
-            dict: Diccionario con los datos de la tasa de cambio
-        """
-        return {
-            "from": self.from_currency.value,
-            "to": self.to_currency.value,
-            "value": self.value,
-            "inverse": self.inverse
-        } 
+                rate = rate * (1 - (percentage / 100))
+                
+        return cls(
+            from_currency=from_currency.value if hasattr(from_currency, 'value') else from_currency,
+            to_currency=to_currency.value if hasattr(to_currency, 'value') else to_currency,
+            rate=rate,
+            source=source,
+            inverse_percentage=inverse_percentage
+        )

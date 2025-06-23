@@ -1,0 +1,80 @@
+version: '3.8'
+
+services:
+  backend:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONPATH=/app
+      - DATABASE_URL=postgresql://tasas_user:tasas_password@db:5432/tasas_db
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - .:/app
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+    networks:
+      - tasas_network
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: tasas_db
+      POSTGRES_USER: tasas_user
+      POSTGRES_PASSWORD: tasas_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    restart: unless-stopped
+    networks:
+      - tasas_network
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    restart: unless-stopped
+    networks:
+      - tasas_network
+
+  celery_worker:
+    build: .
+    command: celery -A app.tasks.scraping_tasks.celery_app worker --loglevel=info
+    environment:
+      - PYTHONPATH=/app
+      - DATABASE_URL=postgresql://tasas_user:tasas_password@db:5432/tasas_db
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - .:/app
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+    networks:
+      - tasas_network
+
+  celery_beat:
+    build: .
+    command: celery -A app.tasks.scraping_tasks.celery_app beat --loglevel=info
+    environment:
+      - PYTHONPATH=/app
+      - DATABASE_URL=postgresql://tasas_user:tasas_password@db:5432/tasas_db
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - .:/app
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+    networks:
+      - tasas_network
+
+volumes:
+  postgres_data:
+
+networks:
+  tasas_network:
+    driver: bridge

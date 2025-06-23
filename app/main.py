@@ -5,6 +5,7 @@ from typing import List, Optional
 from datetime import datetime
 from contextlib import asynccontextmanager
 from app.services.scraper_service import BinanceP2PScraperService
+from app.routers import scraping
 
 # Modelos Pydantic
 class RateResponse(BaseModel):
@@ -66,6 +67,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(scraping.router)
 
 # Rutas de la API
 @app.get("/")
@@ -156,23 +159,6 @@ async def convert_currency(request: ConversionRequest):
         status_code=404, 
             detail=f"Tasa de cambio no disponible. Conversiones disponibles para {request.user_id}: {available_conversions}"
     )
-
-@app.post("/api/scrape")
-async def manual_scrape():
-    """Simular scraping manual"""
-    app_state["last_update"] = datetime.now()
-    
-    return {
-        "message": "✅ Scraping simulado completado",
-        "status": "success",
-        "last_update": app_state["last_update"],
-        "note": "📝 Usando datos mock - el scraper real se integrará después",
-        "updated_prices": {
-            "VES": {"buy": 600.15, "sell": 1439.91},
-            "COP": {"buy": 208.89, "sell": 149.94}, 
-            "BRL": {"buy": 334.87, "sell": 197.0}
-        }
-    }
 
 @app.get("/api/currencies")
 async def get_currencies():

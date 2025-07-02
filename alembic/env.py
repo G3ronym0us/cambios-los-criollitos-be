@@ -8,16 +8,18 @@ import sys
 # Agregar el path del proyecto
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
-# Importar los modelos
+# Importar configuración y modelos
+from app.core.config import settings
 from app.database.connection import Base
-from app.models import User, ExchangeRate, Transaction
+
+# Importar todos los modelos para que se registren en Base.metadata
+import app.models  # Esto importa automáticamente todos los modelos del __init__.py
 
 # this is the Alembic Config object
 config = context.config
 
-# Obtener la URL de la base de datos desde variable de entorno
-database_url = os.getenv("DATABASE_URL", "postgresql://tasas_user:tasas_password@localhost:5433/tasas_db")
-config.set_main_option("sqlalchemy.url", database_url)
+# Configurar la URL de la base de datos desde settings
+config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
 # Interpret the config file for Python logging.
 if config.config_file_name is not None:
@@ -49,7 +51,8 @@ def run_migrations_online() -> None:
 
     with connectable.connect() as connection:
         context.configure(
-            connection=connection, target_metadata=target_metadata
+            connection=connection, 
+            target_metadata=target_metadata
         )
 
         with context.begin_transaction():

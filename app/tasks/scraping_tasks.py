@@ -6,8 +6,8 @@ from app.core.config import settings
 # Configurar Celery
 celery_app = Celery(
     "scraping_tasks",
-    broker=settings.REDIS_URL,
-    backend=settings.REDIS_URL
+    broker=settings.celery_broker_url_computed,
+    backend=settings.celery_result_backend_computed
 )
 
 # Configurar tareas periódicas

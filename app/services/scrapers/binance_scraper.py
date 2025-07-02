@@ -16,9 +16,7 @@ class BinanceP2PScraper(BaseScraper):
             'Accept-Encoding': 'gzip, deflate, br',
             'Origin': 'https://p2p.binance.com',
             'Referer': 'https://p2p.binance.com/',
-            'Content-Type': 'application/json',
-            'X-Forwarded-For': '177.67.82.22',  # IP brasileño
-            'CF-IPCountry': 'BR',
+            'Content-Type': 'application/json'
         }
 
     @property
@@ -50,8 +48,7 @@ class BinanceP2PScraper(BaseScraper):
             "tradeType": trade_type,
             "fiat": fiat.value,
             "publisherType": None,
-            "merchantCheck": False,
-            "countries": ["BR"] if fiat.value == 'BRL' else ["VE"] if fiat.value == 'VES' else ["CO"] if fiat.value == 'COP' else [],
+            "countries": [],
             "proMerchantAds": False,
             "filterType": "all",
         }
@@ -72,7 +69,7 @@ class BinanceP2PScraper(BaseScraper):
                         
                         # Filtrar anuncios válidos
                         valid_ads = [ad for ad in ads if float(ad['adv']['tradableQuantity']) > 0]
-                        
+
                         if valid_ads:
                             first_ad = valid_ads[0]
                             price = float(first_ad['adv']['price'])
@@ -110,17 +107,23 @@ class BinanceP2PScraper(BaseScraper):
             results = await asyncio.gather(*tasks, return_exceptions=True)
             ves_buy, ves_sell, cop_buy, cop_sell, brl_buy, brl_sell = results
 
+            print(f"VES_BUY: {ves_buy}")
+            print(f"VES_SELL: {ves_sell}")
+            print(f"COP_BUY: {cop_buy}")
+            print(f"COP_SELL: {cop_sell}")
+            print(f"BRL_BUY: {brl_buy}")
+            print(f"BRL_SELL: {brl_sell}")
+
             rates = []
             timestamp = datetime.utcnow()
 
             # Crear tasas principales con USDT
-            if ves_buy: rates.append(ExchangeRate(from_currency='VES', to_currency='USDT', rate=ves_buy, source=self.source_name))
-            if ves_sell: rates.append(ExchangeRate(from_currency='USDT', to_currency='VES', rate=ves_sell, source=self.source_name))
-            if cop_buy: rates.append(ExchangeRate(from_currency='COP', to_currency='USDT', rate=cop_buy, source=self.source_name))
-            if cop_sell: rates.append(ExchangeRate(from_currency='USDT', to_currency='COP', rate=cop_sell, source=self.source_name))
-            if brl_buy: rates.append(ExchangeRate(from_currency='BRL', to_currency='USDT', rate=brl_buy, source=self.source_name))
-            if brl_sell: rates.append(ExchangeRate(from_currency='USDT', to_currency='BRL', rate=brl_sell, source=self.source_name))
-
+            if ves_buy: rates.append(ExchangeRate.create_safe(from_currency='VES', to_currency='USDT', rate=ves_buy, source=self.source_name))
+            if ves_sell: rates.append(ExchangeRate.create_safe(from_currency='USDT', to_currency='VES', rate=ves_sell, source=self.source_name))
+            if cop_buy: rates.append(ExchangeRate.create_safe(from_currency='COP', to_currency='USDT', rate=cop_buy, source=self.source_name))
+            if cop_sell: rates.append(ExchangeRate.create_safe(from_currency='USDT', to_currency='COP', rate=cop_sell, source=self.source_name))
+            if brl_buy: rates.append(ExchangeRate.create_safe(from_currency='BRL', to_currency='USDT', rate=brl_buy, source=self.source_name))
+            if brl_sell: rates.append(ExchangeRate.create_safe(from_currency='USDT', to_currency='BRL', rate=brl_sell, source=self.source_name))
             # Calcular tasas derivadas
             self._calculate_derived_rates(rates, ves_buy, ves_sell, cop_buy, cop_sell, brl_buy, brl_sell)
 
@@ -134,30 +137,65 @@ class BinanceP2PScraper(BaseScraper):
     def _calculate_derived_rates(self, rates: List[ExchangeRate], ves_buy, ves_sell, cop_buy, cop_sell, brl_buy, brl_sell):
         """Calcular tasas derivadas (Zelle, PayPal, cruzadas)"""
         
-        # Tasas con Zelle (con márgenes)
-        if ves_buy: rates.append(ExchangeRate(from_currency='VES', to_currency='ZELLE', rate=ves_buy * 0.95, source=f"{self.source_name}_derived"))
-        if ves_sell: rates.append(ExchangeRate(from_currency='ZELLE', to_currency='VES', rate=ves_sell * 1.10, source=f"{self.source_name}_derived"))
-        if cop_buy: rates.append(ExchangeRate(from_currency='COP', to_currency='ZELLE', rate=cop_buy * 0.90, source=f"{self.source_name}_derived"))
-        if cop_sell: rates.append(ExchangeRate(from_currency='ZELLE', to_currency='COP', rate=cop_sell * 1.10, source=f"{self.source_name}_derived"))
-        if brl_buy: rates.append(ExchangeRate(from_currency='BRL', to_currency='ZELLE', rate=brl_buy * 0.90, source=f"{self.source_name}_derived"))
-        if brl_sell: rates.append(ExchangeRate(from_currency='ZELLE', to_currency='BRL', rate=brl_sell * 1.10, source=f"{self.source_name}_derived"))
+        # Tasas con Zelle (con márgenes) - usando create_safe
+        if ves_buy: 
+            rate = ExchangeRate.create_safe('VES', 'ZELLE', ves_buy, source=f"{self.source_name}_derived", percentage=5, inverse_percentage=True)
+            if rate: rates.append(rate)
+        if ves_sell: 
+            rate = ExchangeRate.create_safe('ZELLE', 'VES', ves_sell, source=f"{self.source_name}_derived", percentage=9)
+            if rate: rates.append(rate)
+        if cop_buy: 
+            rate = ExchangeRate.create_safe('COP', 'ZELLE', cop_buy, source=f"{self.source_name}_derived", percentage=5, inverse_percentage=True)
+            if rate: rates.append(rate)
+        if cop_sell: 
+            rate = ExchangeRate.create_safe('ZELLE', 'COP', cop_sell, source=f"{self.source_name}_derived", percentage=9)
+            if rate: rates.append(rate)
+        if brl_buy: 
+            rate = ExchangeRate.create_safe('BRL', 'ZELLE', brl_buy, source=f"{self.source_name}_derived", percentage=5, inverse_percentage=True)
+            if rate: rates.append(rate)
+        if brl_sell: 
+            rate = ExchangeRate.create_safe('ZELLE', 'BRL', brl_sell, source=f"{self.source_name}_derived", percentage=9)
+            if rate: rates.append(rate)
 
-        # Tasas con PayPal (márgenes más altos)
-        if ves_buy: rates.append(ExchangeRate(from_currency='VES', to_currency='PAYPAL', rate=ves_buy * 0.92, source=f"{self.source_name}_derived"))
-        if ves_sell: rates.append(ExchangeRate(from_currency='PAYPAL', to_currency='VES', rate=ves_sell * 1.13, source=f"{self.source_name}_derived"))
-        if cop_buy: rates.append(ExchangeRate(from_currency='COP', to_currency='PAYPAL', rate=cop_buy * 0.87, source=f"{self.source_name}_derived"))
-        if cop_sell: rates.append(ExchangeRate(from_currency='PAYPAL', to_currency='COP', rate=cop_sell * 1.13, source=f"{self.source_name}_derived"))
-        if brl_buy: rates.append(ExchangeRate(from_currency='BRL', to_currency='PAYPAL', rate=brl_buy * 0.87, source=f"{self.source_name}_derived"))
-        if brl_sell: rates.append(ExchangeRate(from_currency='PAYPAL', to_currency='BRL', rate=brl_sell * 1.13, source=f"{self.source_name}_derived"))
+        # Tasas con PayPal (márgenes más altos) - usando create_safe
+        if ves_buy: 
+            rate = ExchangeRate.create_safe('VES', 'PAYPAL', ves_buy, source=f"{self.source_name}_derived", percentage=5, inverse_percentage=True)
+            if rate: rates.append(rate)
+        if ves_sell: 
+            rate = ExchangeRate.create_safe('PAYPAL', 'VES', ves_sell, source=f"{self.source_name}_derived", percentage=12)
+            if rate: rates.append(rate)
+        if cop_buy: 
+            rate = ExchangeRate.create_safe('COP', 'PAYPAL', cop_buy, source=f"{self.source_name}_derived", percentage=5, inverse_percentage=True)
+            if rate: rates.append(rate)
+        if cop_sell: 
+            rate = ExchangeRate.create_safe('PAYPAL', 'COP', cop_sell, source=f"{self.source_name}_derived", percentage=12)
+            if rate: rates.append(rate)
+        if brl_buy: 
+            rate = ExchangeRate.create_safe('BRL', 'PAYPAL', brl_buy, source=f"{self.source_name}_derived", percentage=5, inverse_percentage=True)
+            if rate: rates.append(rate)
+        if brl_sell: 
+            rate = ExchangeRate.create_safe('PAYPAL', 'BRL', brl_sell, source=f"{self.source_name}_derived", percentage=12)
+            if rate: rates.append(rate)
 
-        # Tasas cruzadas directas
-        if all(x is not None for x in [ves_buy, ves_sell, cop_buy, cop_sell, brl_buy, brl_sell]):
-            rates.append(ExchangeRate(from_currency='VES', to_currency='COP', rate=cop_sell / ves_buy, source=f"{self.source_name}_cross"))
-            rates.append(ExchangeRate(from_currency='COP', to_currency='VES', rate=ves_sell / cop_buy, source=f"{self.source_name}_cross"))
-            rates.append(ExchangeRate(from_currency='VES', to_currency='BRL', rate=brl_sell / ves_buy, source=f"{self.source_name}_cross"))
-            rates.append(ExchangeRate(from_currency='BRL', to_currency='VES', rate=ves_sell / brl_buy, source=f"{self.source_name}_cross"))
-            rates.append(ExchangeRate(from_currency='COP', to_currency='BRL', rate=brl_sell / cop_buy, source=f"{self.source_name}_cross"))
-            rates.append(ExchangeRate(from_currency='BRL', to_currency='COP', rate=cop_sell / brl_buy, source=f"{self.source_name}_cross"))
+        # Tasas cruzadas directas - usando create_safe
+        if ves_buy and cop_sell:
+            rate1 = ExchangeRate.create_safe('VES', 'COP', cop_sell / ves_buy, source=f"{self.source_name}_cross", percentage=8)
+            if rate1: rates.append(rate1)
+        if ves_sell and cop_buy:
+            rate2 = ExchangeRate.create_safe('COP', 'VES', ves_sell / cop_buy, source=f"{self.source_name}_cross", percentage=8)
+            if rate2: rates.append(rate2)
+        if ves_buy and brl_sell:
+            rate1 = ExchangeRate.create_safe('VES', 'BRL', brl_sell / ves_buy, source=f"{self.source_name}_cross", percentage=6)
+            if rate1: rates.append(rate1)
+        if ves_sell and brl_buy:
+            rate2 = ExchangeRate.create_safe('BRL', 'VES', ves_sell / brl_buy, source=f"{self.source_name}_cross", percentage=6)
+            if rate2: rates.append(rate2)
+        if cop_buy and brl_sell:
+            rate1 = ExchangeRate.create_safe('COP', 'BRL', brl_sell / cop_buy, source=f"{self.source_name}_cross", percentage=8)
+            if rate1: rates.append(rate1)
+        if cop_sell and brl_buy:
+            rate2 = ExchangeRate.create_safe('BRL', 'COP', cop_sell / brl_buy, source=f"{self.source_name}_cross", percentage=8)
+            if rate2: rates.append(rate2)
 
     async def close(self):
         """Cerrar sesión HTTP"""

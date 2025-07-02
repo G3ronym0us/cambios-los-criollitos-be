@@ -1,11 +1,13 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
 from contextlib import asynccontextmanager
 from app.services.scraper_service import BinanceP2PScraperService
-from app.routers import scraping
+from app.routers import scraping, auth, currency, currency_pair
+from app.database.connection import get_db
 
 # Modelos Pydantic
 class RateResponse(BaseModel):
@@ -69,6 +71,9 @@ app.add_middleware(
 )
 
 app.include_router(scraping.router)
+app.include_router(auth.router)
+app.include_router(currency.router)
+app.include_router(currency_pair.router)
 
 # Rutas de la API
 @app.get("/")
@@ -97,9 +102,14 @@ async def health():
     }
 
 @app.get("/api/rates")
-async def get_all_rates():  
-    scraper = BinanceP2PScraperService()
-    return await scraper.get_all_rates()
+async def get_all_rates(db: Session = Depends(get_db)):
+    """Obtener todas las tasas de cambio desde la base de datos"""
+    from app.repositories.exchange_rate_repository import ExchangeRateRepository
+    
+    repo = ExchangeRateRepository(db)
+    rates = repo.get_active_rates()
+    
+    return rates
 
 @app.get("/api/rates/{user_id}", response_model=UserRatesResponse)
 async def get_user_rates(user_id: str):

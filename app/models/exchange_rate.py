@@ -11,9 +11,10 @@ class ExchangeRate(Base):
     rate = Column(Float, nullable=False)
     source = Column(String(50), nullable=False)  # 'binance', 'manual', etc.
     is_active = Column(Boolean, default=True)
-    inverse_percentage = Column(Float, nullable=True)
+    inverse_percentage = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    percentage = Column(Float, nullable=True)
 
     def __repr__(self):
         return f"<ExchangeRate({self.from_currency}->{self.to_currency}: {self.rate})>"
@@ -35,5 +36,6 @@ class ExchangeRate(Base):
             to_currency=to_currency.value if hasattr(to_currency, 'value') else to_currency,
             rate=rate,
             source=source,
+            percentage=percentage,
             inverse_percentage=inverse_percentage
         )

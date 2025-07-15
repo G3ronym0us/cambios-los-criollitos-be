@@ -95,6 +95,17 @@ async def get_monitored_pairs(
     
     return [CurrencyPairResponse(**pair.dict()) for pair in pairs]
 
+@router.get("/binance-tracked", response_model=List[CurrencyPairResponse])
+async def get_binance_tracked_pairs(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user)
+):
+    """Get all currency pairs tracked on Binance (MODERATOR+ access)"""
+    pair_repo = CurrencyPairRepository(db)
+    pairs = pair_repo.get_binance_tracked_pairs()
+    
+    return [CurrencyPairResponse(**pair.dict()) for pair in pairs]
+
 @router.get("/stats", response_model=CurrencyPairStats)
 async def get_currency_pair_stats(
     db: Session = Depends(get_db),
@@ -224,6 +235,9 @@ async def update_pair_status(
     
     if status_data.is_monitored is not None:
         pair_repo.toggle_monitoring(pair_id, status_data.is_monitored)
+    
+    if status_data.binance_tracked is not None:
+        pair_repo.toggle_binance_tracking(pair_id, status_data.binance_tracked)
     
     updated_pair = pair_repo.get_by_id(pair_id)
     return CurrencyPairResponse(**updated_pair.dict())

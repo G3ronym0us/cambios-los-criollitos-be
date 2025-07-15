@@ -18,6 +18,7 @@ class CurrencyPair(Base):
     # Configuration
     is_active = Column(Boolean, default=True, nullable=False)
     is_monitored = Column(Boolean, default=True, nullable=False)  # Para scraping automático
+    binance_tracked = Column(Boolean, default=False, nullable=False)  # Indica si el par se busca en Binance
     
     # Optional description
     description = Column(String, nullable=True)
@@ -64,6 +65,7 @@ class CurrencyPair(Base):
             "display_name": self.display_name,
             "is_active": self.is_active,
             "is_monitored": self.is_monitored,
+            "binance_tracked": self.binance_tracked,
             "description": self.description,
             "created_at": self.created_at,
             "updated_at": self.updated_at

@@ -26,7 +26,8 @@ class CurrencyPairRepository:
             pair_symbol=pair_symbol,
             description=pair_data.description,
             is_active=pair_data.is_active,
-            is_monitored=pair_data.is_monitored
+            is_monitored=pair_data.is_monitored,
+            binance_tracked=pair_data.binance_tracked
         )
         
         self.db.add(db_pair)
@@ -77,6 +78,16 @@ class CurrencyPairRepository:
             .filter(
                 CurrencyPair.is_active == True,
                 CurrencyPair.is_monitored == True
+            ).all()
+
+    def get_binance_tracked_pairs(self) -> List[CurrencyPair]:
+        """Get pairs that are tracked on Binance (fiat-crypto pairs)"""
+        return self.db.query(CurrencyPair)\
+            .options(joinedload(CurrencyPair.from_currency), 
+                    joinedload(CurrencyPair.to_currency))\
+            .filter(
+                CurrencyPair.is_active == True,
+                CurrencyPair.binance_tracked == True
             ).all()
 
     def get_pairs_by_currency(self, currency_id: int) -> List[CurrencyPair]:
@@ -149,6 +160,17 @@ class CurrencyPairRepository:
             return False
         
         pair.is_active = is_active
+        pair.updated_at = datetime.utcnow()
+        self.db.commit()
+        return True
+
+    def toggle_binance_tracking(self, pair_id: int, binance_tracked: bool) -> bool:
+        """Toggle Binance tracking status for a pair"""
+        pair = self.get_by_id(pair_id)
+        if not pair:
+            return False
+        
+        pair.binance_tracked = binance_tracked
         pair.updated_at = datetime.utcnow()
         self.db.commit()
         return True

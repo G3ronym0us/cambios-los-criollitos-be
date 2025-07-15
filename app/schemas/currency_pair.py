@@ -9,6 +9,7 @@ class CurrencyPairBase(BaseModel):
     description: Optional[str] = None
     is_active: bool = True
     is_monitored: bool = True
+    binance_tracked: bool = False
 
     @validator('to_currency_id')
     def validate_different_currencies(cls, v, values):
@@ -23,6 +24,7 @@ class CurrencyPairUpdate(BaseModel):
     description: Optional[str] = None
     is_active: Optional[bool] = None
     is_monitored: Optional[bool] = None
+    binance_tracked: Optional[bool] = None
 
 class CurrencyPairResponse(BaseModel):
     id: int
@@ -35,6 +37,7 @@ class CurrencyPairResponse(BaseModel):
     description: Optional[str] = None
     is_active: bool
     is_monitored: bool
+    binance_tracked: bool
     created_at: datetime
     updated_at: Optional[datetime] = None
 
@@ -50,6 +53,7 @@ class CurrencyPairList(BaseModel):
 class CurrencyPairStatusUpdate(BaseModel):
     is_active: Optional[bool] = None
     is_monitored: Optional[bool] = None
+    binance_tracked: Optional[bool] = None
 
 class CurrencyPairStats(BaseModel):
     total_pairs: int

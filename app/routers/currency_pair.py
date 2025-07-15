@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional
+from datetime import datetime
 
 from app.database.connection import get_db
 from app.schemas.currency_pair import (
@@ -11,6 +12,7 @@ from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.repositories.currency_repository import CurrencyRepository
 from app.core.dependencies import get_root_user, get_moderator_user
 from app.models.user import User
+from app.models.currency import CurrencyType
 
 router = APIRouter(prefix="/currency-pairs", tags=["Currency Pairs"])
 
@@ -46,6 +48,20 @@ async def create_currency_pair(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Currency pair {from_currency.symbol}-{to_currency.symbol} already exists"
         )
+    
+    # Validate Binance tracking requirements
+    if pair_data.binance_tracked:
+        # Check if one currency is FIAT and the other is CRYPTO
+        valid_combination = (
+            (from_currency.currency_type == CurrencyType.FIAT and to_currency.currency_type == CurrencyType.CRYPTO) or
+            (from_currency.currency_type == CurrencyType.CRYPTO and to_currency.currency_type == CurrencyType.FIAT)
+        )
+        
+        if not valid_combination:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Binance tracked pairs must be between FIAT and CRYPTO currencies"
+            )
     
     try:
         pair = pair_repo.create_currency_pair(pair_data)
@@ -238,6 +254,26 @@ async def update_pair_status(
     
     if status_data.binance_tracked is not None:
         pair_repo.toggle_binance_tracking(pair_id, status_data.binance_tracked)
+    
+    # Update banks_to_track and amount_to_track if provided
+    if status_data.banks_to_track is not None or status_data.amount_to_track is not None:
+        pair = pair_repo.get_by_id(pair_id)
+        if status_data.banks_to_track is not None:
+            pair.banks_to_track = status_data.banks_to_track
+        if status_data.amount_to_track is not None:
+            pair.amount_to_track = status_data.amount_to_track
+        
+        # Validate if binance_tracked is enabled
+        if pair.binance_tracked:
+            valid, error_msg = pair.validate_binance_tracking()
+            if not valid:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=error_msg
+                )
+        
+        pair.updated_at = datetime.utcnow()
+        pair_repo.db.commit()
     
     updated_pair = pair_repo.get_by_id(pair_id)
     return CurrencyPairResponse(**updated_pair.dict())

@@ -1,7 +1,8 @@
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, UniqueConstraint, Numeric, JSON
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from app.database.connection import Base
+from app.models.currency import CurrencyType
 
 class CurrencyPair(Base):
     __tablename__ = "currency_pairs"
@@ -19,6 +20,10 @@ class CurrencyPair(Base):
     is_active = Column(Boolean, default=True, nullable=False)
     is_monitored = Column(Boolean, default=True, nullable=False)  # Para scraping automático
     binance_tracked = Column(Boolean, default=False, nullable=False)  # Indica si el par se busca en Binance
+    
+    # Binance tracking specific fields (only required when binance_tracked=True)
+    banks_to_track = Column(JSON, nullable=True)  # Array of bank names to track in Binance
+    amount_to_track = Column(Numeric(15, 2), nullable=True)  # Specific amount to track
     
     # Optional description
     description = Column(String, nullable=True)
@@ -66,6 +71,8 @@ class CurrencyPair(Base):
             "is_active": self.is_active,
             "is_monitored": self.is_monitored,
             "binance_tracked": self.binance_tracked,
+            "banks_to_track": self.banks_to_track,
+            "amount_to_track": float(self.amount_to_track) if self.amount_to_track else None,
             "description": self.description,
             "created_at": self.created_at,
             "updated_at": self.updated_at
@@ -75,3 +82,32 @@ class CurrencyPair(Base):
     def create_pair_symbol(cls, from_symbol: str, to_symbol: str) -> str:
         """Create standardized pair symbol"""
         return f"{from_symbol.upper()}-{to_symbol.upper()}"
+
+    def validate_binance_tracking(self) -> tuple[bool, str]:
+        """Validate binance tracking requirements"""
+        if not self.binance_tracked:
+            return True, ""
+        
+        # Check if one currency is FIAT and the other is CRYPTO
+        if not self.from_currency or not self.to_currency:
+            return False, "Currency information not loaded"
+        
+        from_type = self.from_currency.currency_type
+        to_type = self.to_currency.currency_type
+        
+        valid_combination = (
+            (from_type == CurrencyType.FIAT and to_type == CurrencyType.CRYPTO) or
+            (from_type == CurrencyType.CRYPTO and to_type == CurrencyType.FIAT)
+        )
+        
+        if not valid_combination:
+            return False, "Binance tracked pairs must be between FIAT and CRYPTO currencies"
+        
+        # Check required fields
+        if not self.banks_to_track or len(self.banks_to_track) == 0:
+            return False, "banks_to_track is required when binance_tracked is True"
+        
+        if not self.amount_to_track or self.amount_to_track <= 0:
+            return False, "amount_to_track is required and must be greater than 0 when binance_tracked is True"
+        
+        return True, ""

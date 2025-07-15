@@ -27,8 +27,16 @@ class CurrencyPairRepository:
             description=pair_data.description,
             is_active=pair_data.is_active,
             is_monitored=pair_data.is_monitored,
-            binance_tracked=pair_data.binance_tracked
+            binance_tracked=pair_data.binance_tracked,
+            banks_to_track=pair_data.banks_to_track,
+            amount_to_track=pair_data.amount_to_track
         )
+        
+        # Validate binance tracking requirements
+        if db_pair.binance_tracked:
+            valid, error_msg = db_pair.validate_binance_tracking()
+            if not valid:
+                raise ValueError(error_msg)
         
         self.db.add(db_pair)
         self.db.commit()
@@ -109,6 +117,12 @@ class CurrencyPairRepository:
         update_data = pair_data.dict(exclude_unset=True)
         for field, value in update_data.items():
             setattr(pair, field, value)
+        
+        # Validate binance tracking requirements if it's being enabled
+        if pair.binance_tracked:
+            valid, error_msg = pair.validate_binance_tracking()
+            if not valid:
+                raise ValueError(error_msg)
         
         pair.updated_at = datetime.utcnow()
         self.db.commit()

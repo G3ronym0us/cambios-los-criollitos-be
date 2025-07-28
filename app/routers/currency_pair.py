@@ -64,7 +64,7 @@ async def create_currency_pair(
             )
     
     try:
-        pair = pair_repo.create_currency_pair(pair_data)
+        pair = await pair_repo.create_currency_pair(pair_data)
         return CurrencyPairResponse(**pair.dict())
     except ValueError as e:
         raise HTTPException(
@@ -219,7 +219,7 @@ async def update_currency_pair(
             detail="Currency pair not found"
         )
     
-    updated_pair = pair_repo.update_currency_pair(pair_id, pair_data)
+    updated_pair = await pair_repo.update_currency_pair(pair_id, pair_data)
     if not updated_pair:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -245,38 +245,116 @@ async def update_pair_status(
             detail="Currency pair not found"
         )
     
-    # Update status fields
+    # Update basic status fields first
     if status_data.is_active is not None:
         pair_repo.toggle_active_status(pair_id, status_data.is_active)
     
     if status_data.is_monitored is not None:
         pair_repo.toggle_monitoring(pair_id, status_data.is_monitored)
     
-    if status_data.binance_tracked is not None:
-        pair_repo.toggle_binance_tracking(pair_id, status_data.binance_tracked)
-    
     # Update banks_to_track and amount_to_track if provided
-    if status_data.banks_to_track is not None or status_data.amount_to_track is not None:
-        pair = pair_repo.get_by_id(pair_id)
-        if status_data.banks_to_track is not None:
-            pair.banks_to_track = status_data.banks_to_track
-        if status_data.amount_to_track is not None:
-            pair.amount_to_track = status_data.amount_to_track
+    pair = pair_repo.get_by_id(pair_id)
+    if status_data.banks_to_track is not None:
+        pair.banks_to_track = status_data.banks_to_track
+    if status_data.amount_to_track is not None:
+        pair.amount_to_track = status_data.amount_to_track
+    
+    # Validate BEFORE updating binance_tracked if it's being enabled
+    if status_data.binance_tracked is True:
+        # Temporarily set binance_tracked to true for validation
+        pair.binance_tracked = True
         
-        # Validate if binance_tracked is enabled
-        if pair.binance_tracked:
-            valid, error_msg = pair.validate_binance_tracking()
-            if not valid:
+        # First do basic validation
+        valid, error_msg = pair.validate_binance_tracking()
+        if not valid:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=error_msg
+            )
+        
+        # Then validate with Binance API
+        try:
+            api_valid, api_msg, validation_data = await pair.validate_binance_tracking_with_api()
+            if not api_valid:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=error_msg
+                    detail=f"Binance validation failed: {api_msg}"
                 )
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Could not validate configuration with Binance: {str(e)}"
+            )
         
-        pair.updated_at = datetime.utcnow()
-        pair_repo.db.commit()
+        # If validation passes, keep binance_tracked = True (already set above)
+        
+    elif status_data.binance_tracked is False:
+        # If disabling binance_tracked, no validation needed
+        pair.binance_tracked = False
+    
+    # Commit all changes
+    pair.updated_at = datetime.utcnow()
+    pair_repo.db.commit()
     
     updated_pair = pair_repo.get_by_id(pair_id)
     return CurrencyPairResponse(**updated_pair.dict())
+
+@router.post("/validate-binance-config", response_model=dict)
+async def validate_binance_configuration(
+    pair_data: CurrencyPairCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user)
+):
+    """
+    Validate Binance tracking configuration without saving
+    Returns validation result with sample ads if successful
+    (MODERATOR+ access required)
+    """
+    pair_repo = CurrencyPairRepository(db)
+    currency_repo = CurrencyRepository(db)
+    
+    # Validate currencies exist
+    from_currency = currency_repo.get_by_id(pair_data.from_currency_id)
+    to_currency = currency_repo.get_by_id(pair_data.to_currency_id)
+    
+    if not from_currency or not to_currency:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid currency IDs provided"
+        )
+    
+    # Only validate if binance_tracked is enabled
+    if not pair_data.binance_tracked:
+        return {
+            "valid": True,
+            "message": "Binance tracking not enabled, no validation needed",
+            "validation_data": {}
+        }
+    
+    # Validate configuration with Binance API
+    from app.services.binance_validation_service import BinanceValidationService
+    
+    try:
+        is_valid, message, validation_data = await BinanceValidationService.validate_currency_pair_configuration(
+            from_currency=from_currency.symbol,
+            to_currency=to_currency.symbol,
+            from_currency_type=from_currency.currency_type,
+            to_currency_type=to_currency.currency_type,
+            banks_to_track=pair_data.banks_to_track or [],
+            amount_to_track=pair_data.amount_to_track or 0
+        )
+        
+        return {
+            "valid": is_valid,
+            "message": message,
+            "validation_data": validation_data or {}
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Error validating with Binance API: {str(e)}"
+        )
 
 @router.delete("/{pair_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_currency_pair(

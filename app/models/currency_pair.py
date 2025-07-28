@@ -111,3 +111,33 @@ class CurrencyPair(Base):
             return False, "amount_to_track is required and must be greater than 0 when binance_tracked is True"
         
         return True, ""
+
+    async def validate_binance_tracking_with_api(self) -> tuple[bool, str, dict]:
+        """
+        Validate binance tracking requirements including real-time API validation
+        
+        Returns:
+            Tuple of (is_valid, error_message, validation_data)
+        """
+        # First run basic validation
+        basic_valid, basic_error = self.validate_binance_tracking()
+        if not basic_valid:
+            return False, basic_error, {}
+        
+        # If basic validation passes, validate with Binance API
+        from app.services.binance_validation_service import BinanceValidationService
+        
+        try:
+            is_valid, message, validation_data = await BinanceValidationService.validate_currency_pair_configuration(
+                from_currency=self.from_currency.symbol,
+                to_currency=self.to_currency.symbol,
+                from_currency_type=self.from_currency.currency_type,
+                to_currency_type=self.to_currency.currency_type,
+                banks_to_track=self.banks_to_track,
+                amount_to_track=self.amount_to_track
+            )
+            
+            return is_valid, message, validation_data or {}
+            
+        except Exception as e:
+            return False, f"Error validating with Binance API: {str(e)}", {}

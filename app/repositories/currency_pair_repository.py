@@ -1,4 +1,5 @@
 from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import case, desc, asc
 from typing import Optional, List
 from datetime import datetime
 from app.models.currency_pair import CurrencyPair
@@ -9,7 +10,7 @@ class CurrencyPairRepository:
     def __init__(self, db: Session):
         self.db = db
 
-    def create_currency_pair(self, pair_data: CurrencyPairCreate) -> CurrencyPair:
+    async def create_currency_pair(self, pair_data: CurrencyPairCreate) -> CurrencyPair:
         """Create new currency pair"""
         # Generate pair symbol
         from_currency = self.db.query(Currency).filter(Currency.id == pair_data.from_currency_id).first()
@@ -34,9 +35,18 @@ class CurrencyPairRepository:
         
         # Validate binance tracking requirements
         if db_pair.binance_tracked:
+            # First do basic validation
             valid, error_msg = db_pair.validate_binance_tracking()
             if not valid:
                 raise ValueError(error_msg)
+            
+            # Then validate with Binance API
+            try:
+                api_valid, api_msg, validation_data = await db_pair.validate_binance_tracking_with_api()
+                if not api_valid:
+                    raise ValueError(f"Binance validation failed: {api_msg}")
+            except Exception as e:
+                raise ValueError(f"Could not validate configuration with Binance: {str(e)}")
         
         self.db.add(db_pair)
         self.db.commit()
@@ -68,13 +78,21 @@ class CurrencyPairRepository:
             ).first()
 
     def get_all_pairs(self, skip: int = 0, limit: int = 100, active_only: bool = False) -> List[CurrencyPair]:
-        """Get all currency pairs with pagination"""
+        """Get all currency pairs with pagination and simple ordering"""
         query = self.db.query(CurrencyPair)\
             .options(joinedload(CurrencyPair.from_currency), 
                     joinedload(CurrencyPair.to_currency))
         
         if active_only:
             query = query.filter(CurrencyPair.is_active == True)
+        
+        # Simple ordering by CurrencyPair fields only
+        query = query.order_by(
+            desc(CurrencyPair.binance_tracked),  # binance_tracked=True first
+            desc(CurrencyPair.is_monitored),     # is_monitored=True second  
+            desc(CurrencyPair.is_active),        # is_active=True third
+            asc(CurrencyPair.pair_symbol)        # Alphabetical last
+        )
         
         return query.offset(skip).limit(limit).all()
 
@@ -108,7 +126,7 @@ class CurrencyPairRepository:
                 (CurrencyPair.to_currency_id == currency_id)
             ).all()
 
-    def update_currency_pair(self, pair_id: int, pair_data: CurrencyPairUpdate) -> Optional[CurrencyPair]:
+    async def update_currency_pair(self, pair_id: int, pair_data: CurrencyPairUpdate) -> Optional[CurrencyPair]:
         """Update currency pair"""
         pair = self.get_by_id(pair_id)
         if not pair:
@@ -120,9 +138,18 @@ class CurrencyPairRepository:
         
         # Validate binance tracking requirements if it's being enabled
         if pair.binance_tracked:
+            # First do basic validation
             valid, error_msg = pair.validate_binance_tracking()
             if not valid:
                 raise ValueError(error_msg)
+            
+            # Then validate with Binance API
+            try:
+                api_valid, api_msg, validation_data = await pair.validate_binance_tracking_with_api()
+                if not api_valid:
+                    raise ValueError(f"Binance validation failed: {api_msg}")
+            except Exception as e:
+                raise ValueError(f"Could not validate configuration with Binance: {str(e)}")
         
         pair.updated_at = datetime.utcnow()
         self.db.commit()

@@ -6,7 +6,7 @@ from typing import List, Optional
 from datetime import datetime
 from contextlib import asynccontextmanager
 from app.services.scraper_service import BinanceP2PScraperService
-from app.routers import scraping, auth, currency, currency_pair
+from app.routers import scraping, auth, currency, currency_pair, binance, rates
 from app.database.connection import get_db
 
 # Modelos Pydantic
@@ -74,6 +74,8 @@ app.include_router(scraping.router)
 app.include_router(auth.router)
 app.include_router(currency.router)
 app.include_router(currency_pair.router)
+app.include_router(binance.router)
+app.include_router(rates.router)
 
 # Rutas de la API
 @app.get("/")
@@ -88,6 +90,8 @@ async def root():
             "health": "/api/health",
             "users": "/api/users",
             "rates": "/api/rates",
+            "latest_rates": "/rates/latest/{from_currency}/{to_currency}",
+            "pair_rates": "/rates/pair/{pair_symbol}/latest",
             "convert": "/api/convert"
         }
     }
@@ -138,8 +142,28 @@ async def get_users():
     return []
 
 @app.post("/api/convert", response_model=ConversionResponse)
-async def convert_currency(request: ConversionRequest):
-    """Calcular conversión de moneda"""
+async def convert_currency(request: ConversionRequest, db: Session = Depends(get_db)):
+    """Calcular conversión de moneda usando tasas de base de datos con prioridad a manuales"""
+    from app.repositories.exchange_rate_repository import ExchangeRateRepository
+    
+    repo = ExchangeRateRepository(db)
+    rate_obj = repo.get_latest_rate(request.from_currency.upper(), request.to_currency.upper())
+    
+    if rate_obj:
+        # Usar la tasa activa (ya incluye manual si está configurada)
+        converted_amount = request.amount * rate_obj.rate
+        
+        return ConversionResponse(
+            original_amount=request.amount,
+            converted_amount=round(converted_amount, 2),
+            rate=rate_obj.rate,
+            from_currency=request.from_currency,
+            to_currency=request.to_currency,
+            user=request.user_id,
+            percentage=rate_obj.percentage or 0
+        )
+    
+    # Fallback al sistema anterior si no se encuentra en BD
     scraper = BinanceP2PScraperService()
     rates = await scraper.get_offers(request.user_id)
     

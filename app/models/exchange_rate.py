@@ -15,9 +15,34 @@ class ExchangeRate(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     percentage = Column(Float, nullable=True)
+    manual_rate = Column(Float, nullable=True)
+    is_manual = Column(Boolean, default=False)
+    automatic_rate = Column(Float, nullable=True)
 
     def __repr__(self):
         return f"<ExchangeRate({self.from_currency}->{self.to_currency}: {self.rate})>"
+
+    def set_manual_rate(self, manual_rate):
+        """Establece una tasa manual y guarda la automática"""
+        if not self.is_manual:
+            self.automatic_rate = self.rate
+        self.manual_rate = manual_rate
+        self.is_manual = True
+        self.rate = manual_rate
+
+    def remove_manual_rate(self):
+        """Remueve la tasa manual y vuelve a la automática"""
+        if self.automatic_rate:
+            self.rate = self.automatic_rate
+        self.is_manual = False
+        self.manual_rate = None
+
+    def update_automatic_rate(self, new_rate):
+        """Actualiza la tasa automática manteniendo la manual si está activa"""
+        if self.is_manual:
+            self.automatic_rate = new_rate
+        else:
+            self.rate = new_rate
 
     @classmethod
     def create_safe(cls, from_currency, to_currency, rate, source="binance", percentage=None, inverse_percentage=False):

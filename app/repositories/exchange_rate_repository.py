@@ -92,11 +92,27 @@ class ExchangeRateRepository:
         """Establecer una tasa manual para un par de monedas"""
         try:
             rate = self.get_latest_rate(from_currency, to_currency)
+            
             if rate:
+                # Si existe un registro, actualizarlo
                 rate.set_manual_rate(manual_rate)
-                self.db.commit()
-                return rate
-            return None
+            else:
+                # Si no existe, crear un nuevo registro manual
+                rate = ExchangeRate(
+                    from_currency=from_currency,
+                    to_currency=to_currency,
+                    rate=manual_rate,
+                    source="manual",
+                    is_active=True,
+                    is_manual=True,
+                    manual_rate=manual_rate,
+                    automatic_rate=None
+                )
+                self.db.add(rate)
+            
+            self.db.commit()
+            return rate
+            
         except Exception as e:
             print(f"❌ Error estableciendo tasa manual: {e}")
             self.db.rollback()

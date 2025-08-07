@@ -4,7 +4,6 @@ uvicorn[standard]==0.24.0
 python-multipart==0.0.6
 
 # Validación de datos
-pydantic==2.5.0
 pydantic-settings==2.0.1
 
 # WebSockets
@@ -46,4 +45,5 @@ passlib==1.7.4
 python-multipart==0.0.6
 python-decouple==3.8
 pydantic[email]==2.5.0
+email-validator==2.1.0
 

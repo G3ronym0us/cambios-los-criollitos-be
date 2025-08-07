@@ -8,32 +8,36 @@ from app.models.exchange_rate import ExchangeRate
 
 class ScrapingService:
     def __init__(self):
-        self.scrapers = [
-            BinanceP2PScraper(),
-        ]
+        pass  # Scrapers will be initialized with DB session when needed
 
     async def scrape_all_rates(self) -> bool:
         """Ejecutar scraping de todas las fuentes y guardar en DB"""
         all_rates = []
         
-        print("🚀 Iniciando scraping de tasas...")
+        print("🚀 Iniciando scraping dinámico de tasas...")
         
-        for scraper in self.scrapers:
-            try:
-                print(f"📡 Scraping desde: {scraper.source_name}")
-                await scraper.initialize()
-                rates = await scraper.get_rates()
-                all_rates.extend(rates)
-                await scraper.close()
-                
-            except Exception as e:
-                print(f"❌ Error en scraper {scraper.source_name}: {e}")
-                continue
+        # Crear sesión de base de datos
+        db = SessionLocal()
+        try:
+            # Inicializar scrapers con sesión de DB
+            scrapers = [
+                BinanceP2PScraper(db),
+            ]
+            
+            for scraper in scrapers:
+                try:
+                    print(f"📡 Scraping desde: {scraper.source_name}")
+                    await scraper.initialize()
+                    rates = await scraper.get_rates()
+                    all_rates.extend(rates)
+                    await scraper.close()
+                    
+                except Exception as e:
+                    print(f"❌ Error en scraper {scraper.source_name}: {e}")
+                    continue
 
-        if all_rates:
-            # Guardar en base de datos
-            db = SessionLocal()
-            try:
+            if all_rates:
+                # Guardar en base de datos
                 repo = ExchangeRateRepository(db)
                 success = repo.save_rates(all_rates)
                 
@@ -43,17 +47,14 @@ class ScrapingService:
                 else:
                     print("❌ Error guardando tasas en base de datos")
                     return False
-                    
-            finally:
-                db.close()
-        else:
-            print("⚠️ No se obtuvieron tasas válidas")
-            return False
+            else:
+                print("⚠️ No se obtuvieron tasas válidas")
+                return False
+                
+        finally:
+            db.close()
 
     async def close_all_scrapers(self):
-        """Cerrar todos los scrapers"""
-        for scraper in self.scrapers:
-            try:
-                await scraper.close()
-            except:
-                pass
+        """Cerrar todos los scrapers - deprecated since scrapers are now created per-request"""
+        # Scrapers are now created and closed per scraping session
+        pass

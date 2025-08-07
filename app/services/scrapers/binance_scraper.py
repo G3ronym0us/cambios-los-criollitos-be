@@ -2,13 +2,17 @@ import aiohttp
 import asyncio
 from typing import List, Optional
 from datetime import datetime
+from sqlalchemy.orm import Session
 from .base_scraper import BaseScraper
 from app.enums.currency_enun import Currency
 from app.models.exchange_rate import ExchangeRate
+from app.repositories.currency_pair_repository import CurrencyPairRepository
 
 class BinanceP2PScraper(BaseScraper):
-    def __init__(self):
+    def __init__(self, db_session: Session):
         self.session = None
+        self.db_session = db_session
+        self.currency_pair_repo = CurrencyPairRepository(db_session)
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'application/json, text/plain, */*',
@@ -73,7 +77,13 @@ class BinanceP2PScraper(BaseScraper):
                         if valid_ads:
                             first_ad = valid_ads[0]
                             price = float(first_ad['adv']['price'])
-                            return price
+                            return {
+                                'from_currency': fiat.value if trade_type == 'BUY' else crypto.value,
+                                'to_currency': crypto.value if trade_type == 'BUY' else fiat.value,
+                                'rate': price,
+                                'type': trade_type,
+                                'payment_method': first_ad['adv']['tradeMethods'][0]
+                            }
                         
             return None
         except Exception as e:
@@ -81,121 +91,250 @@ class BinanceP2PScraper(BaseScraper):
             return None
 
     async def get_rates(self) -> List[ExchangeRate]:
-        """Obtener todas las tasas de Binance"""
+        """Obtener tasas dinámicamente basadas en currency pairs activos con binance_tracked=True"""
         if not self.session:
             success = await self.initialize()
             if not success:
                 return []
 
         try:
-            print("🔄 Obteniendo tasas de Binance P2P...")
+            print("🔄 Obteniendo tasas dinámicas de Binance P2P...")
             
+            # Obtener pares activos que deben ser rastreados en Binance
+            tracked_pairs = self.currency_pair_repo.get_binance_tracked_pairs()
+            
+            if not tracked_pairs:
+                print("⚠️ No hay pares configurados para rastreo en Binance")
+                return []
+
+            print(f"🎯 Rastreando {len(tracked_pairs)} pares: {[pair.pair_symbol for pair in tracked_pairs]}")
+
             tasks = []
-            
-            # VES
-            tasks.append(self._get_p2p_data(Currency.VES, Currency.USDT, 'BUY', ['BANK', 'SpecificBank'], 20000))
-            tasks.append(self._get_p2p_data(Currency.VES, Currency.USDT, 'SELL', ['BANK', 'SpecificBank'], 20000))
-            
-            # COP
-            tasks.append(self._get_p2p_data(Currency.COP, Currency.USDT, 'BUY', ['BancolombiaSA'], 500000))
-            tasks.append(self._get_p2p_data(Currency.COP, Currency.USDT, 'SELL', ['BancolombiaSA'], 500000))
-            
-            # BRL
-            tasks.append(self._get_p2p_data(Currency.BRL, Currency.USDT, 'BUY', ['PIX'], 500))
-            tasks.append(self._get_p2p_data(Currency.BRL, Currency.USDT, 'SELL', ['PIX'], 500))
-            
+
+            # Crear tareas para cada par rastreado
+            for pair in tracked_pairs:
+                fiat_currency = None
+                crypto_currency = None
+                
+                # Determinar cuál es FIAT y cuál es CRYPTO
+                if pair.from_currency.currency_type.name == 'FIAT':
+                    fiat_currency = Currency(pair.from_currency.symbol)
+                    crypto_currency = Currency(pair.to_currency.symbol)
+                    type = 'BUY'
+                elif pair.to_currency.currency_type.name == 'FIAT':
+                    fiat_currency = Currency(pair.to_currency.symbol)
+                    crypto_currency = Currency(pair.from_currency.symbol)
+                    type = 'SELL'
+                else:
+                    print(f"⚠️ Saltando par {pair.pair_symbol} - no es FIAT/CRYPTO")
+                    continue
+
+                banks = pair.banks_to_track or []
+                amount = float(pair.amount_to_track) if pair.amount_to_track else None
+
+                print(f"🔄 Procesando par {pair.pair_symbol} - {fiat_currency} -> {crypto_currency} - {type} - {banks} - {amount}")
+
+                # Crear tareas para BUY y SELL
+                tasks.append(self._get_p2p_data(fiat_currency, crypto_currency, type, banks, amount))
+
+            if not tasks:
+                print("⚠️ No se generaron tareas de scraping")
+                return []
+
+            # Ejecutar todas las tareas
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            ves_buy, ves_sell, cop_buy, cop_sell, brl_buy, brl_sell = results
-
-            print(f"VES_BUY: {ves_buy}")
-            print(f"VES_SELL: {ves_sell}")
-            print(f"COP_BUY: {cop_buy}")
-            print(f"COP_SELL: {cop_sell}")
-            print(f"BRL_BUY: {brl_buy}")
-            print(f"BRL_SELL: {brl_sell}")
-
+            
             rates = []
-            timestamp = datetime.utcnow()
+            base_rates = {}  # Para calcular tasas derivadas después
 
-            # Crear tasas principales con USDT
-            if ves_buy: rates.append(ExchangeRate.create_safe(from_currency='VES', to_currency='USDT', rate=ves_buy, source=self.source_name))
-            if ves_sell: rates.append(ExchangeRate.create_safe(from_currency='USDT', to_currency='VES', rate=ves_sell, source=self.source_name))
-            if cop_buy: rates.append(ExchangeRate.create_safe(from_currency='COP', to_currency='USDT', rate=cop_buy, source=self.source_name))
-            if cop_sell: rates.append(ExchangeRate.create_safe(from_currency='USDT', to_currency='COP', rate=cop_sell, source=self.source_name))
-            if brl_buy: rates.append(ExchangeRate.create_safe(from_currency='BRL', to_currency='USDT', rate=brl_buy, source=self.source_name))
-            if brl_sell: rates.append(ExchangeRate.create_safe(from_currency='USDT', to_currency='BRL', rate=brl_sell, source=self.source_name))
-            # Calcular tasas derivadas
-            self._calculate_derived_rates(rates, ves_buy, ves_sell, cop_buy, cop_sell, brl_buy, brl_sell)
+            # Procesar resultados
+            for result in results:
+                if result:
+                    from_currency = result['from_currency']
+                    to_currency = result['to_currency']
+                    rate = result['rate']
+                    type = result['type'] if result['type'] else 'BUY'
+                
 
-            print(f"✅ {len(rates)} tasas obtenidas de Binance")
+                    print(f"{from_currency} -> {to_currency} - {rate}")
+
+                # Crear tasas principales
+                
+                    rate = ExchangeRate.create_safe(
+                        from_currency=from_currency, 
+                        to_currency=to_currency, 
+                        rate=rate, 
+                        source=self.source_name
+                    )
+                    if rate:
+                        rates.append(rate)
+                        base_rates[f"{from_currency}_{to_currency}_{type}"] = rate
+
+            # Calcular tasas derivadas basadas en los pares obtenidos
+            self._calculate_dynamic_derived_rates(rates, base_rates)
+
+            print(f"✅ {len(rates)} tasas obtenidas dinámicamente de Binance")
             return rates
 
         except Exception as e:
-            print(f"❌ Error obteniendo tasas de Binance: {e}")
+            print(f"❌ Error obteniendo tasas dinámicas de Binance: {e}")
             return []
 
-    def _calculate_derived_rates(self, rates: List[ExchangeRate], ves_buy, ves_sell, cop_buy, cop_sell, brl_buy, brl_sell):
-        """Calcular tasas derivadas (Zelle, PayPal, cruzadas)"""
+    def _calculate_dynamic_derived_rates(self, rates: List[ExchangeRate], base_rates: dict):
+        """Calcular tasas derivadas dinámicamente (Zelle, PayPal, cruzadas) usando tasas manuales cuando estén disponibles"""
         
-        # Tasas con Zelle (con márgenes) - usando create_safe
-        if ves_buy: 
-            rate = ExchangeRate.create_safe('VES', 'ZELLE', ves_buy, source=f"{self.source_name}_derived", percentage=5, inverse_percentage=True)
-            if rate: rates.append(rate)
-        if ves_sell: 
-            rate = ExchangeRate.create_safe('ZELLE', 'VES', ves_sell, source=f"{self.source_name}_derived", percentage=9)
-            if rate: rates.append(rate)
-        if cop_buy: 
-            rate = ExchangeRate.create_safe('COP', 'ZELLE', cop_buy, source=f"{self.source_name}_derived", percentage=5, inverse_percentage=True)
-            if rate: rates.append(rate)
-        if cop_sell: 
-            rate = ExchangeRate.create_safe('ZELLE', 'COP', cop_sell, source=f"{self.source_name}_derived", percentage=9)
-            if rate: rates.append(rate)
-        if brl_buy: 
-            rate = ExchangeRate.create_safe('BRL', 'ZELLE', brl_buy, source=f"{self.source_name}_derived", percentage=5, inverse_percentage=True)
-            if rate: rates.append(rate)
-        if brl_sell: 
-            rate = ExchangeRate.create_safe('ZELLE', 'BRL', brl_sell, source=f"{self.source_name}_derived", percentage=9)
-            if rate: rates.append(rate)
+        print("🔄 Calculando tasas derivadas (priorizando tasas manuales)...")
+        
+        # Obtener tasas manuales más recientes de la DB para usar en derivadas
+        manual_rates = self._get_latest_manual_rates()
+        effective_rates = self._merge_rates_with_manual_priority(base_rates, manual_rates)
+        
+        print(f"📊 Usando {len(effective_rates)} tasas para derivadas ({len(manual_rates)} manuales, {len(base_rates)} automáticas)")
+        
+        # Separar tasas FIAT->CRYPTO y CRYPTO->FIAT para procesamiento
+        fiat_to_crypto = {}
+        crypto_to_fiat = {}
+        
+        for rate_key, rate_obj in effective_rates.items():
+            rate_value = rate_obj.rate if hasattr(rate_obj, 'rate') else rate_obj
+            parts = rate_key.split('_')
+            
+            if len(parts) >= 2:
+                from_currency = parts[0]
+                to_currency = parts[1]
+                
+                # Detectar si es FIAT->CRYPTO o CRYPTO->FIAT
+                fiat_currencies = ['VES', 'COP', 'BRL', 'USD']
+                crypto_currencies = ['USDT', 'BTC', 'ETH']
+                
+                if from_currency in fiat_currencies and to_currency in crypto_currencies:
+                    # FIAT -> CRYPTO
+                    fiat_to_crypto[from_currency] = rate_value
+                    
+                    # FIAT -> ZELLE (con margen inverso)
+                    zelle_rate = ExchangeRate.create_safe(
+                        from_currency, 'ZELLE', rate_value, 
+                        source=f"{self.source_name}_derived", 
+                        percentage=5, inverse_percentage=True
+                    )
+                    if zelle_rate: rates.append(zelle_rate)
+                    
+                    # FIAT -> PAYPAL (con margen inverso)
+                    paypal_rate = ExchangeRate.create_safe(
+                        from_currency, 'PAYPAL', rate_value, 
+                        source=f"{self.source_name}_derived", 
+                        percentage=5, inverse_percentage=True
+                    )
+                    if paypal_rate: rates.append(paypal_rate)
+                    
+                elif from_currency in crypto_currencies and to_currency in fiat_currencies:
+                    # CRYPTO -> FIAT
+                    crypto_to_fiat[to_currency] = rate_value
+                    
+                    # ZELLE -> FIAT (con margen)
+                    zelle_rate = ExchangeRate.create_safe(
+                        'ZELLE', to_currency, rate_value, 
+                        source=f"{self.source_name}_derived", 
+                        percentage=9
+                    )
+                    if zelle_rate: rates.append(zelle_rate)
+                    
+                    # PAYPAL -> FIAT (con margen mayor)
+                    paypal_rate = ExchangeRate.create_safe(
+                        'PAYPAL', to_currency, rate_value, 
+                        source=f"{self.source_name}_derived", 
+                        percentage=12
+                    )
+                    if paypal_rate: rates.append(paypal_rate)
 
-        # Tasas con PayPal (márgenes más altos) - usando create_safe
-        if ves_buy: 
-            rate = ExchangeRate.create_safe('VES', 'PAYPAL', ves_buy, source=f"{self.source_name}_derived", percentage=5, inverse_percentage=True)
-            if rate: rates.append(rate)
-        if ves_sell: 
-            rate = ExchangeRate.create_safe('PAYPAL', 'VES', ves_sell, source=f"{self.source_name}_derived", percentage=12)
-            if rate: rates.append(rate)
-        if cop_buy: 
-            rate = ExchangeRate.create_safe('COP', 'PAYPAL', cop_buy, source=f"{self.source_name}_derived", percentage=5, inverse_percentage=True)
-            if rate: rates.append(rate)
-        if cop_sell: 
-            rate = ExchangeRate.create_safe('PAYPAL', 'COP', cop_sell, source=f"{self.source_name}_derived", percentage=12)
-            if rate: rates.append(rate)
-        if brl_buy: 
-            rate = ExchangeRate.create_safe('BRL', 'PAYPAL', brl_buy, source=f"{self.source_name}_derived", percentage=5, inverse_percentage=True)
-            if rate: rates.append(rate)
-        if brl_sell: 
-            rate = ExchangeRate.create_safe('PAYPAL', 'BRL', brl_sell, source=f"{self.source_name}_derived", percentage=12)
-            if rate: rates.append(rate)
+        # Calcular tasas cruzadas FIAT-FIAT
+        fiat_currencies = set(fiat_to_crypto.keys()) | set(crypto_to_fiat.keys())
+        fiat_list = list(fiat_currencies)
+        
+        for i, fiat1 in enumerate(fiat_list):
+            for fiat2 in fiat_list[i+1:]:
+                # fiat1 -> fiat2 (usando fiat1->crypto y crypto->fiat2)
+                fiat1_to_crypto = fiat_to_crypto.get(fiat1)
+                crypto_to_fiat2 = crypto_to_fiat.get(fiat2)
+                
+                if fiat1_to_crypto and crypto_to_fiat2:
+                    cross_rate = crypto_to_fiat2 / fiat1_to_crypto
+                    rate = ExchangeRate.create_safe(
+                        fiat1, fiat2, cross_rate, 
+                        source=f"{self.source_name}_cross", 
+                        percentage=8
+                    )
+                    if rate: rates.append(rate)
+                
+                # fiat2 -> fiat1 (usando fiat2->crypto y crypto->fiat1)
+                fiat2_to_crypto = fiat_to_crypto.get(fiat2)
+                crypto_to_fiat1 = crypto_to_fiat.get(fiat1)
+                
+                if fiat2_to_crypto and crypto_to_fiat1:
+                    cross_rate = crypto_to_fiat1 / fiat2_to_crypto
+                    rate = ExchangeRate.create_safe(
+                        fiat2, fiat1, cross_rate, 
+                        source=f"{self.source_name}_cross", 
+                        percentage=8
+                    )
+                    if rate: rates.append(rate)
 
-        # Tasas cruzadas directas - usando create_safe
-        if ves_buy and cop_sell:
-            rate1 = ExchangeRate.create_safe('VES', 'COP', cop_sell / ves_buy, source=f"{self.source_name}_cross", percentage=8)
-            if rate1: rates.append(rate1)
-        if ves_sell and cop_buy:
-            rate2 = ExchangeRate.create_safe('COP', 'VES', ves_sell / cop_buy, source=f"{self.source_name}_cross", percentage=8)
-            if rate2: rates.append(rate2)
-        if ves_buy and brl_sell:
-            rate1 = ExchangeRate.create_safe('VES', 'BRL', brl_sell / ves_buy, source=f"{self.source_name}_cross", percentage=6)
-            if rate1: rates.append(rate1)
-        if ves_sell and brl_buy:
-            rate2 = ExchangeRate.create_safe('BRL', 'VES', ves_sell / brl_buy, source=f"{self.source_name}_cross", percentage=6)
-            if rate2: rates.append(rate2)
-        if cop_buy and brl_sell:
-            rate1 = ExchangeRate.create_safe('COP', 'BRL', brl_sell / cop_buy, source=f"{self.source_name}_cross", percentage=8)
-            if rate1: rates.append(rate1)
-        if cop_sell and brl_buy:
-            rate2 = ExchangeRate.create_safe('BRL', 'COP', cop_sell / brl_buy, source=f"{self.source_name}_cross", percentage=8)
-            if rate2: rates.append(rate2)
+        print(f"✅ Tasas derivadas calculadas")
+
+    def _get_latest_manual_rates(self) -> dict:
+        """Obtener las tasas manuales más recientes de la base de datos"""
+        try:
+            from sqlalchemy import and_, desc
+            
+            # Obtener todas las tasas manuales activas más recientes por par de monedas
+            query = self.db_session.query(ExchangeRate).filter(
+                and_(
+                    ExchangeRate.is_manual == True,
+                    ExchangeRate.is_active == True
+                )
+            ).order_by(desc(ExchangeRate.created_at))
+            
+            manual_exchange_rates = query.all()
+
+            print(f"📝 Tasas manuales obtenidas desde la DB: {manual_exchange_rates}")
+            
+            manual_rates = {}
+            processed_pairs = set()
+            
+            for rate in manual_exchange_rates:
+                # Crear key único para el par de monedas
+                pair_key = f"{rate.from_currency}_{rate.to_currency}"
+                
+                # Solo tomar la más reciente para cada par (ya está ordenado por created_at desc)
+                if pair_key in processed_pairs:
+                    continue
+                    
+                processed_pairs.add(pair_key)
+                
+                manual_rates[pair_key] = float(rate.rate)
+                print(f"📝 Tasa manual encontrada: {pair_key} = {rate.rate} (creada: {rate.created_at})")
+
+            print(f"📝 Tasas manuales obtenidas: {manual_rates}")
+                
+            return manual_rates
+            
+        except Exception as e:
+            print(f"⚠️ Error obteniendo tasas manuales: {e}")
+            return {}
+
+    def _merge_rates_with_manual_priority(self, auto_rates: dict, manual_rates: dict) -> dict:
+        """Combinar tasas automáticas y manuales, priorizando las manuales"""
+        effective_rates = auto_rates.copy()
+        
+        # Sobrescribir con tasas manuales cuando estén disponibles
+        for key, value in manual_rates.items():
+            if key in effective_rates:
+                print(f"🔄 Reemplazando tasa automática {key}: {effective_rates[key]} → {value} (manual)")
+            else:
+                print(f"➕ Añadiendo tasa manual {key}: {value}")
+            effective_rates[key] = value
+            
+        return effective_rates
 
     async def close(self):
         """Cerrar sesión HTTP"""

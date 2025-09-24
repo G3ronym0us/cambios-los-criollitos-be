@@ -1,11 +1,37 @@
-.env*__pycache__/
+# Environment files
+.env*
+.env
+
+# Python cache and compiled files
+__pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.so
 .Python
+
+# Virtual environments
 env/
-.env
 venv/
 .venv
+
+# Celery
 celerybeat-schedule
+celerybeat.pid
+
+# IDE and OS files
 .DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Database
+*.db
+*.sqlite3
+
+# Docker volumes
+docker-compose.override.yml

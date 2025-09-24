@@ -21,9 +21,20 @@ class CurrencyPairRepository:
         
         pair_symbol = CurrencyPair.create_pair_symbol(from_currency.symbol, to_currency.symbol)
         
+        # Validate base_pair if provided
+        if pair_data.base_pair_id:
+            base_pair = self.get_by_id(pair_data.base_pair_id)
+            if not base_pair:
+                raise ValueError("Base pair not found")
+            if not (base_pair.binance_tracked or base_pair.is_manual):
+                raise ValueError("Base pair must be either Binance tracked or have manual rates")
+
         db_pair = CurrencyPair(
             from_currency_id=pair_data.from_currency_id,
             to_currency_id=pair_data.to_currency_id,
+            base_pair_id=pair_data.base_pair_id,
+            derived_percentage=pair_data.derived_percentage,
+            use_inverse_percentage=pair_data.use_inverse_percentage,
             pair_symbol=pair_symbol,
             description=pair_data.description,
             is_active=pair_data.is_active,
@@ -33,6 +44,11 @@ class CurrencyPairRepository:
             amount_to_track=pair_data.amount_to_track
         )
         
+        # Validate base pair configuration
+        valid_base, base_error = db_pair.validate_base_pair()
+        if not valid_base:
+            raise ValueError(base_error)
+
         # Validate binance tracking requirements
         if db_pair.binance_tracked:
             # First do basic validation
@@ -57,14 +73,16 @@ class CurrencyPairRepository:
         """Get currency pair by ID with related currencies"""
         return self.db.query(CurrencyPair)\
             .options(joinedload(CurrencyPair.from_currency), 
-                    joinedload(CurrencyPair.to_currency))\
+                    joinedload(CurrencyPair.to_currency),
+                    joinedload(CurrencyPair.base_pair))\
             .filter(CurrencyPair.id == pair_id).first()
 
     def get_by_symbol(self, pair_symbol: str) -> Optional[CurrencyPair]:
         """Get currency pair by symbol"""
         return self.db.query(CurrencyPair)\
             .options(joinedload(CurrencyPair.from_currency), 
-                    joinedload(CurrencyPair.to_currency))\
+                    joinedload(CurrencyPair.to_currency),
+                    joinedload(CurrencyPair.base_pair))\
             .filter(CurrencyPair.pair_symbol == pair_symbol.upper()).first()
 
     def get_by_currencies(self, from_currency_id: int, to_currency_id: int) -> Optional[CurrencyPair]:
@@ -162,6 +180,11 @@ class CurrencyPairRepository:
         if not pair:
             return False
         
+        # Validate that no derived pairs depend on this pair
+        can_delete, error_msg = self.validate_base_pair_usage(pair_id)
+        if not can_delete:
+            raise ValueError(error_msg)
+        
         self.db.delete(pair)
         self.db.commit()
         return True
@@ -215,3 +238,37 @@ class CurrencyPairRepository:
         pair.updated_at = datetime.utcnow()
         self.db.commit()
         return True
+
+    def get_base_pairs(self) -> List[CurrencyPair]:
+        """Get all pairs that can be used as base pairs (Binance tracked or manual rates)"""
+        return self.db.query(CurrencyPair)\
+            .options(joinedload(CurrencyPair.from_currency), 
+                    joinedload(CurrencyPair.to_currency))\
+            .filter(
+                CurrencyPair.is_active == True,
+                CurrencyPair.binance_tracked == True  # For now, only Binance tracked pairs can be base pairs
+            ).all()
+
+    def get_derived_pairs(self, base_pair_id: int) -> List[CurrencyPair]:
+        """Get all pairs that are derived from a specific base pair"""
+        return self.db.query(CurrencyPair)\
+            .options(joinedload(CurrencyPair.from_currency), 
+                    joinedload(CurrencyPair.to_currency),
+                    joinedload(CurrencyPair.base_pair))\
+            .filter(CurrencyPair.base_pair_id == base_pair_id).all()
+
+    def validate_base_pair_usage(self, pair_id: int) -> tuple[bool, str]:
+        """Validate if a pair can be deleted (no derived pairs depend on it)"""
+        derived_pairs = self.get_derived_pairs(pair_id)
+        if derived_pairs:
+            pair_names = [p.pair_symbol for p in derived_pairs]
+            return False, f"Cannot delete pair because it's used as base by: {', '.join(pair_names)}"
+        return True, ""
+
+    def get_pairs_with_base_rates(self) -> List[CurrencyPair]:
+        """Get all pairs that have base rates"""
+        return self.db.query(CurrencyPair)\
+            .options(joinedload(CurrencyPair.from_currency), 
+                    joinedload(CurrencyPair.to_currency),
+                    joinedload(CurrencyPair.base_pair))\
+            .filter(CurrencyPair.base_pair_id.isnot(None)).all()

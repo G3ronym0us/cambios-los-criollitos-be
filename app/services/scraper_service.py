@@ -165,9 +165,10 @@ class BinanceP2PScraperService:
             # Procesar resultados
             ves_buy, ves_sell, cop_buy, cop_sell, brl_buy, brl_sell = results
 
+            # Only collect base rates from Binance (no derived rates here)
             rates: List[ExchangeRate] = []
 
-
+            # Add base Binance P2P rates (FIAT-USDT pairs)
             self.add_rate_to_rates(rates, Currency.VES, Currency.USDT, ves_buy)
             self.add_rate_to_rates(rates, Currency.USDT, Currency.VES, ves_sell)
             self.add_rate_to_rates(rates, Currency.COP, Currency.USDT, cop_buy)
@@ -175,44 +176,23 @@ class BinanceP2PScraperService:
             self.add_rate_to_rates(rates, Currency.BRL, Currency.USDT, brl_buy)
             self.add_rate_to_rates(rates, Currency.USDT, Currency.BRL, brl_sell)
 
-            self.add_rate_to_rates(rates, Currency.VES, Currency.ZELLE, ves_buy, 5, inverse_percentage=True)
-            self.add_rate_to_rates(rates, Currency.ZELLE, Currency.VES, ves_sell, 10)
-            self.add_rate_to_rates(rates, Currency.COP, Currency.ZELLE, cop_buy, 10)
-            self.add_rate_to_rates(rates, Currency.ZELLE, Currency.COP, cop_sell, 10)
-            self.add_rate_to_rates(rates, Currency.BRL, Currency.ZELLE, brl_buy, 10)
-            self.add_rate_to_rates(rates, Currency.ZELLE, Currency.BRL, brl_sell, 10)
-
-            self.add_rate_to_rates(rates, Currency.VES, Currency.PAYPAL, ves_buy, 8, inverse_percentage=True)
-            self.add_rate_to_rates(rates, Currency.PAYPAL, Currency.VES, ves_sell, 13)
-            self.add_rate_to_rates(rates, Currency.COP, Currency.PAYPAL, cop_buy, 13)
-            self.add_rate_to_rates(rates, Currency.PAYPAL, Currency.COP, cop_sell, 13)
-            self.add_rate_to_rates(rates, Currency.BRL, Currency.PAYPAL, brl_buy, 13)
-            self.add_rate_to_rates(rates, Currency.PAYPAL, Currency.BRL, brl_sell, 13)
-
-            self.add_cross_rate_to_rates(rates, Currency.VES, ves_buy, Currency.COP, cop_sell, 8)
-            self.add_cross_rate_to_rates(rates, Currency.COP, cop_buy, Currency.VES, ves_sell, 8)
-            self.add_cross_rate_to_rates(rates, Currency.BRL, brl_buy, Currency.VES, ves_sell, 6)
-            self.add_cross_rate_to_rates(rates, Currency.VES, ves_buy, Currency.BRL, brl_sell, 6)
-            self.add_cross_rate_to_rates(rates, Currency.COP, cop_buy, Currency.BRL, brl_sell, 8)
-            self.add_cross_rate_to_rates(rates, Currency.BRL, brl_buy, Currency.COP, cop_sell, 8)
-
             # Filtrar excepciones   
             def safe_price(price):
                 return price if isinstance(price, (int, float)) and price is not None else None
             
-            # Verificar que obtuvimos al menos algunos precios
-            valid_prices = sum(1 for value in rates if value is not None)
+            # Verificar que obtuvimos al menos algunos precios base
+            valid_prices = sum(1 for rate in rates if rate is not None)
             
             if valid_prices > 0:
-                print(f"📊 {valid_prices}/6 precios obtenidos exitosamente")
+                print(f"📊 {valid_prices} base rates obtained successfully from Binance P2P")
                 return rates
             else:
-                print("❌ No se pudieron obtener precios válidos")
-                return {}
+                print("❌ No base rates could be obtained")
+                return []
             
         except Exception as e:
             print(f"❌ Error obteniendo tasas: {e}")
-            return {}
+            return []
 
     async def close(self):
         """Cerrar sesión HTTP"""

@@ -153,6 +153,36 @@ async def get_currency_pair_stats(
     
     return CurrencyPairStats(**stats)
 
+@router.get("/base-pairs", response_model=List[CurrencyPairResponse])
+async def get_base_pairs(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user)
+):
+    """Get all pairs that can be used as base pairs (MODERATOR+ access)"""
+    pair_repo = CurrencyPairRepository(db)
+    base_pairs = pair_repo.get_base_pairs()
+    return [CurrencyPairResponse(**pair.dict()) for pair in base_pairs]
+
+@router.get("/{pair_id}/derived", response_model=List[CurrencyPairResponse])
+async def get_derived_pairs(
+    pair_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user)
+):
+    """Get all pairs derived from a specific base pair (MODERATOR+ access)"""
+    pair_repo = CurrencyPairRepository(db)
+    
+    # Validate base pair exists
+    base_pair = pair_repo.get_by_id(pair_id)
+    if not base_pair:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Base pair not found"
+        )
+    
+    derived_pairs = pair_repo.get_derived_pairs(pair_id)
+    return [CurrencyPairResponse(**pair.dict()) for pair in derived_pairs]
+
 @router.get("/{pair_id}", response_model=CurrencyPairResponse)
 async def get_currency_pair(
     pair_id: int,
@@ -371,9 +401,15 @@ async def delete_currency_pair(
             detail="Currency pair not found"
         )
     
-    success = pair_repo.delete_currency_pair(pair_id)
-    if not success:
+    try:
+        success = pair_repo.delete_currency_pair(pair_id)
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to delete currency pair"
+            )
+    except ValueError as e:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to delete currency pair"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
         )

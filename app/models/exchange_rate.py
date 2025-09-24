@@ -51,16 +51,18 @@ class ExchangeRate(Base):
             return None
         
         if percentage is not None:
+            # Convert percentage to float to ensure compatibility with rate operations
+            percentage_float = float(percentage)
             if inverse_percentage:
-                rate = rate * (1 + (percentage / 100))
+                rate = rate * (1 + (percentage_float / 100))
             else:
-                rate = rate * (1 - (percentage / 100))
+                rate = rate * (1 - (percentage_float / 100))
                 
         return cls(
             from_currency=from_currency.value if hasattr(from_currency, 'value') else from_currency,
             to_currency=to_currency.value if hasattr(to_currency, 'value') else to_currency,
             rate=rate,
             source=source,
-            percentage=percentage,
+            percentage=float(percentage) if percentage is not None else None,
             inverse_percentage=inverse_percentage
         )

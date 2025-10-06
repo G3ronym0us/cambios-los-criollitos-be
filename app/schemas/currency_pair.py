@@ -3,10 +3,12 @@ from typing import Optional, List
 from datetime import datetime
 from decimal import Decimal
 from app.schemas.currency import CurrencyResponse
+from app.enums.pair_type import PairType
 
 class CurrencyPairBase(BaseModel):
     from_currency_id: int
     to_currency_id: int
+    pair_type: PairType = PairType.BASE
     base_pair_id: Optional[int] = None
     derived_percentage: Optional[Decimal] = None
     use_inverse_percentage: bool = False
@@ -43,10 +45,21 @@ class CurrencyPairBase(BaseModel):
         # to ensure base_pair exists and is not self-referencing
         return v
 
+    @validator('pair_type', pre=True)
+    def validate_pair_type(cls, v):
+        # Convert string to PairType enum if needed
+        if isinstance(v, str):
+            try:
+                return PairType(v.lower())
+            except ValueError:
+                raise ValueError(f'Invalid pair_type. Must be one of: {", ".join([pt.value for pt in PairType])}')
+        return v
+
 class CurrencyPairCreate(CurrencyPairBase):
     pass
 
 class CurrencyPairUpdate(BaseModel):
+    pair_type: Optional[PairType] = None
     base_pair_id: Optional[int] = None
     derived_percentage: Optional[Decimal] = None
     use_inverse_percentage: Optional[bool] = None
@@ -57,9 +70,20 @@ class CurrencyPairUpdate(BaseModel):
     banks_to_track: Optional[List[str]] = None
     amount_to_track: Optional[Decimal] = None
 
+    @validator('pair_type', pre=True)
+    def validate_pair_type(cls, v):
+        # Convert string to PairType enum if needed
+        if v is not None and isinstance(v, str):
+            try:
+                return PairType(v.lower())
+            except ValueError:
+                raise ValueError(f'Invalid pair_type. Must be one of: {", ".join([pt.value for pt in PairType])}')
+        return v
+
 class CurrencyPairResponse(BaseModel):
     id: int
     pair_symbol: str
+    pair_type: PairType
     from_currency_id: int
     to_currency_id: int
     base_pair_id: Optional[int] = None
@@ -80,6 +104,7 @@ class CurrencyPairResponse(BaseModel):
 
     class Config:
         from_attributes = True
+        use_enum_values = True
 
 class CurrencyPairList(BaseModel):
     pairs: list[CurrencyPairResponse]

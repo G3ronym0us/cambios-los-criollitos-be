@@ -32,6 +32,7 @@ class CurrencyPairRepository:
         db_pair = CurrencyPair(
             from_currency_id=pair_data.from_currency_id,
             to_currency_id=pair_data.to_currency_id,
+            pair_type=pair_data.pair_type,
             base_pair_id=pair_data.base_pair_id,
             derived_percentage=pair_data.derived_percentage,
             use_inverse_percentage=pair_data.use_inverse_percentage,
@@ -268,7 +269,22 @@ class CurrencyPairRepository:
     def get_pairs_with_base_rates(self) -> List[CurrencyPair]:
         """Get all pairs that have base rates"""
         return self.db.query(CurrencyPair)\
-            .options(joinedload(CurrencyPair.from_currency), 
+            .options(joinedload(CurrencyPair.from_currency),
                     joinedload(CurrencyPair.to_currency),
                     joinedload(CurrencyPair.base_pair))\
             .filter(CurrencyPair.base_pair_id.isnot(None)).all()
+
+    def get_cross_rate_pairs(self) -> List[CurrencyPair]:
+        """
+        Get all active cross rate pairs (FIAT-FIAT pairs).
+        These require two base rates for calculation.
+        """
+        from app.enums.pair_type import PairType
+
+        return self.db.query(CurrencyPair)\
+            .options(joinedload(CurrencyPair.from_currency),
+                    joinedload(CurrencyPair.to_currency))\
+            .filter(
+                CurrencyPair.is_active == True,
+                CurrencyPair.pair_type == PairType.CROSS
+            ).all()

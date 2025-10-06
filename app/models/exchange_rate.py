@@ -54,7 +54,7 @@ class ExchangeRate(Base):
             # Convert percentage to float to ensure compatibility with rate operations
             percentage_float = float(percentage)
             if inverse_percentage:
-                rate = rate * (1 + (percentage_float / 100))
+                rate = rate / (1 - (percentage_float / 100))
             else:
                 rate = rate * (1 - (percentage_float / 100))
                 

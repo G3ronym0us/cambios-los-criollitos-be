@@ -172,6 +172,9 @@ class BinanceP2PScraper(BaseScraper):
             # Calcular tasas derivadas basadas en los pares obtenidos
             self._calculate_dynamic_derived_rates(rates, base_rates)
 
+            # Calcular tasas cruzadas entre fiats
+            self._calculate_cross_rates(rates, base_rates)
+
             print(f"✅ {len(rates)} tasas obtenidas dinámicamente de Binance")
             return rates
 
@@ -273,6 +276,88 @@ class BinanceP2PScraper(BaseScraper):
             effective_rates[key] = value
             
         return effective_rates
+
+    def _calculate_cross_rates(self, rates: List[ExchangeRate], base_rates: dict):
+        """
+        Calcular tasas cruzadas entre dos FIATs usando USDT como intermediario.
+
+        Para un par VES→COP, buscamos:
+        - VES→USDT (primera tasa base)
+        - USDT→COP (segunda tasa base)
+        - Fórmula: VES→COP = (VES→USDT) / (USDT→COP)
+
+        Args:
+            rates: Lista de tasas donde se agregarán las tasas cruzadas
+            base_rates: Diccionario con tasas base obtenidas
+        """
+        print("🔄 Calculando tasas cruzadas FIAT-FIAT...")
+
+        # Obtener pares configurados como CROSS
+        cross_pairs = self.currency_pair_repo.get_cross_rate_pairs()
+
+        if not cross_pairs:
+            print("⚠️ No hay pares cruzados configurados")
+            return
+
+        print(f"🎯 Encontrados {len(cross_pairs)} pares cruzados: {[p.pair_symbol for p in cross_pairs]}")
+
+        # Obtener tasas manuales para priorizar
+        manual_rates = self._get_latest_manual_rates()
+        effective_rates = self._merge_rates_with_manual_priority(base_rates, manual_rates)
+
+        # Moneda intermediaria
+        intermediate = 'USDT'
+        cross_rates_count = 0
+
+        for pair in cross_pairs:
+            from_fiat = pair.from_currency.symbol
+            to_fiat = pair.to_currency.symbol
+
+            # Para calcular from_fiat → to_fiat necesitamos:
+            # 1. from_fiat → USDT
+            # 2. USDT → to_fiat
+            # Fórmula: from_fiat → to_fiat = (from_fiat → USDT) / (USDT → to_fiat)
+
+            key_from_to_intermediate = f"{from_fiat}_{intermediate}"
+            key_intermediate_to_to = f"{intermediate}_{to_fiat}"
+
+            rate_from_to_intermediate = effective_rates.get(key_from_to_intermediate)
+            rate_intermediate_to_to = effective_rates.get(key_intermediate_to_to)
+
+            print(f"🔍 Buscando tasas para {from_fiat}→{to_fiat}:")
+            print(f"   - {key_from_to_intermediate}: {rate_from_to_intermediate}")
+            print(f"   - {key_intermediate_to_to}: {rate_intermediate_to_to}")
+
+            # Si tenemos ambas tasas base, calculamos la cruzada
+            if rate_from_to_intermediate and rate_intermediate_to_to:
+                # Fórmula: from_fiat → to_fiat = (from_fiat → USDT) / (USDT → to_fiat)
+                cross_rate = rate_from_to_intermediate / rate_intermediate_to_to
+
+                # Crear ExchangeRate (create_safe aplica el percentage automáticamente)
+                rate_obj = ExchangeRate.create_safe(
+                    from_currency=from_fiat,
+                    to_currency=to_fiat,
+                    rate=cross_rate,
+                    source=f"{self.source_name}_cross",
+                    percentage=float(pair.derived_percentage) if pair.derived_percentage else None,
+                    inverse_percentage=pair.use_inverse_percentage
+                )
+
+                if rate_obj:
+                    rates.append(rate_obj)
+                    cross_rates_count += 1
+                    print(f"✅ Tasa cruzada: {from_fiat}→{to_fiat} = {rate_from_to_intermediate} / {rate_intermediate_to_to} = {rate_obj.rate:.6f}")
+            else:
+                # Mostrar qué tasas faltan
+                missing = []
+                if not rate_from_to_intermediate:
+                    missing.append(key_from_to_intermediate)
+                if not rate_intermediate_to_to:
+                    missing.append(key_intermediate_to_to)
+
+                print(f"⚠️ No se puede calcular {from_fiat}→{to_fiat}: faltan {', '.join(missing)}")
+
+        print(f"✅ {cross_rates_count} tasas cruzadas calculadas")
 
     async def close(self):
         """Cerrar sesión HTTP"""

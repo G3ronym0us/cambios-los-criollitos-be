@@ -1,8 +1,9 @@
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, UniqueConstraint, Numeric, JSON
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, UniqueConstraint, Numeric, JSON, Enum as SQLEnum
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from app.database.connection import Base
 from app.models.currency import CurrencyType
+from app.enums.pair_type import PairType
 
 class CurrencyPair(Base):
     __tablename__ = "currency_pairs"
@@ -22,7 +23,10 @@ class CurrencyPair(Base):
     
     # Pair identifier (e.g., "USDT-VES", "ZELLE-COP")
     pair_symbol = Column(String(20), unique=True, index=True, nullable=False)
-    
+
+    # Pair type (base, derived, cross)
+    pair_type = Column(SQLEnum(PairType), nullable=False, default=PairType.BASE)
+
     # Configuration
     is_active = Column(Boolean, default=True, nullable=False)
     is_monitored = Column(Boolean, default=True, nullable=False)  # Para scraping automático
@@ -72,6 +76,7 @@ class CurrencyPair(Base):
         return {
             "id": self.id,
             "pair_symbol": self.pair_symbol,
+            "pair_type": self.pair_type.value if self.pair_type else None,
             "from_currency_id": self.from_currency_id,
             "to_currency_id": self.to_currency_id,
             "from_currency": self.from_currency.dict() if self.from_currency else None,

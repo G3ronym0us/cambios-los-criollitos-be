@@ -70,6 +70,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Trusted Host - Asegurar que los redirects usen el protocolo correcto
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["api.cambiosloscriollitos.com", "localhost", "127.0.0.1", "*"]
+)
+
 app.include_router(scraping.router)
 app.include_router(auth.router)
 app.include_router(currency.router)

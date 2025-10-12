@@ -11,7 +11,7 @@ from app.core.dependencies import get_root_user
 from app.models.user import User
 from app.models.currency import CurrencyType
 
-router = APIRouter(prefix="/currencies", tags=["Currencies"])
+router = APIRouter(prefix="/currencies", tags=["Currencies"], redirect_slashes=False)
 
 @router.post("/", response_model=CurrencyResponse, status_code=status.HTTP_201_CREATED)
 async def create_currency(
@@ -32,18 +32,16 @@ async def create_currency(
     currency = currency_repo.create_currency(currency_data)
     return CurrencyResponse(**currency.dict())
 
-@router.get("/", response_model=CurrencyList)
-async def get_currencies(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(100, ge=1, le=1000),
-    currency_type: Optional[CurrencyType] = None,
-    search: Optional[str] = None,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_root_user)
-):
-    """Get all currencies with pagination and filters (ROOT access only)"""
+async def _get_currencies_impl(
+    skip: int,
+    limit: int,
+    currency_type: Optional[CurrencyType],
+    search: Optional[str],
+    db: Session
+) -> CurrencyList:
+    """Implementación compartida para obtener currencies"""
     currency_repo = CurrencyRepository(db)
-    
+
     if search:
         currencies = currency_repo.search_currencies(search)
         total = len(currencies)
@@ -56,13 +54,39 @@ async def get_currencies(
         currencies = currency_repo.get_all_currencies(skip, limit)
         # For total count, we'd need another query or estimate
         total = len(currencies) + skip if len(currencies) == limit else skip + len(currencies)
-    
+
     return CurrencyList(
         currencies=[CurrencyResponse(**currency.dict()) for currency in currencies],
         total=total,
         skip=skip,
         limit=limit
     )
+
+@router.get("", response_model=CurrencyList)
+async def get_currencies_no_slash(
+    skip: int = Query(0, ge=0, alias="page"),
+    limit: int = Query(100, ge=1, le=1000, alias="per_page"),
+    currency_type: Optional[CurrencyType] = None,
+    search: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_root_user)
+):
+    """Get all currencies without trailing slash (ROOT access only)"""
+    # Convertir page/per_page a skip/limit
+    actual_skip = (skip - 1) * limit if skip > 0 else 0
+    return await _get_currencies_impl(actual_skip, limit, currency_type, search, db)
+
+@router.get("/", response_model=CurrencyList)
+async def get_currencies(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    currency_type: Optional[CurrencyType] = None,
+    search: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_root_user)
+):
+    """Get all currencies with pagination and filters (ROOT access only)"""
+    return await _get_currencies_impl(skip, limit, currency_type, search, db)
 
 @router.get("/{currency_id}", response_model=CurrencyResponse)
 async def get_currency(

@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional
+from uuid import UUID
 
 from app.database.connection import get_db
 from app.schemas.currency import (
@@ -88,22 +89,22 @@ async def get_currencies(
     """Get all currencies with pagination and filters (ROOT access only)"""
     return await _get_currencies_impl(skip, limit, currency_type, search, db)
 
-@router.get("/{currency_id}", response_model=CurrencyResponse)
+@router.get("/{currency_uuid}", response_model=CurrencyResponse)
 async def get_currency(
-    currency_id: int,
+    currency_uuid: UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_root_user)
 ):
-    """Get currency by ID (ROOT access only)"""
+    """Get currency by UUID (ROOT access only)"""
     currency_repo = CurrencyRepository(db)
-    currency = currency_repo.get_by_id(currency_id)
-    
+    currency = currency_repo.get_by_uuid(currency_uuid)
+
     if not currency:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Currency not found"
         )
-    
+
     return CurrencyResponse(**currency.dict())
 
 @router.get("/symbol/{symbol}", response_model=CurrencyResponse)
@@ -124,32 +125,32 @@ async def get_currency_by_symbol(
     
     return CurrencyResponse(**currency.dict())
 
-@router.put("/{currency_id}", response_model=CurrencyResponse)
+@router.put("/{currency_uuid}", response_model=CurrencyResponse)
 async def update_currency(
-    currency_id: int,
+    currency_uuid: UUID,
     currency_data: CurrencyUpdate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_root_user)
 ):
     """Update currency (ROOT access only)"""
     currency_repo = CurrencyRepository(db)
-    
+
     # Check if currency exists
-    existing_currency = currency_repo.get_by_id(currency_id)
+    existing_currency = currency_repo.get_by_uuid(currency_uuid)
     if not existing_currency:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Currency not found"
         )
-    
+
     # Check if new symbol conflicts with existing currencies
-    if currency_data.symbol and currency_repo.symbol_exists(currency_data.symbol, exclude_id=currency_id):
+    if currency_data.symbol and currency_repo.symbol_exists(currency_data.symbol, exclude_id=existing_currency.id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Currency with symbol '{currency_data.symbol}' already exists"
         )
-    
-    updated_currency = currency_repo.update_currency(currency_id, currency_data)
+
+    updated_currency = currency_repo.update_currency(existing_currency.id, currency_data)
     if not updated_currency:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -158,22 +159,23 @@ async def update_currency(
     
     return CurrencyResponse(**updated_currency.dict())
 
-@router.delete("/{currency_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{currency_uuid}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_currency(
-    currency_id: int,
+    currency_uuid: UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_root_user)
 ):
     """Delete currency (ROOT access only)"""
     currency_repo = CurrencyRepository(db)
-    
-    if not currency_repo.get_by_id(currency_id):
+
+    currency = currency_repo.get_by_uuid(currency_uuid)
+    if not currency:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Currency not found"
         )
-    
-    success = currency_repo.delete_currency(currency_id)
+
+    success = currency_repo.delete_currency(currency.id)
     if not success:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

@@ -6,7 +6,7 @@ from typing import List, Optional
 from datetime import datetime
 from contextlib import asynccontextmanager
 from app.services.scraper_service import BinanceP2PScraperService
-from app.routers import scraping, auth, currency, currency_pair, binance, rates
+from app.routers import scraping, auth, currency, currency_pair, binance, rates, transaction, user, commission_config
 from app.database.connection import get_db
 
 # Modelos Pydantic
@@ -79,10 +79,13 @@ app.add_middleware(
 
 app.include_router(scraping.router)
 app.include_router(auth.router)
+app.include_router(user.router)
 app.include_router(currency.router)
 app.include_router(currency_pair.router)
 app.include_router(binance.router)
 app.include_router(rates.router)
+app.include_router(transaction.router)
+app.include_router(commission_config.router)
 
 # Rutas de la API
 @app.get("/")
@@ -112,36 +115,7 @@ async def health():
         "scraper_available": app_state["scraper_available"],
     }
 
-@app.get("/api/rates")
-async def get_all_rates(db: Session = Depends(get_db)):
-    """Obtener todas las tasas de cambio desde la base de datos"""
-    from app.repositories.exchange_rate_repository import ExchangeRateRepository
-    
-    repo = ExchangeRateRepository(db)
-    rates = repo.get_active_rates()
-    
-    return rates
-
-@app.get("/api/rates/{user_id}", response_model=UserRatesResponse)
-async def get_user_rates(user_id: str):
-    scraper = BinanceP2PScraperService()
-    rates = await scraper.get_offers(user_id)
-    
-    for rate_data in rates:
-        rates.append(RateResponse(
-            id=rate_data["id"],
-            from_currency=rate_data["from"],
-            to_currency=rate_data["to"],
-            rate=rate_data["rate"],
-            percentage=rate_data["percentage"],
-            last_updated=app_state["last_update"]
-        ))
-    
-    return UserRatesResponse(
-        user_id=user_id,
-        user_name=user_id,
-        rates=rates
-    )
+# REMOVED: Duplicate /rates endpoint - now handled by rates.router as public endpoint
 
 @app.get("/api/users")
 async def get_users():

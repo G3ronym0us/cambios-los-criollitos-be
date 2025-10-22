@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime
+from uuid import UUID
 
 from app.database.connection import get_db
 from app.schemas.currency_pair import (
@@ -158,47 +159,58 @@ async def get_base_pairs(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_moderator_user)
 ):
-    """Get all pairs that can be used as base pairs (MODERATOR+ access)"""
+    """
+    Get all pairs that can be used as base pairs for derived rates (MODERATOR+ access)
+
+    Returns currency pairs that meet ALL of these conditions:
+    1. pair_type = BASE
+    2. is_active = True
+    3. At least ONE of:
+       - binance_tracked = True (rates obtained from Binance)
+       - Has active manual rates (is_manual = True in exchange_rates)
+
+    These pairs can be used as base_pair_uuid when creating derived pairs.
+    """
     pair_repo = CurrencyPairRepository(db)
     base_pairs = pair_repo.get_base_pairs()
     return [CurrencyPairResponse(**pair.dict()) for pair in base_pairs]
 
-@router.get("/{pair_id}/derived", response_model=List[CurrencyPairResponse])
+@router.get("/{pair_uuid}/derived", response_model=List[CurrencyPairResponse])
 async def get_derived_pairs(
-    pair_id: int,
+    pair_uuid: UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_moderator_user)
 ):
     """Get all pairs derived from a specific base pair (MODERATOR+ access)"""
     pair_repo = CurrencyPairRepository(db)
-    
+
     # Validate base pair exists
-    base_pair = pair_repo.get_by_id(pair_id)
+    base_pair = pair_repo.get_by_uuid(pair_uuid)
     if not base_pair:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Base pair not found"
         )
-    
-    derived_pairs = pair_repo.get_derived_pairs(pair_id)
+
+    derived_pairs = pair_repo.get_derived_pairs(base_pair.id)
     return [CurrencyPairResponse(**pair.dict()) for pair in derived_pairs]
 
-@router.get("/{pair_id}", response_model=CurrencyPairResponse)
+@router.get("/{pair_uuid}", response_model=CurrencyPairResponse)
 async def get_currency_pair(
-    pair_id: int,
+    pair_uuid: UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_moderator_user)
 ):
-    """Get currency pair by ID (MODERATOR+ access)"""
+    """Get currency pair by UUID (MODERATOR+ access)"""
     pair_repo = CurrencyPairRepository(db)
-    pair = pair_repo.get_by_id(pair_id)
-    
+    pair = pair_repo.get_by_uuid(pair_uuid)
+
     if not pair:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Currency pair not found"
         )
-    
+
     return CurrencyPairResponse(**pair.dict())
 
 @router.get("/symbol/{pair_symbol}", response_model=CurrencyPairResponse)
@@ -219,37 +231,47 @@ async def get_currency_pair_by_symbol(
     
     return CurrencyPairResponse(**pair.dict())
 
-@router.get("/currency/{currency_id}", response_model=List[CurrencyPairResponse])
+@router.get("/currency/{currency_uuid}", response_model=List[CurrencyPairResponse])
 async def get_pairs_by_currency(
-    currency_id: int,
+    currency_uuid: UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_moderator_user)
 ):
     """Get all pairs that include a specific currency (MODERATOR+ access)"""
     pair_repo = CurrencyPairRepository(db)
-    pairs = pair_repo.get_pairs_by_currency(currency_id)
-    
+    currency_repo = CurrencyRepository(db)
+
+    # Get currency by UUID
+    currency = currency_repo.get_by_uuid(currency_uuid)
+    if not currency:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Currency with UUID {currency_uuid} not found"
+        )
+
+    pairs = pair_repo.get_pairs_by_currency(currency.id)
+
     return [CurrencyPairResponse(**pair.dict()) for pair in pairs]
 
-@router.put("/{pair_id}", response_model=CurrencyPairResponse)
+@router.put("/{pair_uuid}", response_model=CurrencyPairResponse)
 async def update_currency_pair(
-    pair_id: int,
+    pair_uuid: UUID,
     pair_data: CurrencyPairUpdate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_root_user)
 ):
     """Update currency pair (ROOT access only)"""
     pair_repo = CurrencyPairRepository(db)
-    
+
     # Check if pair exists
-    existing_pair = pair_repo.get_by_id(pair_id)
+    existing_pair = pair_repo.get_by_uuid(pair_uuid)
     if not existing_pair:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Currency pair not found"
         )
-    
-    updated_pair = await pair_repo.update_currency_pair(pair_id, pair_data)
+
+    updated_pair = await pair_repo.update_currency_pair(existing_pair.id, pair_data)
     if not updated_pair:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -258,32 +280,32 @@ async def update_currency_pair(
     
     return CurrencyPairResponse(**updated_pair.dict())
 
-@router.patch("/{pair_id}/status", response_model=CurrencyPairResponse)
+@router.patch("/{pair_uuid}/status", response_model=CurrencyPairResponse)
 async def update_pair_status(
-    pair_id: int,
+    pair_uuid: UUID,
     status_data: CurrencyPairStatusUpdate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_root_user)
 ):
     """Update pair status (active/monitoring) (ROOT access only)"""
     pair_repo = CurrencyPairRepository(db)
-    
-    pair = pair_repo.get_by_id(pair_id)
+
+    pair = pair_repo.get_by_uuid(pair_uuid)
     if not pair:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Currency pair not found"
         )
-    
+
     # Update basic status fields first
     if status_data.is_active is not None:
-        pair_repo.toggle_active_status(pair_id, status_data.is_active)
-    
+        pair_repo.toggle_active_status(pair.id, status_data.is_active)
+
     if status_data.is_monitored is not None:
-        pair_repo.toggle_monitoring(pair_id, status_data.is_monitored)
-    
+        pair_repo.toggle_monitoring(pair.id, status_data.is_monitored)
+
     # Update banks_to_track and amount_to_track if provided
-    pair = pair_repo.get_by_id(pair_id)
+    pair = pair_repo.get_by_id(pair.id)
     if status_data.banks_to_track is not None:
         pair.banks_to_track = status_data.banks_to_track
     if status_data.amount_to_track is not None:
@@ -325,8 +347,8 @@ async def update_pair_status(
     # Commit all changes
     pair.updated_at = datetime.utcnow()
     pair_repo.db.commit()
-    
-    updated_pair = pair_repo.get_by_id(pair_id)
+
+    updated_pair = pair_repo.get_by_id(pair.id)
     return CurrencyPairResponse(**updated_pair.dict())
 
 @router.post("/validate-binance-config", response_model=dict)
@@ -386,23 +408,24 @@ async def validate_binance_configuration(
             detail=f"Error validating with Binance API: {str(e)}"
         )
 
-@router.delete("/{pair_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{pair_uuid}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_currency_pair(
-    pair_id: int,
+    pair_uuid: UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_root_user)
 ):
     """Delete currency pair (ROOT access only)"""
     pair_repo = CurrencyPairRepository(db)
-    
-    if not pair_repo.get_by_id(pair_id):
+
+    pair = pair_repo.get_by_uuid(pair_uuid)
+    if not pair:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Currency pair not found"
         )
-    
+
     try:
-        success = pair_repo.delete_currency_pair(pair_id)
+        success = pair_repo.delete_currency_pair(pair.id)
         if not success:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

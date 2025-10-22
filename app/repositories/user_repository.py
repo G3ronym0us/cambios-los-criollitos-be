@@ -2,6 +2,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from typing import Optional, List
 from datetime import datetime
+from uuid import UUID
 from app.models.user import User
 from app.schemas.auth import UserRegister, UserUpdate, AdminCreateUser
 from app.core.security import get_password_hash, verify_password
@@ -81,6 +82,10 @@ class UserRepository:
     # ... resto de métodos sin cambios
     def get_by_id(self, user_id: int) -> Optional[User]:
         return self.db.query(User).filter(User.id == user_id).first()
+
+    def get_by_uuid(self, user_uuid: UUID) -> Optional[User]:
+        """Obtener usuario por UUID"""
+        return self.db.query(User).filter(User.uuid == user_uuid).first()
 
     def get_by_email(self, email: str) -> Optional[User]:
         return self.db.query(User).filter(User.email == email).first()
@@ -162,3 +167,55 @@ class UserRepository:
 
     def email_exists(self, email: str) -> bool:
         return self.db.query(User).filter(User.email == email).first() is not None
+
+    # ===== Commission User Management =====
+
+    def get_commission_users(self, skip: int = 0, limit: int = 100, only_active: bool = True) -> tuple[List[User], int]:
+        """
+        Obtener usuarios que pueden recibir comisiones
+
+        Returns:
+            Tuple de (usuarios, total_count)
+        """
+        query = self.db.query(User).filter(User.can_receive_commission == True)
+
+        if only_active:
+            query = query.filter(User.is_active == True)
+
+        total = query.count()
+        users = query.offset(skip).limit(limit).all()
+
+        return users, total
+
+    def update_commission_settings(self, user_id: int, can_receive_commission: bool) -> Optional[User]:
+        """
+        Actualizar configuración de comisiones de un usuario
+
+        Args:
+            user_id: ID del usuario
+            can_receive_commission: Si puede recibir comisiones
+
+        Returns:
+            Usuario actualizado o None si no existe
+        """
+        user = self.get_by_id(user_id)
+        if not user:
+            return None
+
+        user.can_receive_commission = can_receive_commission
+        user.updated_at = datetime.utcnow()
+
+        self.db.commit()
+        self.db.refresh(user)
+        return user
+
+    def get_available_commission_users(self) -> List[User]:
+        """
+        Obtener lista simple de usuarios activos que pueden recibir comisiones
+        Útil para dropdowns/selectores en el frontend
+        """
+        return self.db.query(User)\
+            .filter(User.can_receive_commission == True)\
+            .filter(User.is_active == True)\
+            .order_by(User.username)\
+            .all()

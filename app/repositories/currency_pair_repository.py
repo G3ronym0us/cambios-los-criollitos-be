@@ -2,6 +2,7 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import case, desc, asc
 from typing import Optional, List
 from datetime import datetime
+from uuid import UUID
 from app.models.currency_pair import CurrencyPair
 from app.models.currency import Currency
 from app.schemas.currency_pair import CurrencyPairCreate, CurrencyPairUpdate
@@ -10,30 +11,45 @@ class CurrencyPairRepository:
     def __init__(self, db: Session):
         self.db = db
 
+    def has_manual_rates(self, pair_id: int) -> bool:
+        """Check if a currency pair has active manual rates"""
+        from app.models.exchange_rate import ExchangeRate
+
+        manual_rate = self.db.query(ExchangeRate)\
+            .filter(
+                ExchangeRate.currency_pair_id == pair_id,
+                ExchangeRate.is_active == True,
+                ExchangeRate.is_manual == True
+            ).first()
+
+        return manual_rate is not None
+
     async def create_currency_pair(self, pair_data: CurrencyPairCreate) -> CurrencyPair:
         """Create new currency pair"""
-        # Generate pair symbol
-        from_currency = self.db.query(Currency).filter(Currency.id == pair_data.from_currency_id).first()
-        to_currency = self.db.query(Currency).filter(Currency.id == pair_data.to_currency_id).first()
-        
+        # Get currencies from UUIDs
+        from_currency = self.db.query(Currency).filter(Currency.uuid == pair_data.from_currency_uuid).first()
+        to_currency = self.db.query(Currency).filter(Currency.uuid == pair_data.to_currency_uuid).first()
+
         if not from_currency or not to_currency:
-            raise ValueError("Invalid currency IDs provided")
-        
+            raise ValueError("Invalid currency UUIDs provided")
+
         pair_symbol = CurrencyPair.create_pair_symbol(from_currency.symbol, to_currency.symbol)
-        
+
         # Validate base_pair if provided
-        if pair_data.base_pair_id:
-            base_pair = self.get_by_id(pair_data.base_pair_id)
+        base_pair_id = None
+        if pair_data.base_pair_uuid:
+            base_pair = self.get_by_uuid(pair_data.base_pair_uuid)
             if not base_pair:
                 raise ValueError("Base pair not found")
-            if not (base_pair.binance_tracked or base_pair.is_manual):
+            if not (base_pair.binance_tracked or self.has_manual_rates(base_pair.id)):
                 raise ValueError("Base pair must be either Binance tracked or have manual rates")
+            base_pair_id = base_pair.id
 
         db_pair = CurrencyPair(
-            from_currency_id=pair_data.from_currency_id,
-            to_currency_id=pair_data.to_currency_id,
+            from_currency_id=from_currency.id,
+            to_currency_id=to_currency.id,
             pair_type=pair_data.pair_type,
-            base_pair_id=pair_data.base_pair_id,
+            base_pair_id=base_pair_id,
             derived_percentage=pair_data.derived_percentage,
             use_inverse_percentage=pair_data.use_inverse_percentage,
             pair_symbol=pair_symbol,
@@ -73,10 +89,18 @@ class CurrencyPairRepository:
     def get_by_id(self, pair_id: int) -> Optional[CurrencyPair]:
         """Get currency pair by ID with related currencies"""
         return self.db.query(CurrencyPair)\
-            .options(joinedload(CurrencyPair.from_currency), 
+            .options(joinedload(CurrencyPair.from_currency),
                     joinedload(CurrencyPair.to_currency),
                     joinedload(CurrencyPair.base_pair))\
             .filter(CurrencyPair.id == pair_id).first()
+
+    def get_by_uuid(self, pair_uuid: UUID) -> Optional[CurrencyPair]:
+        """Get currency pair by UUID with related currencies"""
+        return self.db.query(CurrencyPair)\
+            .options(joinedload(CurrencyPair.from_currency),
+                    joinedload(CurrencyPair.to_currency),
+                    joinedload(CurrencyPair.base_pair))\
+            .filter(CurrencyPair.uuid == pair_uuid).first()
 
     def get_by_symbol(self, pair_symbol: str) -> Optional[CurrencyPair]:
         """Get currency pair by symbol"""
@@ -150,8 +174,19 @@ class CurrencyPairRepository:
         pair = self.get_by_id(pair_id)
         if not pair:
             return None
-        
+
         update_data = pair_data.dict(exclude_unset=True)
+
+        # Convert base_pair_uuid to base_pair_id if provided
+        if 'base_pair_uuid' in update_data and update_data['base_pair_uuid']:
+            base_pair = self.get_by_uuid(update_data['base_pair_uuid'])
+            if not base_pair:
+                raise ValueError("Base pair not found")
+            update_data['base_pair_id'] = base_pair.id
+            del update_data['base_pair_uuid']
+        elif 'base_pair_uuid' in update_data:
+            del update_data['base_pair_uuid']
+
         for field, value in update_data.items():
             setattr(pair, field, value)
         
@@ -241,13 +276,34 @@ class CurrencyPairRepository:
         return True
 
     def get_base_pairs(self) -> List[CurrencyPair]:
-        """Get all pairs that can be used as base pairs (Binance tracked or manual rates)"""
+        """
+        Get all pairs that can be used as base pairs for derived rates.
+
+        A pair can be a base pair if:
+        1. pair_type = BASE
+        2. binance_tracked = True OR has an active manual rate (is_manual = True)
+        """
+        from app.models.exchange_rate import ExchangeRate
+        from app.enums.pair_type import PairType
+        from sqlalchemy import or_
+
+        # Subquery to check if pair has manual rates
+        subquery = self.db.query(ExchangeRate.currency_pair_id)\
+            .filter(
+                ExchangeRate.is_active == True,
+                ExchangeRate.is_manual == True
+            ).subquery()
+
         return self.db.query(CurrencyPair)\
-            .options(joinedload(CurrencyPair.from_currency), 
+            .options(joinedload(CurrencyPair.from_currency),
                     joinedload(CurrencyPair.to_currency))\
             .filter(
                 CurrencyPair.is_active == True,
-                CurrencyPair.binance_tracked == True  # For now, only Binance tracked pairs can be base pairs
+                CurrencyPair.pair_type == PairType.BASE,
+                or_(
+                    CurrencyPair.binance_tracked == True,
+                    CurrencyPair.id.in_(subquery)
+                )
             ).all()
 
     def get_derived_pairs(self, base_pair_id: int) -> List[CurrencyPair]:

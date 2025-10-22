@@ -4,8 +4,9 @@ from sqlalchemy.orm import relationship
 from app.database.connection import Base
 from app.models.currency import CurrencyType
 from app.enums.pair_type import PairType
+from app.models.mixins import UUIDMixin
 
-class CurrencyPair(Base):
+class CurrencyPair(UUIDMixin, Base):
     __tablename__ = "currency_pairs"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -74,11 +75,11 @@ class CurrencyPair(Base):
     def dict(self):
         """Convert to dictionary for JSON responses"""
         return {
-            "id": self.id,
+            "uuid": self.uuid,
             "pair_symbol": self.pair_symbol,
             "pair_type": self.pair_type.value if self.pair_type else None,
-            "from_currency_id": self.from_currency_id,
-            "to_currency_id": self.to_currency_id,
+            "from_currency_uuid": self.from_currency.uuid if self.from_currency else None,
+            "to_currency_uuid": self.to_currency.uuid if self.to_currency else None,
             "from_currency": self.from_currency.dict() if self.from_currency else None,
             "to_currency": self.to_currency.dict() if self.to_currency else None,
             "display_name": self.display_name,
@@ -88,7 +89,7 @@ class CurrencyPair(Base):
             "banks_to_track": self.banks_to_track,
             "amount_to_track": float(self.amount_to_track) if self.amount_to_track else None,
             "description": self.description,
-            "base_pair_id": self.base_pair_id,
+            "base_pair_uuid": self.base_pair.uuid if self.base_pair else None,
             "base_pair": self.base_pair.dict() if self.base_pair else None,
             "derived_percentage": float(self.derived_percentage) if self.derived_percentage else None,
             "use_inverse_percentage": self.use_inverse_percentage,

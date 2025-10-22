@@ -1,6 +1,7 @@
 from sqlalchemy.orm import Session
 from typing import Optional, List
 from datetime import datetime
+from uuid import UUID
 from app.models.currency import Currency, CurrencyType
 from app.schemas.currency import CurrencyCreate, CurrencyUpdate
 
@@ -25,6 +26,10 @@ class CurrencyRepository:
     def get_by_id(self, currency_id: int) -> Optional[Currency]:
         """Get currency by ID"""
         return self.db.query(Currency).filter(Currency.id == currency_id).first()
+
+    def get_by_uuid(self, currency_uuid: UUID) -> Optional[Currency]:
+        """Get currency by UUID"""
+        return self.db.query(Currency).filter(Currency.uuid == currency_uuid).first()
 
     def get_by_symbol(self, symbol: str) -> Optional[Currency]:
         """Get currency by symbol"""

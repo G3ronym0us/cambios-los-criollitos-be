@@ -1,6 +1,7 @@
 from pydantic import BaseModel, validator
 from typing import Optional
 from datetime import datetime
+from uuid import UUID
 from app.models.currency import CurrencyType
 
 class CurrencyBase(BaseModel):
@@ -57,7 +58,7 @@ class CurrencyUpdate(BaseModel):
         return v
 
 class CurrencyResponse(CurrencyBase):
-    id: int
+    uuid: UUID
     created_at: datetime
     updated_at: Optional[datetime] = None
 

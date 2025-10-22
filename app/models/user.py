@@ -1,10 +1,11 @@
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, Text, Enum as SQLEnum
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, Text, Float, Enum as SQLEnum
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from app.database.connection import Base
 from app.enums.user_roles import UserRole
+from app.models.mixins import UUIDMixin
 
-class User(Base):
+class User(UUIDMixin, Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -12,29 +13,32 @@ class User(Base):
     username = Column(String, unique=True, index=True, nullable=False)
     full_name = Column(String, nullable=True)
     hashed_password = Column(String, nullable=False)
-    
+
     # Estados del usuario
     is_active = Column(Boolean, default=True)
     is_verified = Column(Boolean, default=False)
-    
+
     # Rol del usuario usando Enum directamente
     role = Column(SQLEnum(UserRole), nullable=False, default=UserRole.USER)
-    
+
     # Campos de autenticación
     last_login = Column(DateTime(timezone=True), nullable=True)
     login_count = Column(Integer, default=0)
     failed_login_attempts = Column(Integer, default=0)
     locked_until = Column(DateTime(timezone=True), nullable=True)
-    
+
+    # Campos de comisiones
+    can_receive_commission = Column(Boolean, default=False, nullable=False)
+
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-    
+
     # Campos adicionales
     avatar_url = Column(String, nullable=True)
     bio = Column(Text, nullable=True)
     phone_number = Column(String, nullable=True)
-    
+
     # Relación con Transaction
     transactions = relationship("Transaction", back_populates="user")
 
@@ -108,7 +112,7 @@ class User(Base):
         """Convertir a diccionario para respuestas JSON"""
         permissions = self._get_role_permissions()
         return {
-            "id": self.id,
+            "uuid": self.uuid,
             "username": self.username,
             "email": self.email,
             "full_name": self.full_name,
@@ -117,8 +121,10 @@ class User(Base):
             "role": self.role.value if self.role else None,
             "role_display": self.role.value.title() if self.role else None,
             "permissions": permissions.get(self.role, []),
+            "can_receive_commission": self.can_receive_commission,
             "last_login": self.last_login,
             "created_at": self.created_at,
+            "updated_at": self.updated_at,
             "avatar_url": self.avatar_url,
             "bio": self.bio,
             "phone_number": self.phone_number

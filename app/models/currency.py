@@ -1,6 +1,7 @@
 from sqlalchemy import Column, Integer, String, DateTime, Enum as SQLEnum
 from sqlalchemy.sql import func
 from app.database.connection import Base
+from app.models.mixins import UUIDMixin
 from enum import Enum
 
 class CurrencyType(Enum):
@@ -8,7 +9,7 @@ class CurrencyType(Enum):
     CRYPTO = "CRYPTO"
     COMMODITY = "COMMODITY"
 
-class Currency(Base):
+class Currency(UUIDMixin, Base):
     __tablename__ = "currencies"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -27,7 +28,7 @@ class Currency(Base):
     def dict(self):
         """Convert to dictionary for JSON responses"""
         return {
-            "id": self.id,
+            "uuid": self.uuid,
             "name": self.name,
             "symbol": self.symbol,
             "description": self.description,

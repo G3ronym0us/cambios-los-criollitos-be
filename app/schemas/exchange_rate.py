@@ -1,18 +1,32 @@
 from pydantic import BaseModel, field_validator
 from datetime import datetime
 from typing import Optional
+from uuid import UUID
+from app.enums.pair_type import PairType
 
 class ExchangeRateBase(BaseModel):
-    from_currency: str
-    to_currency: str
+    currency_pair_uuid: UUID
     rate: float
-    source: str = "manual"
 
 class ExchangeRateCreate(ExchangeRateBase):
-    pass
+    percentage: Optional[float] = None
+    inverse_percentage: bool = False
 
-class ExchangeRateResponse(ExchangeRateBase):
-    id: int
+class ExchangeRateUpdate(BaseModel):
+    currency_pair_uuid: Optional[UUID] = None
+    rate: Optional[float] = None
+    percentage: Optional[float] = None
+    inverse_percentage: Optional[bool] = None
+    is_active: Optional[bool] = None
+
+class ExchangeRateResponse(BaseModel):
+    uuid: UUID
+    currency_pair_uuid: UUID
+    pair_symbol: Optional[str] = None  # Incluido para facilidad (ej: "USDT/VES")
+    pair_type: Optional[PairType] = None  # Tipo de par: base, derived, cross
+    from_currency: str  # Incluido para compatibilidad
+    to_currency: str    # Incluido para compatibilidad
+    rate: float
     is_active: bool
     percentage: Optional[float] = None
     inverse_percentage: bool = False
@@ -29,14 +43,17 @@ class ExchangeRateResponse(ExchangeRateBase):
         return v if v is not None else False
 
     class Config:
-        from_attributes = True
+        # Note: from_attributes removed to allow manual dict construction in enrich_rate_response()
+        pass
 
 class ManualRateRequest(BaseModel):
+    currency_pair_uuid: UUID
     manual_rate: float
 
     class Config:
         json_schema_extra = {
             "example": {
+                "currency_pair_uuid": "550e8400-e29b-41d4-a716-446655440000",
                 "manual_rate": 45.5
             }
         }

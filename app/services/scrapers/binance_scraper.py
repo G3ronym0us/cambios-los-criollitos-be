@@ -152,22 +152,27 @@ class BinanceP2PScraper(BaseScraper):
                 if result:
                     from_currency = result['from_currency']
                     to_currency = result['to_currency']
-                    rate = result['rate']
-                
+                    rate_value = result['rate']
 
-                    print(f"{from_currency} -> {to_currency} - {rate}")
 
-                # Crear tasas principales
-                
-                    rate = ExchangeRate.create_safe(
-                        from_currency=from_currency, 
-                        to_currency=to_currency, 
-                        rate=rate, 
-                        source=self.source_name
-                    )
-                    if rate:
-                        rates.append(rate)
-                        base_rates[f"{from_currency}_{to_currency}"] = rate.rate  # Store the numeric value, not the object
+                    print(f"{from_currency} -> {to_currency} - {rate_value}")
+
+                    # Crear tasas principales
+                    pair_symbol = f"{from_currency}-{to_currency}"
+                    currency_pair = self.currency_pair_repo.get_by_symbol(pair_symbol)
+
+                    if currency_pair:
+                        rate = ExchangeRate.create_safe(
+                            currency_pair_id=currency_pair.id,
+                            from_currency=from_currency,
+                            to_currency=to_currency,
+                            rate=rate_value
+                        )
+                        if rate:
+                            rates.append(rate)
+                            base_rates[f"{from_currency}_{to_currency}"] = rate.rate  # Store the numeric value, not the object
+                    else:
+                        print(f"⚠️ Par {pair_symbol} no encontrado en la base de datos")
 
             # Calcular tasas derivadas basadas en los pares obtenidos
             self._calculate_dynamic_derived_rates(rates, base_rates)
@@ -203,10 +208,10 @@ class BinanceP2PScraper(BaseScraper):
             base_rate = effective_rates.get(symbol)
             if base_rate:
                 rate = ExchangeRate.create_safe(
+                    currency_pair_id=pair.id,
                     from_currency=pair.from_currency.symbol,
                     to_currency=pair.to_currency.symbol,
                     rate=base_rate,  # base_rate is already a float value
-                    source=f"{self.source_name}_derived",
                     percentage=float(pair.derived_percentage) if pair.derived_percentage else None,
                     inverse_percentage=pair.use_inverse_percentage
                 )
@@ -335,10 +340,10 @@ class BinanceP2PScraper(BaseScraper):
 
                 # Crear ExchangeRate (create_safe aplica el percentage automáticamente)
                 rate_obj = ExchangeRate.create_safe(
+                    currency_pair_id=pair.id,
                     from_currency=from_fiat,
                     to_currency=to_fiat,
                     rate=cross_rate,
-                    source=f"{self.source_name}_cross",
                     percentage=float(pair.derived_percentage) if pair.derived_percentage else None,
                     inverse_percentage=pair.use_inverse_percentage
                 )

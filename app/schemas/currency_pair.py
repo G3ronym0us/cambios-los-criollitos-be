@@ -2,14 +2,15 @@ from pydantic import BaseModel, validator
 from typing import Optional, List
 from datetime import datetime
 from decimal import Decimal
+from uuid import UUID
 from app.schemas.currency import CurrencyResponse
 from app.enums.pair_type import PairType
 
 class CurrencyPairBase(BaseModel):
-    from_currency_id: int
-    to_currency_id: int
+    from_currency_uuid: UUID
+    to_currency_uuid: UUID
     pair_type: PairType = PairType.BASE
-    base_pair_id: Optional[int] = None
+    base_pair_uuid: Optional[UUID] = None
     derived_percentage: Optional[Decimal] = None
     use_inverse_percentage: bool = False
     description: Optional[str] = None
@@ -19,9 +20,9 @@ class CurrencyPairBase(BaseModel):
     banks_to_track: Optional[List[str]] = None
     amount_to_track: Optional[Decimal] = None
 
-    @validator('to_currency_id')
+    @validator('to_currency_uuid')
     def validate_different_currencies(cls, v, values):
-        if 'from_currency_id' in values and v == values['from_currency_id']:
+        if 'from_currency_uuid' in values and v == values['from_currency_uuid']:
             raise ValueError('From and to currencies must be different')
         return v
 
@@ -39,7 +40,7 @@ class CurrencyPairBase(BaseModel):
                 raise ValueError('amount_to_track is required and must be greater than 0 when binance_tracked is True')
         return v
 
-    @validator('base_pair_id')
+    @validator('base_pair_uuid')
     def validate_base_pair_not_self(cls, v, values):
         # This validation will be enhanced at the database level
         # to ensure base_pair exists and is not self-referencing
@@ -60,7 +61,7 @@ class CurrencyPairCreate(CurrencyPairBase):
 
 class CurrencyPairUpdate(BaseModel):
     pair_type: Optional[PairType] = None
-    base_pair_id: Optional[int] = None
+    base_pair_uuid: Optional[UUID] = None
     derived_percentage: Optional[Decimal] = None
     use_inverse_percentage: Optional[bool] = None
     description: Optional[str] = None
@@ -81,12 +82,12 @@ class CurrencyPairUpdate(BaseModel):
         return v
 
 class CurrencyPairResponse(BaseModel):
-    id: int
+    uuid: UUID
     pair_symbol: str
     pair_type: PairType
-    from_currency_id: int
-    to_currency_id: int
-    base_pair_id: Optional[int] = None
+    from_currency_uuid: Optional[UUID] = None
+    to_currency_uuid: Optional[UUID] = None
+    base_pair_uuid: Optional[UUID] = None
     derived_percentage: Optional[Decimal] = None
     use_inverse_percentage: bool
     from_currency: Optional[CurrencyResponse] = None

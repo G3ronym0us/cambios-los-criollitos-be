@@ -1,6 +1,7 @@
 from pydantic import BaseModel, EmailStr, validator
 from typing import Optional, List
 from datetime import datetime
+from uuid import UUID
 
 class UserRegister(BaseModel):
     username: str
@@ -47,7 +48,7 @@ class PermissionResponse(BaseModel):
         from_attributes = True
 
 class UserResponse(BaseModel):
-    id: int
+    uuid: UUID
     username: str
     email: str
     full_name: Optional[str] = None
@@ -55,9 +56,11 @@ class UserResponse(BaseModel):
     is_verified: bool
     role: Optional[str] = None
     role_display: Optional[str] = None
+    can_receive_commission: bool = False
     permissions: List[str] = []
     last_login: Optional[datetime] = None
     created_at: datetime
+    updated_at: Optional[datetime] = None
     avatar_url: Optional[str] = None
     bio: Optional[str] = None
     phone_number: Optional[str] = None
@@ -117,7 +120,7 @@ class Token(BaseModel):
     user: UserResponse
 
 class TokenData(BaseModel):
-    user_id: Optional[int] = None
+    user_id: Optional[int] = None  # Mantiene ID interno para tokens
     username: Optional[str] = None
 
 class RefreshToken(BaseModel):

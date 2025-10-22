@@ -1,8 +1,11 @@
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import and_, desc
 from typing import List, Optional
 from datetime import datetime, timedelta
+from uuid import UUID
 from app.models.exchange_rate import ExchangeRate
+from app.models.currency_pair import CurrencyPair
+from app.schemas.exchange_rate import ExchangeRateCreate, ExchangeRateUpdate
 from app.database.connection import get_db
 
 class ExchangeRateRepository:
@@ -12,16 +15,16 @@ class ExchangeRateRepository:
     def save_rates(self, rates: List[ExchangeRate]) -> bool:
         """Guardar múltiples tasas de cambio"""
         try:
-            # Desactivar tasas anteriores del mismo source que no tengan precio manual
-            sources = set(rate.source for rate in rates)
-            for source in sources:
+            # Desactivar tasas anteriores del mismo currency_pair que no tengan precio manual
+            currency_pair_ids = set(rate.currency_pair_id for rate in rates if rate.currency_pair_id)
+            for pair_id in currency_pair_ids:
                 existing_rates = self.db.query(ExchangeRate).filter(
                     and_(
-                        ExchangeRate.source == source,
+                        ExchangeRate.currency_pair_id == pair_id,
                         ExchangeRate.is_active == True
                     )
                 ).all()
-                
+
                 # Desactivar todas las tasas existentes para el historial
                 for existing_rate in existing_rates:
                     existing_rate.is_active = False
@@ -69,6 +72,14 @@ class ExchangeRateRepository:
             
         return query.order_by(desc(ExchangeRate.created_at)).all()
 
+    def get_by_id(self, rate_id: int) -> Optional[ExchangeRate]:
+        """Get exchange rate by ID"""
+        return self.db.query(ExchangeRate).filter(ExchangeRate.id == rate_id).first()
+
+    def get_by_uuid(self, rate_uuid: UUID) -> Optional[ExchangeRate]:
+        """Get exchange rate by UUID"""
+        return self.db.query(ExchangeRate).filter(ExchangeRate.uuid == rate_uuid).first()
+
     def get_latest_rate(self, from_currency: str, to_currency: str) -> Optional[ExchangeRate]:
         """Obtener la tasa más reciente entre dos monedas"""
         return self.db.query(ExchangeRate).filter(
@@ -102,7 +113,6 @@ class ExchangeRateRepository:
                     from_currency=from_currency,
                     to_currency=to_currency,
                     rate=manual_rate,
-                    source="manual",
                     is_active=True,
                     is_manual=True,
                     manual_rate=manual_rate,
@@ -140,3 +150,144 @@ class ExchangeRateRepository:
         ).delete()
         self.db.commit()
         print(f"🗑️ {deleted} tasas antiguas eliminadas")
+
+    # ===== NUEVOS MÉTODOS CON currency_pair_id =====
+
+    def create_or_update_rate(self, rate_data: ExchangeRateCreate) -> ExchangeRate:
+        """
+        Crear o actualizar tasa de cambio para un par de divisas.
+        Garantiza que solo haya un registro activo por par.
+
+        Args:
+            rate_data: Datos de la nueva tasa
+
+        Returns:
+            ExchangeRate creado o actualizado
+        """
+        # Obtener el currency_pair para extraer from_currency y to_currency
+        currency_pair = self.db.query(CurrencyPair).filter(
+            CurrencyPair.uuid == rate_data.currency_pair_uuid
+        ).options(
+            joinedload(CurrencyPair.from_currency),
+            joinedload(CurrencyPair.to_currency)
+        ).first()
+
+        if not currency_pair:
+            raise ValueError(f"Currency pair with UUID {rate_data.currency_pair_uuid} not found")
+
+        # Desactivar cualquier rate activo anterior para este par
+        self.db.query(ExchangeRate).filter(
+            and_(
+                ExchangeRate.currency_pair_id == currency_pair.id,
+                ExchangeRate.is_active == True
+            )
+        ).update({"is_active": False})
+
+        # Crear nuevo rate activo
+        new_rate = ExchangeRate(
+            currency_pair_id=currency_pair.id,
+            from_currency=currency_pair.from_currency.symbol,
+            to_currency=currency_pair.to_currency.symbol,
+            rate=rate_data.rate,
+            percentage=rate_data.percentage,
+            inverse_percentage=rate_data.inverse_percentage,
+            is_active=True
+        )
+
+        self.db.add(new_rate)
+        self.db.commit()
+        self.db.refresh(new_rate)
+
+        return new_rate
+
+    def get_active_rate_by_pair(self, currency_pair_uuid: UUID) -> Optional[ExchangeRate]:
+        """
+        Obtener la tasa activa para un par de divisas específico.
+        Solo debe haber una tasa activa por par.
+
+        Args:
+            currency_pair_uuid: UUID del par de divisas
+
+        Returns:
+            ExchangeRate activo o None
+        """
+        currency_pair = self.db.query(CurrencyPair).filter(
+            CurrencyPair.uuid == currency_pair_uuid
+        ).first()
+
+        if not currency_pair:
+            return None
+
+        return self.db.query(ExchangeRate).filter(
+            and_(
+                ExchangeRate.currency_pair_id == currency_pair.id,
+                ExchangeRate.is_active == True
+            )
+        ).options(
+            joinedload(ExchangeRate.currency_pair).joinedload(CurrencyPair.from_currency),
+            joinedload(ExchangeRate.currency_pair).joinedload(CurrencyPair.to_currency)
+        ).first()
+
+    def update_rate(self, rate_uuid: UUID, update_data: ExchangeRateUpdate) -> Optional[ExchangeRate]:
+        """
+        Actualizar una tasa de cambio existente.
+
+        Args:
+            rate_uuid: UUID de la tasa a actualizar
+            update_data: Datos de actualización
+
+        Returns:
+            ExchangeRate actualizado o None
+        """
+        rate = self.get_by_uuid(rate_uuid)
+        if not rate:
+            return None
+
+        update_dict = update_data.dict(exclude_unset=True)
+
+        # Si se actualiza el currency_pair_uuid, resolver las monedas
+        if 'currency_pair_uuid' in update_dict:
+            currency_pair = self.db.query(CurrencyPair).filter(
+                CurrencyPair.uuid == update_dict['currency_pair_uuid']
+            ).options(
+                joinedload(CurrencyPair.from_currency),
+                joinedload(CurrencyPair.to_currency)
+            ).first()
+
+            if not currency_pair:
+                raise ValueError(f"Currency pair with UUID {update_dict['currency_pair_uuid']} not found")
+
+            update_dict['currency_pair_id'] = currency_pair.id
+            update_dict['from_currency'] = currency_pair.from_currency.symbol
+            update_dict['to_currency'] = currency_pair.to_currency.symbol
+            del update_dict['currency_pair_uuid']
+
+        # Aplicar actualizaciones
+        for field, value in update_dict.items():
+            setattr(rate, field, value)
+
+        rate.updated_at = datetime.utcnow()
+
+        self.db.commit()
+        self.db.refresh(rate)
+
+        return rate
+
+    def get_all_active_rates(self) -> List[ExchangeRate]:
+        """Obtener todas las tasas activas con información de currency_pair"""
+        return self.db.query(ExchangeRate).filter(
+            ExchangeRate.is_active == True
+        ).options(
+            joinedload(ExchangeRate.currency_pair).joinedload(CurrencyPair.from_currency),
+            joinedload(ExchangeRate.currency_pair).joinedload(CurrencyPair.to_currency)
+        ).order_by(desc(ExchangeRate.created_at)).all()
+
+    def delete_rate(self, rate_uuid: UUID) -> bool:
+        """Eliminar (desactivar) una tasa de cambio"""
+        rate = self.get_by_uuid(rate_uuid)
+        if not rate:
+            return False
+
+        rate.is_active = False
+        self.db.commit()
+        return True

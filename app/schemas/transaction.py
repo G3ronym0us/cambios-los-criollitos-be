@@ -1,75 +1,172 @@
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, validator, Field
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
+from uuid import UUID
+
+# ===== Profit Split Schemas =====
+
+class ProfitSplitBase(BaseModel):
+    """Schema base para división de ganancias"""
+    user_uuid: UUID
+    profit_percentage: float = Field(..., ge=0, le=100, description="Porcentaje de ganancia asignado (0-100)")
+
+class ProfitSplitCreate(ProfitSplitBase):
+    """Schema para crear una división de ganancia"""
+    pass
+
+class ProfitSplitResponse(ProfitSplitBase):
+    """Schema de respuesta para división de ganancia"""
+    uuid: UUID
+    transaction_uuid: UUID
+    profit_amount: float
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+# ===== Transaction Schemas =====
 
 class TransactionBase(BaseModel):
-    from_currency: str
-    to_currency: str
+    """Schema base para transacciones"""
+    currency_pair_uuid: UUID
     from_amount: float
     to_amount: float
     exchange_rate: float
+    description: Optional[str] = None
     transaction_type: str = "conversion"
-    
-    @validator('from_currency', 'to_currency')
-    def validate_currency(cls, v):
-        if len(v) != 3:
-            raise ValueError('Currency code must be exactly 3 characters')
-        return v.upper()
-    
+    total_profit_percentage: float = 0.0
+
     @validator('from_amount', 'to_amount')
     def validate_amount(cls, v):
         if v <= 0:
             raise ValueError('Amount must be greater than 0')
         return v
-    
+
     @validator('exchange_rate')
     def validate_exchange_rate(cls, v):
         if v <= 0:
             raise ValueError('Exchange rate must be greater than 0')
+        return v
+
+    @validator('total_profit_percentage')
+    def validate_profit_percentage(cls, v):
+        if v < 0 or v > 100:
+            raise ValueError('Profit percentage must be between 0 and 100')
         return v
 
 class TransactionCreate(TransactionBase):
-    user_id: Optional[int] = None
+    """
+    Schema para crear transacción con distribución de ganancias
+
+    Puede usar una configuración predefinida (commission_config_uuid) o splits manuales (profit_splits)
+    """
+    user_uuid: Optional[UUID] = None
+    commission_config_uuid: Optional[UUID] = Field(None, description="UUID de configuración predefinida de comisiones")
+    profit_splits: Optional[List[ProfitSplitCreate]] = Field(None, description="Splits manuales (alternativa a config_uuid)")
+    force: bool = Field(False, description="Forzar creación ignorando advertencias de duplicados")
+
+    @validator('profit_splits')
+    def validate_profit_splits(cls, v, values):
+        """Validar que la suma de porcentajes coincida con el total"""
+        # Si se usa config_uuid, profit_splits debe estar vacío
+        if values.get('commission_config_uuid') and v:
+            raise ValueError('Cannot specify both commission_config_uuid and profit_splits')
+
+        # Si no se usa config_uuid, validar splits manuales
+        if not values.get('commission_config_uuid') and v and 'total_profit_percentage' in values:
+            total_split = sum(split.profit_percentage for split in v)
+            total_profit = values['total_profit_percentage']
+
+            # Permitir diferencias pequeñas por redondeo (0.01%)
+            if abs(total_split - total_profit) > 0.01:
+                raise ValueError(
+                    f'Sum of profit splits ({total_split}%) must equal total_profit_percentage ({total_profit}%)'
+                )
+        return v
 
 class TransactionUpdate(BaseModel):
-    from_currency: Optional[str] = None
-    to_currency: Optional[str] = None
+    """Schema para actualizar transacción"""
+    currency_pair_uuid: Optional[UUID] = None
     from_amount: Optional[float] = None
     to_amount: Optional[float] = None
     exchange_rate: Optional[float] = None
+    description: Optional[str] = None
     transaction_type: Optional[str] = None
-    
-    @validator('from_currency', 'to_currency')
-    def validate_currency(cls, v):
-        if v is not None:
-            if len(v) != 3:
-                raise ValueError('Currency code must be exactly 3 characters')
-            return v.upper()
-        return v
-    
+    total_profit_percentage: Optional[float] = None
+    status: Optional[str] = None
+
     @validator('from_amount', 'to_amount')
     def validate_amount(cls, v):
         if v is not None and v <= 0:
             raise ValueError('Amount must be greater than 0')
         return v
-    
+
     @validator('exchange_rate')
     def validate_exchange_rate(cls, v):
         if v is not None and v <= 0:
             raise ValueError('Exchange rate must be greater than 0')
         return v
 
-class TransactionResponse(TransactionBase):
-    id: int
-    user_id: Optional[int]
+    @validator('total_profit_percentage')
+    def validate_profit_percentage(cls, v):
+        if v is not None and (v < 0 or v > 100):
+            raise ValueError('Profit percentage must be between 0 and 100')
+        return v
+
+class TransactionResponse(BaseModel):
+    """Schema de respuesta para transacción"""
+    uuid: UUID
+    currency_pair_uuid: UUID
+    pair_symbol: Optional[str] = None  # Incluido para facilidad (ej: "USDT/VES")
+    from_currency: str  # Incluido para compatibilidad
+    to_currency: str    # Incluido para compatibilidad
+    from_amount: float
+    to_amount: float
+    exchange_rate: float
+    description: Optional[str] = None
+    transaction_type: str = "conversion"
+    total_profit_percentage: float = 0.0
+    user_uuid: Optional[UUID] = None
+    profit_amount: float
+    status: str
     created_at: datetime
-    
+    updated_at: Optional[datetime]
+    completed_at: Optional[datetime]
+    profit_splits: List[ProfitSplitResponse] = []
+
     class Config:
         from_attributes = True
 
 class TransactionList(BaseModel):
-    transactions: list[TransactionResponse]
+    """Schema para lista paginada de transacciones"""
+    transactions: List[TransactionResponse]
     total: int
     page: int
     per_page: int
     total_pages: int
+
+class SimilarTransactionWarning(BaseModel):
+    """Schema para advertencia de transacción similar/duplicada"""
+    warning: str = "Similar transaction found"
+    similar_transaction: TransactionResponse
+    requires_confirmation: bool = True
+    message: str
+
+# ===== Report Schemas =====
+
+class UserProfitReport(BaseModel):
+    """Reporte de ganancias por usuario"""
+    user_uuid: UUID
+    username: Optional[str] = None
+    email: Optional[str] = None
+    total_profit: float
+    transaction_count: int
+    transactions: List[TransactionResponse] = []
+
+class ProfitSummary(BaseModel):
+    """Resumen general de ganancias"""
+    total_profit: float
+    total_transactions: int
+    by_currency_pair: dict
+    by_user: List[UserProfitReport]
+    date_range: Optional[dict] = None

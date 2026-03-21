@@ -33,6 +33,10 @@ jobs:
             echo "--- Pulling latest code ---"
             git pull origin main
 
+            echo "--- Cleaning unused Docker resources to free disk space ---"
+            docker system prune -f
+            docker volume prune -f
+
             echo "--- Building and restarting containers ---"
             docker compose build
             docker compose up -d

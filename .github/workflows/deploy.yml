@@ -20,6 +20,14 @@ jobs:
           script: |
             set -e
 
+            # Install docker compose v2 plugin if not present
+            if ! docker compose version &>/dev/null 2>&1; then
+              mkdir -p ~/.docker/cli-plugins
+              curl -SL https://github.com/docker/compose/releases/download/v2.24.5/docker-compose-linux-x86_64 \
+                -o ~/.docker/cli-plugins/docker-compose
+              chmod +x ~/.docker/cli-plugins/docker-compose
+            fi
+
             cd ${{ secrets.DEPLOY_PATH }}
 
             echo "--- Pulling latest code ---"

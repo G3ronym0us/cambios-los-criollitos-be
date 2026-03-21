@@ -32,6 +32,7 @@ class Transaction(UUIDMixin, Base):
     # Ganancia y distribución
     total_profit_percentage = Column(Float, default=0.0)  # Porcentaje total de ganancia (ej: 10%)
     profit_amount = Column(Float, default=0.0)            # Ganancia calculada en valor absoluto
+    profit_amount_usdt = Column(Float, nullable=True)     # Ganancia total en USDT (suma de splits)
 
     # Estado y auditoría
     status = Column(SQLEnum(TransactionStatus), nullable=False, default=TransactionStatus.PENDING)
@@ -60,6 +61,7 @@ class Transaction(UUIDMixin, Base):
             "transaction_type": self.transaction_type,
             "total_profit_percentage": self.total_profit_percentage,
             "profit_amount": self.profit_amount,
+            "profit_amount_usdt": self.profit_amount_usdt,
             "status": self.status.value if self.status else None,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -79,6 +81,13 @@ class TransactionProfitSplit(UUIDMixin, Base):
     profit_percentage = Column(Float, nullable=False)  # Porcentaje asignado a este usuario (ej: 5%)
     profit_amount = Column(Float, nullable=False)      # Ganancia calculada para este usuario
 
+    # Ganancia en USDT (referencia universal)
+    profit_amount_usdt = Column(Float, nullable=True)  # Ganancia convertida a USDT al momento del registro
+
+    # Liquidación en moneda preferida del usuario
+    settlement_currency = Column(String(10), nullable=True)  # Moneda de pago (ej: "COP", "USD"). NULL = USDT
+    settlement_amount = Column(Float, nullable=True)          # Monto en settlement_currency. NULL si no aplica
+
     # Auditoría
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -97,5 +106,8 @@ class TransactionProfitSplit(UUIDMixin, Base):
             "user_uuid": self.user.uuid if self.user else None,
             "profit_percentage": self.profit_percentage,
             "profit_amount": self.profit_amount,
+            "profit_amount_usdt": self.profit_amount_usdt,
+            "settlement_currency": self.settlement_currency,
+            "settlement_amount": self.settlement_amount,
             "created_at": self.created_at
         }

@@ -29,6 +29,7 @@ class User(UUIDMixin, Base):
 
     # Campos de comisiones
     can_receive_commission = Column(Boolean, default=False, nullable=False)
+    preferred_settlement_currency = Column(String(10), nullable=True)  # Moneda preferida de cobro (ej: "USD", "COP"). NULL = USDT
 
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -122,6 +123,7 @@ class User(UUIDMixin, Base):
             "role_display": self.role.value.title() if self.role else None,
             "permissions": permissions.get(self.role, []),
             "can_receive_commission": self.can_receive_commission,
+            "preferred_settlement_currency": self.preferred_settlement_currency,
             "last_login": self.last_login,
             "created_at": self.created_at,
             "updated_at": self.updated_at,

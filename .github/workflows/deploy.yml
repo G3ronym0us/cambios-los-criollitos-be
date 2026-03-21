@@ -1,0 +1,43 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          script: |
+            set -e
+
+            cd ${{ secrets.DEPLOY_PATH }}
+
+            echo "--- Pulling latest code ---"
+            git pull origin main
+
+            echo "--- Building and restarting containers ---"
+            docker-compose build
+            docker-compose up -d
+
+            echo "--- Waiting for services to be ready ---"
+            sleep 8
+
+            echo "--- Running database migrations ---"
+            docker-compose exec -T backend alembic upgrade head
+
+            echo "--- Health check ---"
+            curl -sf http://localhost:8000/api/health \
+              && echo "Health check passed" \
+              || echo "WARNING: Health check returned non-200"
+
+            echo "--- Deploy complete. Commit: $(git rev-parse --short HEAD) ---"

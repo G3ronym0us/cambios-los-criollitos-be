@@ -22,6 +22,7 @@ class UserUpdate(BaseModel):
     role: Optional[str] = None
     phone_number: Optional[str] = None
     bio: Optional[str] = None
+    preferred_settlement_currency: Optional[str] = None
 
 class UserResponse(UserBase):
     uuid: UUID
@@ -29,6 +30,7 @@ class UserResponse(UserBase):
     role_display: Optional[str] = None
     is_verified: bool
     can_receive_commission: bool
+    preferred_settlement_currency: Optional[str] = None
     phone_number: Optional[str] = None
     bio: Optional[str] = None
     avatar_url: Optional[str] = None

@@ -66,22 +66,55 @@ class TransactionRepository:
         self.db.flush()  # Para obtener el ID sin commit
 
         # Crear profit splits si existen
+        usdt_rate = transaction_data.usdt_rate
+        total_profit_usdt = None
+        all_splits_have_usdt = True
+
         if transaction_data.profit_splits:
             for split in transaction_data.profit_splits:
-                # Obtener user_id del UUID
+                # Obtener user con preferred_settlement_currency
                 user = self.db.query(User).filter(User.uuid == split.user_uuid).first()
                 if not user:
                     raise ValueError(f"User with UUID {split.user_uuid} not found")
 
                 split_amount = (profit_amount * split.profit_percentage) / transaction_data.total_profit_percentage
 
+                # Determinar settlement_currency: explícito en split > preferred del usuario > NULL
+                effective_usdt_rate = getattr(split, 'usdt_rate', None) or usdt_rate
+                settlement_currency = split.settlement_currency or user.preferred_settlement_currency
+
+                # Calcular profit_amount_usdt del split
+                split_profit_usdt = None
+                if effective_usdt_rate:
+                    split_profit_usdt = split_amount / effective_usdt_rate
+                else:
+                    all_splits_have_usdt = False
+
+                # Calcular settlement_amount (solo para USD/USDT por ahora)
+                split_settlement_amount = None
+                if settlement_currency and settlement_currency.upper() in ("USD", "USDT"):
+                    split_settlement_amount = split_profit_usdt
+
                 db_split = TransactionProfitSplit(
                     transaction_id=db_transaction.id,
                     user_id=user.id,
                     profit_percentage=split.profit_percentage,
-                    profit_amount=split_amount
+                    profit_amount=split_amount,
+                    profit_amount_usdt=split_profit_usdt,
+                    settlement_currency=settlement_currency,
+                    settlement_amount=split_settlement_amount
                 )
                 self.db.add(db_split)
+
+                if split_profit_usdt is not None:
+                    total_profit_usdt = (total_profit_usdt or 0) + split_profit_usdt
+
+        # Asignar profit_amount_usdt a la transacción solo si todos los splits lo tienen
+        if transaction_data.profit_splits and all_splits_have_usdt:
+            db_transaction.profit_amount_usdt = total_profit_usdt
+        elif usdt_rate and not transaction_data.profit_splits:
+            # Sin splits: calcular directo desde el profit_amount total
+            db_transaction.profit_amount_usdt = profit_amount / usdt_rate
 
         self.db.commit()
         self.db.refresh(db_transaction)
@@ -213,15 +246,36 @@ class TransactionRepository:
             update_data['from_currency'] = from_currency.upper()
             update_data['to_currency'] = to_currency.upper()
 
-        # Remover currency_pair_uuid del update_data (no está en el modelo)
+        # Remover campos que no pertenecen al modelo Transaction
         update_data.pop('currency_pair_uuid', None)
+        usdt_rate = update_data.pop('usdt_rate', None)
 
-        # Si se actualiza el porcentaje de ganancia, recalcular profit_amount
-        if 'total_profit_percentage' in update_data:
-            to_amount = update_data.get('to_amount', transaction.to_amount)
-            update_data['profit_amount'] = (to_amount * update_data['total_profit_percentage']) / 100
+        # Si cambia el porcentaje o el monto destino, recalcular profit_amount y todos los splits
+        recalculate_splits = 'total_profit_percentage' in update_data or 'to_amount' in update_data
+        if recalculate_splits:
+            new_to_amount = update_data.get('to_amount', transaction.to_amount)
+            new_total_pct = update_data.get('total_profit_percentage', transaction.total_profit_percentage)
+            new_profit_amount = (new_to_amount * new_total_pct) / 100
+            update_data['profit_amount'] = new_profit_amount
 
-        # Aplicar actualizaciones
+            # Recalcular profit_amount de cada split existente
+            if transaction.profit_splits and new_total_pct:
+                new_total_profit_usdt = 0.0
+                all_have_usdt = True
+                for split in transaction.profit_splits:
+                    split.profit_amount = new_profit_amount * (split.profit_percentage / new_total_pct)
+                    if usdt_rate:
+                        split.profit_amount_usdt = split.profit_amount / usdt_rate
+                        if split.settlement_currency and split.settlement_currency.upper() in ("USD", "USDT"):
+                            split.settlement_amount = split.profit_amount_usdt
+                        new_total_profit_usdt += split.profit_amount_usdt
+                    elif split.profit_amount_usdt is None:
+                        all_have_usdt = False
+
+                if usdt_rate:
+                    update_data['profit_amount_usdt'] = new_total_profit_usdt if all_have_usdt else None
+
+        # Aplicar actualizaciones al modelo
         for field, value in update_data.items():
             if field in ['from_currency', 'to_currency'] and value:
                 value = value.upper()

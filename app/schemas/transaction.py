@@ -12,13 +12,17 @@ class ProfitSplitBase(BaseModel):
 
 class ProfitSplitCreate(ProfitSplitBase):
     """Schema para crear una división de ganancia"""
-    pass
+    settlement_currency: Optional[str] = None  # Moneda de liquidación. NULL = usar preferred del usuario o USDT
+    usdt_rate: Optional[float] = None           # Tasa USDT/moneda_origen para calcular profit_amount_usdt
 
 class ProfitSplitResponse(ProfitSplitBase):
     """Schema de respuesta para división de ganancia"""
     uuid: UUID
     transaction_uuid: UUID
     profit_amount: float
+    profit_amount_usdt: Optional[float] = None
+    settlement_currency: Optional[str] = None
+    settlement_amount: Optional[float] = None
     created_at: datetime
 
     class Config:
@@ -64,6 +68,7 @@ class TransactionCreate(TransactionBase):
     commission_config_uuid: Optional[UUID] = Field(None, description="UUID de configuración predefinida de comisiones")
     profit_splits: Optional[List[ProfitSplitCreate]] = Field(None, description="Splits manuales (alternativa a config_uuid)")
     force: bool = Field(False, description="Forzar creación ignorando advertencias de duplicados")
+    usdt_rate: Optional[float] = None  # Tasa USDT/moneda_origen al momento de la transacción
 
     @validator('profit_splits')
     def validate_profit_splits(cls, v, values):
@@ -94,6 +99,7 @@ class TransactionUpdate(BaseModel):
     transaction_type: Optional[str] = None
     total_profit_percentage: Optional[float] = None
     status: Optional[str] = None
+    usdt_rate: Optional[float] = None  # Para recalcular profit_amount_usdt de splits al actualizar
 
     @validator('from_amount', 'to_amount')
     def validate_amount(cls, v):
@@ -128,6 +134,7 @@ class TransactionResponse(BaseModel):
     total_profit_percentage: float = 0.0
     user_uuid: Optional[UUID] = None
     profit_amount: float
+    profit_amount_usdt: Optional[float] = None
     status: str
     created_at: datetime
     updated_at: Optional[datetime]

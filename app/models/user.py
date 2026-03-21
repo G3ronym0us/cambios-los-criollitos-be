@@ -30,6 +30,7 @@ class User(UUIDMixin, Base):
     # Campos de comisiones
     can_receive_commission = Column(Boolean, default=False, nullable=False)
     preferred_settlement_currency = Column(String(10), nullable=True)  # Moneda preferida de cobro (ej: "USD", "COP"). NULL = USDT
+    is_fund_manager = Column(Boolean, default=False, nullable=False)   # Flag global: administra cuentas físicas de algún fondo
 
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -124,6 +125,7 @@ class User(UUIDMixin, Base):
             "permissions": permissions.get(self.role, []),
             "can_receive_commission": self.can_receive_commission,
             "preferred_settlement_currency": self.preferred_settlement_currency,
+            "is_fund_manager": self.is_fund_manager,
             "last_login": self.last_login,
             "created_at": self.created_at,
             "updated_at": self.updated_at,

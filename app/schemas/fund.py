@@ -1,0 +1,125 @@
+from pydantic import BaseModel, validator, Field
+from datetime import datetime
+from typing import Optional, List
+from uuid import UUID
+
+
+# ===== Fund Group Schemas =====
+
+class FundGroupCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    currency: str = Field(..., min_length=1, max_length=10)
+    description: Optional[str] = None
+
+
+class FundGroupMemberCreate(BaseModel):
+    user_uuid: UUID
+    is_fund_manager: bool = False
+
+
+class FundGroupMemberResponse(BaseModel):
+    uuid: UUID
+    user_uuid: UUID
+    username: Optional[str] = None
+    is_fund_manager: bool
+    joined_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class FundGroupResponse(BaseModel):
+    uuid: UUID
+    name: str
+    currency: str
+    description: Optional[str] = None
+    is_active: bool
+    created_at: datetime
+    members: List[FundGroupMemberResponse] = []
+
+    class Config:
+        from_attributes = True
+
+
+# ===== Fund Movement Schemas =====
+
+VALID_MOVEMENT_TYPES = {"deposit", "exchange", "personal", "adjustment"}
+
+
+class FundMovementCreate(BaseModel):
+    group_uuid: UUID
+    user_uuid: UUID
+    movement_type: str = Field(..., description="deposit | exchange | personal | adjustment")
+    amount: float = Field(..., gt=0, description="Monto positivo del movimiento")
+    currency: str = Field(..., min_length=1, max_length=10)
+    amount_usdt: Optional[float] = None
+    usdt_rate: Optional[float] = None
+    transaction_uuid: Optional[UUID] = None
+    reference: Optional[str] = None
+    notes: Optional[str] = None
+    movement_date: datetime
+
+    @validator("movement_type")
+    def validate_movement_type(cls, v):
+        if v not in VALID_MOVEMENT_TYPES:
+            raise ValueError(f"movement_type must be one of: {', '.join(VALID_MOVEMENT_TYPES)}")
+        return v
+
+
+class FundMovementResponse(BaseModel):
+    uuid: UUID
+    group_uuid: Optional[UUID] = None
+    group_name: Optional[str] = None
+    user_uuid: Optional[UUID] = None
+    username: Optional[str] = None
+    movement_type: str
+    amount: float
+    currency: str
+    amount_usdt: Optional[float] = None
+    usdt_rate: Optional[float] = None
+    transaction_uuid: Optional[UUID] = None
+    reference: Optional[str] = None
+    notes: Optional[str] = None
+    recorded_by_uuid: Optional[UUID] = None
+    recorded_by_username: Optional[str] = None
+    movement_date: datetime
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ===== Position & Balance Schemas =====
+
+class UserPositionResponse(BaseModel):
+    """Posición individual de un gestor dentro de un grupo de fondo"""
+    user_uuid: UUID
+    username: Optional[str] = None
+    group_uuid: UUID
+    group_name: str
+    is_fund_manager: bool
+    total_deposited: float        # Suma de depósitos en moneda nativa
+    total_deposited_usdt: float   # Suma de depósitos en USDT
+    total_outflow: float          # Suma de EXCHANGE + PERSONAL en moneda nativa
+    total_outflow_usdt: float     # Suma de EXCHANGE + PERSONAL en USDT
+    position: float               # total_deposited - total_outflow (moneda nativa)
+    position_usdt: float          # deposited_usdt - outflow_usdt
+    currency: str                 # Moneda del fondo
+
+
+class FundGroupBalanceResponse(BaseModel):
+    """
+    Balance consolidado del grupo — replica las tres columnas de la hoja Excel:
+    - total_position_usdt  → "Total"     (depósitos - salidas)
+    - total_profit_usdt    → "Acumulada" (ganancias de transacciones completadas)
+    - available_funds_usdt → "Fondos"    (Acumulada - Total)
+    """
+    group_uuid: UUID
+    group_name: str
+    currency: str
+    total_deposited_usdt: float
+    total_outflow_usdt: float
+    total_position_usdt: float       # deposited - outflow → "Total" Excel
+    total_profit_usdt: float         # suma profit splits de miembros COMPLETED → "Acumulada"
+    available_funds_usdt: float      # profit - position → "Fondos" Excel
+    by_member: List[UserPositionResponse] = []

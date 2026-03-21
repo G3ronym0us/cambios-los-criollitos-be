@@ -23,6 +23,7 @@ class UserUpdate(BaseModel):
     phone_number: Optional[str] = None
     bio: Optional[str] = None
     preferred_settlement_currency: Optional[str] = None
+    is_fund_manager: Optional[bool] = None
 
 class UserResponse(UserBase):
     uuid: UUID
@@ -31,6 +32,7 @@ class UserResponse(UserBase):
     is_verified: bool
     can_receive_commission: bool
     preferred_settlement_currency: Optional[str] = None
+    is_fund_manager: bool = False
     phone_number: Optional[str] = None
     bio: Optional[str] = None
     avatar_url: Optional[str] = None

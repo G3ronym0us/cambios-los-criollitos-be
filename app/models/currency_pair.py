@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, UniqueConstraint, Numeric, JSON, Enum as SQLEnum
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, Float, ForeignKey, UniqueConstraint, Numeric, JSON, Enum as SQLEnum
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from app.database.connection import Base
@@ -17,6 +17,12 @@ class CurrencyPair(UUIDMixin, Base):
     
     # Base pair for derived rates (nullable for primary pairs)
     base_pair_id = Column(Integer, ForeignKey("currency_pairs.id"), nullable=True)
+
+    # USDT conversion config — used when auto-creating FundMovements from transactions
+    usdt_reference_side = Column(String(4), nullable=True)   # "FROM" or "TO"
+    usdt_manual_rate    = Column(Float, nullable=True)        # reference_amount * rate = amount_usdt
+    usdt_pair_id        = Column(Integer, ForeignKey("currency_pairs.id"), nullable=True)
+    usdt_pair_inverse   = Column(Boolean, default=False, nullable=False)
     
     # Derived rate configuration (only used when base_pair_id is set)
     derived_percentage = Column(Numeric(5, 2), nullable=True)  # Percentage to apply (e.g., 5.00 for 5%)
@@ -47,8 +53,9 @@ class CurrencyPair(UUIDMixin, Base):
     # Relationships
     from_currency = relationship("Currency", foreign_keys=[from_currency_id])
     to_currency = relationship("Currency", foreign_keys=[to_currency_id])
-    base_pair = relationship("CurrencyPair", remote_side=[id], back_populates="derived_pairs")
-    derived_pairs = relationship("CurrencyPair", back_populates="base_pair")
+    base_pair = relationship("CurrencyPair", foreign_keys=[base_pair_id], remote_side="CurrencyPair.id", back_populates="derived_pairs")
+    derived_pairs = relationship("CurrencyPair", foreign_keys=[base_pair_id], back_populates="base_pair")
+    usdt_pair = relationship("CurrencyPair", foreign_keys=[usdt_pair_id], remote_side="CurrencyPair.id")
     
     # Ensure unique pair combination
     __table_args__ = (
@@ -93,6 +100,11 @@ class CurrencyPair(UUIDMixin, Base):
             "base_pair": self.base_pair.dict() if self.base_pair else None,
             "derived_percentage": float(self.derived_percentage) if self.derived_percentage else None,
             "use_inverse_percentage": self.use_inverse_percentage,
+            "usdt_reference_side": self.usdt_reference_side,
+            "usdt_manual_rate": self.usdt_manual_rate,
+            "usdt_pair_uuid": self.usdt_pair.uuid if self.usdt_pair else None,
+            "usdt_pair_symbol": self.usdt_pair.pair_symbol if self.usdt_pair else None,
+            "usdt_pair_inverse": self.usdt_pair_inverse,
             "created_at": self.created_at,
             "updated_at": self.updated_at
         }

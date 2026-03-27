@@ -1,5 +1,5 @@
 from pydantic import BaseModel, validator, Field
-from typing import Optional, List
+from typing import Optional, List, Literal
 from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
@@ -19,6 +19,10 @@ class CurrencyPairBase(BaseModel):
     binance_tracked: bool = False
     banks_to_track: Optional[List[str]] = None
     amount_to_track: Optional[Decimal] = None
+    usdt_reference_side: Optional[Literal["FROM", "TO"]] = Field(None, description="Which side is the USDT reference (FROM or TO currency)")
+    usdt_manual_rate: Optional[float] = Field(None, description="Manual USDT rate: reference_amount * rate = amount_usdt")
+    usdt_pair_uuid: Optional[UUID] = Field(None, description="UUID of CurrencyPair used for auto USDT rate")
+    usdt_pair_inverse: bool = Field(False, description="If True, use 1/rate from the conversion pair")
 
     @validator('to_currency_uuid')
     def validate_different_currencies(cls, v, values):
@@ -70,6 +74,10 @@ class CurrencyPairUpdate(BaseModel):
     binance_tracked: Optional[bool] = None
     banks_to_track: Optional[List[str]] = None
     amount_to_track: Optional[Decimal] = None
+    usdt_reference_side: Optional[Literal["FROM", "TO"]] = None
+    usdt_manual_rate: Optional[float] = None
+    usdt_pair_uuid: Optional[UUID] = None
+    usdt_pair_inverse: Optional[bool] = None
 
     @validator('pair_type', pre=True)
     def validate_pair_type(cls, v):
@@ -100,6 +108,11 @@ class CurrencyPairResponse(BaseModel):
     binance_tracked: bool
     banks_to_track: Optional[List[str]] = None
     amount_to_track: Optional[Decimal] = None
+    usdt_reference_side: Optional[str] = None
+    usdt_manual_rate: Optional[float] = None
+    usdt_pair_uuid: Optional[UUID] = None
+    usdt_pair_symbol: Optional[str] = None
+    usdt_pair_inverse: bool = False
     created_at: datetime
     updated_at: Optional[datetime] = None
 

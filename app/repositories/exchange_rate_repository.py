@@ -295,6 +295,16 @@ class ExchangeRateRepository:
             joinedload(ExchangeRate.currency_pair).joinedload(CurrencyPair.to_currency)
         ).order_by(desc(ExchangeRate.created_at)).all()
 
+    def get_latest_rate_by_pair_id(self, currency_pair_id: int) -> Optional[ExchangeRate]:
+        """Get the most recent active ExchangeRate for a CurrencyPair by its integer ID."""
+        return self.db.query(ExchangeRate)\
+            .filter(
+                ExchangeRate.currency_pair_id == currency_pair_id,
+                ExchangeRate.is_active == True
+            )\
+            .order_by(desc(ExchangeRate.created_at))\
+            .first()
+
     def delete_rate(self, rate_uuid: UUID) -> bool:
         """Eliminar (desactivar) una tasa de cambio"""
         rate = self.get_by_uuid(rate_uuid)

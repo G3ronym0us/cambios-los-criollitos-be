@@ -193,9 +193,28 @@ async def create_transaction(
             effective_fund_group = config.fund_group
 
         if effective_fund_group:
-            amount_usdt = None
+            resolved_amount_usdt = None
+            resolved_usdt_rate = transaction_data.usdt_rate
+
             if transaction_data.usdt_rate:
-                amount_usdt = transaction.from_amount / transaction_data.usdt_rate
+                # Explicit rate in request always wins
+                resolved_amount_usdt = transaction.from_amount / transaction_data.usdt_rate
+            elif currency_pair.usdt_reference_side:
+                reference_amount = (
+                    transaction.from_amount if currency_pair.usdt_reference_side == "FROM"
+                    else transaction.to_amount
+                )
+                if reference_amount is not None:
+                    if currency_pair.usdt_manual_rate is not None:
+                        resolved_amount_usdt = reference_amount * currency_pair.usdt_manual_rate
+                        resolved_usdt_rate = currency_pair.usdt_manual_rate
+                    elif currency_pair.usdt_pair_id:
+                        from app.repositories.exchange_rate_repository import ExchangeRateRepository
+                        er = ExchangeRateRepository(db).get_latest_rate_by_pair_id(currency_pair.usdt_pair_id)
+                        if er:
+                            rate = (1.0 / er.rate) if currency_pair.usdt_pair_inverse else er.rate
+                            resolved_amount_usdt = reference_amount * rate
+                            resolved_usdt_rate = rate
 
             fund_repo.create_movement(
                 group_id=effective_fund_group.id,
@@ -204,8 +223,8 @@ async def create_transaction(
                 amount=transaction.from_amount,
                 currency=currency_pair.from_currency.symbol,
                 movement_date=datetime.utcnow(),
-                amount_usdt=amount_usdt,
-                usdt_rate=transaction_data.usdt_rate,
+                amount_usdt=resolved_amount_usdt,
+                usdt_rate=resolved_usdt_rate,
                 transaction_id=transaction.id,
                 recorded_by_user_id=current_user.id,
             )

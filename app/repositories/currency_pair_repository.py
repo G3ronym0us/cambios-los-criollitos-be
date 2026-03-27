@@ -45,6 +45,14 @@ class CurrencyPairRepository:
                 raise ValueError("Base pair must be either Binance tracked or have manual rates")
             base_pair_id = base_pair.id
 
+        # Resolve usdt_pair_uuid to usdt_pair_id if provided
+        usdt_pair_id = None
+        if pair_data.usdt_pair_uuid:
+            usdt_pair = self.get_by_uuid(pair_data.usdt_pair_uuid)
+            if not usdt_pair:
+                raise ValueError("USDT conversion pair not found")
+            usdt_pair_id = usdt_pair.id
+
         db_pair = CurrencyPair(
             from_currency_id=from_currency.id,
             to_currency_id=to_currency.id,
@@ -58,7 +66,11 @@ class CurrencyPairRepository:
             is_monitored=pair_data.is_monitored,
             binance_tracked=pair_data.binance_tracked,
             banks_to_track=pair_data.banks_to_track,
-            amount_to_track=pair_data.amount_to_track
+            amount_to_track=pair_data.amount_to_track,
+            usdt_reference_side=pair_data.usdt_reference_side,
+            usdt_manual_rate=pair_data.usdt_manual_rate,
+            usdt_pair_id=usdt_pair_id,
+            usdt_pair_inverse=pair_data.usdt_pair_inverse,
         )
         
         # Validate base pair configuration
@@ -120,23 +132,44 @@ class CurrencyPairRepository:
                 CurrencyPair.to_currency_id == to_currency_id
             ).first()
 
-    def get_all_pairs(self, skip: int = 0, limit: int = 100, active_only: bool = False) -> List[CurrencyPair]:
+    def get_all_pairs(
+        self,
+        skip: int = 0,
+        limit: int = 100,
+        active_only: bool = False,
+        currency_symbol: Optional[str] = None,
+    ) -> List[CurrencyPair]:
         """Get all currency pairs with pagination and simple ordering"""
+        from app.models.currency import Currency
+        from sqlalchemy.orm import aliased
+
+        FromCurrency = aliased(Currency)
+        ToCurrency = aliased(Currency)
+
         query = self.db.query(CurrencyPair)\
-            .options(joinedload(CurrencyPair.from_currency), 
-                    joinedload(CurrencyPair.to_currency))
-        
+            .join(FromCurrency, CurrencyPair.from_currency_id == FromCurrency.id)\
+            .join(ToCurrency, CurrencyPair.to_currency_id == ToCurrency.id)\
+            .options(
+                joinedload(CurrencyPair.from_currency),
+                joinedload(CurrencyPair.to_currency),
+            )
+
         if active_only:
             query = query.filter(CurrencyPair.is_active == True)
-        
-        # Simple ordering by CurrencyPair fields only
+
+        if currency_symbol:
+            symbol = currency_symbol.upper()
+            query = query.filter(
+                (FromCurrency.symbol == symbol) | (ToCurrency.symbol == symbol)
+            )
+
         query = query.order_by(
-            desc(CurrencyPair.binance_tracked),  # binance_tracked=True first
-            desc(CurrencyPair.is_monitored),     # is_monitored=True second  
-            desc(CurrencyPair.is_active),        # is_active=True third
-            asc(CurrencyPair.pair_symbol)        # Alphabetical last
+            desc(CurrencyPair.binance_tracked),
+            desc(CurrencyPair.is_monitored),
+            desc(CurrencyPair.is_active),
+            asc(CurrencyPair.pair_symbol)
         )
-        
+
         return query.offset(skip).limit(limit).all()
 
     def get_monitored_pairs(self) -> List[CurrencyPair]:
@@ -186,6 +219,17 @@ class CurrencyPairRepository:
             del update_data['base_pair_uuid']
         elif 'base_pair_uuid' in update_data:
             del update_data['base_pair_uuid']
+
+        # Convert usdt_pair_uuid to usdt_pair_id if provided
+        if 'usdt_pair_uuid' in update_data and update_data['usdt_pair_uuid']:
+            usdt_pair = self.get_by_uuid(update_data['usdt_pair_uuid'])
+            if not usdt_pair:
+                raise ValueError("USDT conversion pair not found")
+            update_data['usdt_pair_id'] = usdt_pair.id
+            del update_data['usdt_pair_uuid']
+        elif 'usdt_pair_uuid' in update_data:
+            update_data['usdt_pair_id'] = None
+            del update_data['usdt_pair_uuid']
 
         for field, value in update_data.items():
             setattr(pair, field, value)

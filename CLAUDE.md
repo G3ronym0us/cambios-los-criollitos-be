@@ -4,207 +4,143 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Application Overview
 
-This is a **FastAPI currency exchange rate tracking system** that scrapes P2P exchange rates from Binance for Latin American currencies (VES, COP, BRL) and provides real-time conversion services. The backend includes user authentication with role-based permissions, background scraping tasks, and a comprehensive API for rate management.
+This is a **FastAPI currency exchange rate tracking system** that scrapes P2P exchange rates from Binance for Latin American currencies (VES, COP, BRL) and provides real-time conversion services. The backend includes user authentication with role-based permissions, background scraping tasks, commission configuration, and transaction tracking.
 
 ## Core Architecture
 
 **Stack**: FastAPI + PostgreSQL + Redis + Celery + Docker
-**Key Services**: Web API, Background workers, Scheduled tasks, Database, Cache
 
 ### Directory Structure
-- `app/main.py` - FastAPI application entry point with main endpoints
-- `app/core/` - Configuration, security, authentication, dependencies
-- `app/models/` - SQLAlchemy database models (User, ExchangeRate, Transaction)
+- `app/main.py` - FastAPI app entry point, CORS/proxy middleware, router inclusion
+- `app/core/` - Configuration (`config.py`), JWT security (`security.py`), dependency injection (`dependencies.py`)
+- `app/models/` - SQLAlchemy ORM models
 - `app/routers/` - API route handlers grouped by feature
-- `app/services/` - Business logic (scraping, rate calculation, conversions)
-- `app/repositories/` - Data access layer
-- `app/schemas/` - Pydantic models for request/response validation
-- `app/tasks/` - Celery background tasks
-- `alembic/` - Database migrations
+- `app/services/` - Business logic and scraping orchestration
+- `app/repositories/` - Data access layer (always use these, never access models directly)
+- `app/schemas/` - Pydantic request/response models
+- `app/tasks/scraping_tasks.py` - Celery task definitions and beat schedule
+- `app/enums/` - `UserRole`, `PairType`, currency enums
+- `alembic/` - Database migrations (24+ versions)
 
 ## Development Commands
 
-### Docker Environment (Recommended)
+### Docker (Recommended)
 ```bash
-# Start all services (API + DB + Redis + Celery workers)
-docker-compose up -d
-
-# View logs
-docker-compose logs -f backend
-
-# Stop services
-docker-compose down
-
-# Rebuild after code changes
-docker-compose up --build
+docker-compose up -d                        # Start all services
+docker-compose logs -f backend              # View API logs
+docker-compose up --build                   # Rebuild after dependency changes
+docker-compose exec backend python create_root_user.py  # Create root user
 ```
 
 ### Local Development
 ```bash
-# Install dependencies
 pip install -r requirements.txt
-
-# Run database migrations
 alembic upgrade head
-
-# Start API server (requires PostgreSQL and Redis running)
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-
-# Start Celery worker
 celery -A app.tasks.scraping_tasks.celery_app worker --loglevel=info
-
-# Start Celery beat scheduler
 celery -A app.tasks.scraping_tasks.celery_app beat --loglevel=info
 ```
 
-### Database Operations
+### Database
 ```bash
-# Create new migration
 alembic revision --autogenerate -m "description"
-
-# Apply migrations
 alembic upgrade head
-
-# Downgrade migration
 alembic downgrade -1
 ```
 
 ### Testing
 ```bash
-# Run tests (pytest available in requirements.txt)
 pytest
-
-# Run with coverage
 pytest --cov=app
 ```
+> **Note**: No tests are currently implemented despite pytest in requirements.
 
-## Key Configuration
+## Environment Variables
 
-**Environment Variables** (set in docker-compose.yml or .env):
-- `DATABASE_URL` - PostgreSQL connection string
-- `REDIS_URL` - Redis connection string  
-- `JWT_SECRET_KEY` - JWT token signing key
-- `PYTHONPATH=/app` - Required for module imports
-
-**Main config file**: `app/core/config.py` - Comprehensive Pydantic settings
-
-## Authentication System
-
-**User Roles**: USER (read-only) → MODERATOR (manage rates) → ROOT (full admin)
-**JWT-based** authentication with refresh tokens
-**Key files**: `app/core/security.py`, `app/routers/auth.py`, `app/models/user.py`
-
-## Scraping System
-
-**Primary source**: Binance P2P API via `app/services/scraper_service.py`
-**Currencies**: VES, COP, BRL against USDT, with PayPal/Zelle variants
-**Background tasks**: Scheduled scraping via Celery in `app/tasks/scraping_tasks.py`
-**Manual triggers**: Available through `/api/scraping/` endpoints
-
-## API Structure
-
-**Main endpoints**:
-- `/` - API status and docs
-- `/api/rates` - Current exchange rates
-- `/api/convert` - Currency conversion
-- `/auth/` - Authentication endpoints
-- `/docs` - FastAPI automatic documentation
-
-**Service architecture**: Router → Repository → Database Model pattern
-
-## Important Notes
-
-- **Database**: Uses PostgreSQL with SQLAlchemy 2.0 syntax
-- **Async**: Services use both async/await and sync patterns appropriately  
-- **Selenium**: Web scraping setup with Chrome/Chromium in Docker
-- **Background processing**: Celery tasks for rate updates every hour
-- **Security**: JWT tokens, password hashing, role-based access control
+```bash
+DATABASE_URL=postgresql://tasas_user:tasas_password@localhost:5433/tasas_db
+REDIS_URL=redis://localhost:6380/0       # Local: 6380 | Docker internal: redis:6379
+JWT_SECRET_KEY=<32+ char secret>
+ROOT_USER_EMAIL=admin@example.com
+ROOT_USER_PASSWORD=your-secure-password
+PYTHONPATH=/app                          # Required for module imports
+APP_ENV=development                      # development | production | testing
+```
 
 ## Root User Setup
 
-Create initial admin user:
 ```bash
-# Via Docker
-docker-compose exec backend python create_root_user.py
-
-# Or use CLI tool
 python app/cli/create_root_user.py create
-python app/cli/create_root_user.py list  # List existing users
+python app/cli/create_root_user.py list
 ```
 
-## Critical Architecture Details
+## Architecture Details
 
-### Scraping System Architecture
+### Request Flow
 
-**Multi-layered scraping with rate derivation**:
-- **Base rates**: Fetches VES, COP, BRL ↔ USDT from Binance P2P API
-- **Derived rates**: Automatically calculates Zelle/PayPal rates with configurable margins (5-12%)
-- **Cross rates**: Generates direct fiat-to-fiat conversions (VES↔COP, VES↔BRL, COP↔BRL)
-- **Source attribution**: Primary (`binance_p2p`), derived (`binance_p2p_derived`), cross (`binance_p2p_cross`)
+**Router → Repository → Database Model**. Routers use FastAPI `Depends()` for auth and DB session injection. Never access models directly from routers—always go through repositories.
 
-**Scraper pattern**: Abstract `BaseScraper` class with `initialize()`, `get_rates()`, `close()` methods. `ScrapingService` orchestrates multiple scrapers and handles database persistence via `ExchangeRateRepository`.
+### Authentication & Authorization
 
-### ExchangeRate Model Important Notes
+**Role hierarchy**: `USER` (read-only) → `MODERATOR` (rate management) → `ROOT` (full admin)
 
-**Always use `ExchangeRate.create_safe()` method** when creating instances with percentage adjustments:
+Multi-method JWT auth: `Authorization: Bearer <token>`, cookies, or query params. Supports failed login tracking, 15-min account lockout, and configurable password policies.
+
+**Dependency injection pattern** (`app/core/dependencies.py`):
+- `get_current_user()` → validates JWT, returns User
+- `get_current_active_user()` → validates active/verified/unlocked
+- `require_role(UserRole.MODERATOR)` → role-gated endpoint decorator
+- `require_permission("rates:write")` → permission-gated decorator
+
+### Scraping System
+
+**Three-layer rate system**:
+1. **Base rates** (`binance_p2p`): Direct Binance P2P API hits for FIAT↔USDT pairs. Uses `aiohttp` (not Selenium) for the P2P search API.
+2. **Derived rates** (`binance_p2p_derived`): Calculated from base pairs with configurable `derived_percentage` + `use_inverse_percentage`. Configured per `CurrencyPair` via `base_pair_id`.
+3. **Cross rates** (`binance_p2p_cross`): Direct fiat-to-fiat conversions (VES↔COP, VES↔BRL, COP↔BRL) computed from base pairs.
+
+**Scraper lifecycle**: `ScrapingService` calls `initialize()` → `get_rates()` → `close()` on each `BaseScraper` implementation. Celery runs this hourly; manual trigger available via `POST /scrape/manual`.
+
+**Binance tracking configuration**: A `CurrencyPair` must have `binance_tracked=True`, a `banks_to_track` JSON array (e.g., `["Zelle", "PayPal"]`), and `amount_to_track` set. Only FIAT/CRYPTO pairs are valid for direct Binance tracking.
+
+### ExchangeRate Model — Critical
+
+**Always use `ExchangeRate.create_safe()`** when creating instances with percentage adjustments:
 ```python
-# CORRECT - handles percentage and validation
+# CORRECT
 rate = ExchangeRate.create_safe('VES', 'USDT', 45.5, source='binance', percentage=5, inverse_percentage=True)
 
-# INCORRECT - will cause "percentage is invalid keyword" error
+# INCORRECT — will raise "percentage is invalid keyword" error
 rate = ExchangeRate(from_currency='VES', to_currency='USDT', rate=45.5, percentage=5)
 ```
 
-### Authentication & Authorization Flow
+**Manual rate override**: `ExchangeRate` supports `is_manual` flag. When active, `manual_rate` overrides the automatic rate; `automatic_rate` is preserved for fallback. Use `set_manual_rate()` / `remove_manual_rate()` methods.
 
-**Role hierarchy**: USER (read-only) → MODERATOR (rate management) → ROOT (full admin)
-**Multi-method auth**: Supports JWT via Authorization header, cookies, and query parameters
-**Security features**: Failed login tracking, account lockout (15 min), configurable password policies
+### CurrencyPair Configuration
 
-### Background Tasks & Redis Configuration
+`CurrencyPair` drives scraping and derived rate behavior:
+- **Binance tracking**: `binance_tracked=True` + `banks_to_track` + `amount_to_track`
+- **Derived rates**: `base_pair_id` (FK to another CurrencyPair) + `derived_percentage` + `use_inverse_percentage`
+- **Pair type**: `PairType` enum — `BASE`, `DERIVED`, or `CROSS`
+- All models have a `uuid` column (via `UUIDMixin`) used in API responses; internal PKs are integer IDs
 
-**Critical**: Docker Redis runs on port 6380, local Redis on 6379. Ensure `REDIS_URL` environment variable matches your setup:
-- Docker: `redis://redis:6379/0` (internal Docker network)  
-- Local: `redis://localhost:6380/0` (mapped port)
+### Commission & Transaction System
 
-**Celery tasks**: Hourly scraping via `celery_beat`, manual triggers via API endpoints
+**CommissionConfiguration**: Per-currency-pair profit distribution config with named splits (`CommissionConfigurationSplit`) assigning percentages to specific users.
 
-### Database Patterns
+**Transaction**: Records currency conversions with `from_amount`, `to_amount`, `exchange_rate`, profit tracking, and `TransactionProfitSplit` for multi-user profit distribution. Status: `PENDING → COMPLETED | CANCELLED | FAILED`.
 
-**Repository pattern**: Use repositories (`UserRepository`, `ExchangeRateRepository`) rather than direct model access
-**Migrations**: Alembic configured with dynamic URL from settings. Always test migrations in development first
-**Connection**: Async-capable but uses sync patterns where needed for Celery compatibility
+### Redis & Celery
 
-## Development Troubleshooting
+**Port distinction**: Docker Redis container is on port `6379` internally but mapped to `6380` on host. Local Redis typically runs on `6379`.
+- Docker `REDIS_URL`: `redis://redis:6379/0`
+- Local `REDIS_URL`: `redis://localhost:6380/0`
 
-### Common Issues
+Celery beat schedule: hourly scraping. Tasks in `app/tasks/scraping_tasks.py` manage their own `asyncio` event loop since Celery workers run synchronously.
 
-1. **Celery tasks stuck in PENDING**: Check Redis port configuration mismatch between local/Docker
-2. **ExchangeRate creation errors**: Use `create_safe()` method instead of direct constructor
-3. **Import errors**: Ensure `PYTHONPATH=/app` is set in environment
-4. **Migration errors**: Run `alembic upgrade head` after pulling new migrations
+## Common Issues
 
-### Testing Framework
-
-**Status**: ⚠️ No tests currently implemented despite pytest in requirements
-**Recommended structure**:
-```
-tests/
-├── conftest.py           # Fixtures for auth, database
-├── test_auth.py          # JWT, role-based access  
-├── test_scraping.py      # Scraper services
-├── test_repositories.py  # Data access layer
-└── test_api/            # Endpoint integration tests
-```
-
-### Environment Variables
-
-**Required for development**:
-```bash
-DATABASE_URL=postgresql://tasas_user:tasas_password@localhost:5433/tasas_db
-REDIS_URL=redis://localhost:6380/0
-JWT_SECRET_KEY=your-32-character-minimum-secret-key
-ROOT_USER_EMAIL=admin@example.com
-ROOT_USER_PASSWORD=your-secure-password
-PYTHONPATH=/app
-```
+1. **Celery tasks stuck in PENDING**: Redis port mismatch (`REDIS_URL` env var)
+2. **ExchangeRate creation errors**: Use `create_safe()` not direct constructor
+3. **Import errors**: Ensure `PYTHONPATH=/app`
+4. **Migration errors**: Run `alembic upgrade head` after pulling new code

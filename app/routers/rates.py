@@ -26,6 +26,7 @@ def enrich_rate_response(rate) -> dict:
         "from_currency": rate.from_currency,
         "to_currency": rate.to_currency,
         "rate": rate.rate,
+        "base_rate": rate.base_rate,
         "is_active": rate.is_active,
         "percentage": rate.percentage,
         "inverse_percentage": rate.inverse_percentage,
@@ -260,6 +261,39 @@ async def get_all_active_rates(
     # Construir respuestas con datos enriquecidos
     enriched_rates = [enrich_rate_response(rate) for rate in rates]
     return enriched_rates
+
+
+@router.get("/historical/{currency_pair_uuid}", response_model=ExchangeRateResponse)
+async def get_rate_at_datetime(
+    currency_pair_uuid: UUID,
+    at: datetime = Query(..., description="Fecha y hora (ISO 8601, ej: 2026-03-21T14:30:00Z)"),
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """
+    Obtener la tasa que estaba activa para un par en un momento específico.
+
+    Devuelve el registro con `created_at` más reciente que sea <= `at`.
+    """
+    from app.repositories.currency_pair_repository import CurrencyPairRepository
+    pair_repo = CurrencyPairRepository(db)
+    currency_pair = pair_repo.get_by_uuid(currency_pair_uuid)
+    if not currency_pair:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Currency pair with UUID {currency_pair_uuid} not found"
+        )
+
+    repo = ExchangeRateRepository(db)
+    rate = repo.get_rate_at_datetime(currency_pair.id, at)
+
+    if not rate:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No rate found for pair {currency_pair.pair_symbol} at or before {at.isoformat()}"
+        )
+
+    return ExchangeRateResponse(**enrich_rate_response(rate))
 
 
 @router.get("/by-pair/{currency_pair_uuid}", response_model=ExchangeRateResponse)

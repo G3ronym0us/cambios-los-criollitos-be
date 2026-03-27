@@ -11,7 +11,7 @@ class UserBase(BaseModel):
 
 class UserCreate(UserBase):
     password: str
-    role: Optional[str] = "user"
+    role: Optional[str] = "USER"
 
 class UserUpdate(BaseModel):
     email: Optional[EmailStr] = None

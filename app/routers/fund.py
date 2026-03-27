@@ -8,7 +8,7 @@ from app.database.connection import get_db
 from app.schemas.fund import (
     FundGroupCreate, FundGroupResponse,
     FundGroupMemberCreate, FundGroupMemberResponse,
-    FundMovementCreate, FundMovementResponse,
+    FundMovementCreate, FundMovementResponse, FundMovementList,
     UserPositionResponse, FundGroupBalanceResponse,
 )
 from app.repositories.fund_repository import FundRepository
@@ -133,12 +133,14 @@ async def get_group_balance(
     return balance
 
 
-@router.get("/groups/{group_uuid}/movements", response_model=List[FundMovementResponse])
+@router.get("/groups/{group_uuid}/movements", response_model=FundMovementList)
 async def list_group_movements(
     group_uuid: UUID,
-    movement_type: Optional[str] = Query(None, description="Filtrar por tipo: deposit, exchange, personal, adjustment"),
+    movement_type: Optional[str] = Query(None, description="Filtrar por tipo: DEPOSIT, EXCHANGE, PERSONAL, ADJUSTMENT"),
     date_from: Optional[datetime] = Query(None),
     date_to: Optional[datetime] = Query(None),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_moderator_user),
 ):
@@ -152,20 +154,30 @@ async def list_group_movements(
     type_enum = None
     if movement_type:
         try:
-            type_enum = FundMovementType(movement_type.lower())
+            type_enum = FundMovementType(movement_type.upper())
         except ValueError:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid movement_type '{movement_type}'. Valid: deposit, exchange, personal, adjustment",
+                detail=f"Invalid movement_type '{movement_type}'. Valid: DEPOSIT, EXCHANGE, PERSONAL, ADJUSTMENT",
             )
 
-    movements = fund_repo.get_movements(
+    skip = (page - 1) * per_page
+    movements, total = fund_repo.get_movements(
         group_id=group.id,
         movement_type=type_enum,
         date_from=date_from,
         date_to=date_to,
+        skip=skip,
+        limit=per_page,
     )
-    return [_serialize_movement(m) for m in movements]
+    total_pages = (total + per_page - 1) // per_page
+    return FundMovementList(
+        movements=[_serialize_movement(m) for m in movements],
+        total=total,
+        page=page,
+        per_page=per_page,
+        total_pages=total_pages,
+    )
 
 
 # ===== Movements =====

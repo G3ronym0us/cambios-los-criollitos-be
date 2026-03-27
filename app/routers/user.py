@@ -66,7 +66,7 @@ async def create_user(
         email=user_data.email,
         full_name=user_data.full_name,
         password=user_data.password,
-        role_name=user_data.role.lower() or "user",
+        role_name=user_data.role.upper() if user_data.role else "USER",
         is_active=user_data.is_active if user_data.is_active is not None else True,
         is_verified=False,
         phone_number=None

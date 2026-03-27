@@ -1,4 +1,4 @@
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, validator, Field
 from typing import Optional, List
 from datetime import datetime
 from decimal import Decimal
@@ -119,6 +119,10 @@ class CurrencyPairStatusUpdate(BaseModel):
     binance_tracked: Optional[bool] = None
     banks_to_track: Optional[List[str]] = None
     amount_to_track: Optional[Decimal] = None
+
+class CurrencyPairPercentageUpdate(BaseModel):
+    derived_percentage: float = Field(..., ge=0, le=100)
+    use_inverse_percentage: bool = False
 
 class CurrencyPairStats(BaseModel):
     total_pairs: int

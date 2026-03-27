@@ -1,9 +1,9 @@
 from enum import Enum
 
 class UserRole(Enum):
-    USER = "user"
-    MODERATOR = "moderator"
-    ROOT = "root"
+    USER = "USER"
+    MODERATOR = "MODERATOR"
+    ROOT = "ROOT"
 
     @property
     def level(self) -> int:

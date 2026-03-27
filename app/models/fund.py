@@ -1,4 +1,5 @@
 import enum
+import uuid as _uuid
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Text, Enum as SQLEnum, UniqueConstraint
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
@@ -7,10 +8,10 @@ from app.models.mixins import UUIDMixin
 
 
 class FundMovementType(enum.Enum):
-    DEPOSIT    = "deposit"     # Gestor deposita USD al fondo (Binance/Kraken → Zelle)
-    EXCHANGE   = "exchange"    # Cambio gestionado: gestor envía USD al cliente, sale del fondo
-    PERSONAL   = "personal"    # Gasto personal del gestor con fondos del fondo (queda como deuda)
-    ADJUSTMENT = "adjustment"  # Corrección manual
+    DEPOSIT    = "DEPOSIT"     # Gestor deposita USD al fondo (Binance/Kraken → Zelle)
+    EXCHANGE   = "EXCHANGE"    # Cambio gestionado: gestor envía USD al cliente, sale del fondo
+    PERSONAL   = "PERSONAL"    # Gasto personal del gestor con fondos del fondo (queda como deuda)
+    ADJUSTMENT = "ADJUSTMENT"  # Corrección manual
 
 
 class FundGroup(UUIDMixin, Base):
@@ -20,6 +21,7 @@ class FundGroup(UUIDMixin, Base):
     """
     __tablename__ = "fund_groups"
 
+    uuid = Column(String(36), unique=True, nullable=False, default=lambda: str(_uuid.uuid4()), index=True)
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(100), nullable=False, unique=True)
     currency = Column(String(10), nullable=False)  # Moneda base del fondo: "USD", "COP"
@@ -54,6 +56,7 @@ class FundGroupMember(UUIDMixin, Base):
     """
     __tablename__ = "fund_group_members"
 
+    uuid = Column(String(36), unique=True, nullable=False, default=lambda: str(_uuid.uuid4()), index=True)
     id = Column(Integer, primary_key=True, index=True)
     group_id = Column(Integer, ForeignKey("fund_groups.id", ondelete="CASCADE"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
@@ -67,6 +70,14 @@ class FundGroupMember(UUIDMixin, Base):
     __table_args__ = (
         UniqueConstraint("group_id", "user_id", name="unique_fund_group_member"),
     )
+
+    @property
+    def user_uuid(self):
+        return self.user.uuid if self.user else None
+
+    @property
+    def username(self):
+        return self.user.username if self.user else None
 
     def __repr__(self):
         return f"<FundGroupMember(group_id={self.group_id}, user_id={self.user_id}, manager={self.is_fund_manager})>"
@@ -94,6 +105,7 @@ class FundMovement(UUIDMixin, Base):
     """
     __tablename__ = "fund_movements"
 
+    uuid = Column(String(36), unique=True, nullable=False, default=lambda: str(_uuid.uuid4()), index=True)
     id = Column(Integer, primary_key=True, index=True)
     group_id = Column(Integer, ForeignKey("fund_groups.id"), nullable=False, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)

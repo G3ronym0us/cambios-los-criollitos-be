@@ -80,10 +80,11 @@ class UserRoleUpdate(BaseModel):
     
     @validator('role_name')
     def validate_role_name(cls, v):
-        allowed_roles = ["user", "moderator", "root"]
-        if v not in allowed_roles:
+        allowed_roles = ["USER", "MODERATOR", "ROOT"]
+        v_upper = v.upper()
+        if v_upper not in allowed_roles:
             raise ValueError(f'Rol debe ser uno de: {", ".join(allowed_roles)}')
-        return v
+        return v_upper
 
 class ChangePassword(BaseModel):
     current_password: str
@@ -101,16 +102,17 @@ class AdminCreateUser(BaseModel):
     password: str
     full_name: Optional[str] = None
     phone_number: Optional[str] = None
-    role_name: str = "user"
+    role_name: str = "USER"
     is_active: bool = True
     is_verified: bool = False
-    
+
     @validator('role_name')
     def validate_role_name(cls, v):
-        allowed_roles = ["user", "moderator", "root"]
-        if v not in allowed_roles:
+        allowed_roles = ["USER", "MODERATOR", "ROOT"]
+        v_upper = v.upper()
+        if v_upper not in allowed_roles:
             raise ValueError(f'Rol debe ser uno de: {", ".join(allowed_roles)}')
-        return v
+        return v_upper
 
 class Token(BaseModel):
     access_token: str

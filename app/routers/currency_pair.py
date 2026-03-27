@@ -6,8 +6,9 @@ from uuid import UUID
 
 from app.database.connection import get_db
 from app.schemas.currency_pair import (
-    CurrencyPairCreate, CurrencyPairUpdate, CurrencyPairResponse, 
-    CurrencyPairList, CurrencyPairStatusUpdate, CurrencyPairStats
+    CurrencyPairCreate, CurrencyPairUpdate, CurrencyPairResponse,
+    CurrencyPairList, CurrencyPairStatusUpdate, CurrencyPairStats,
+    CurrencyPairPercentageUpdate,
 )
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.repositories.currency_repository import CurrencyRepository
@@ -407,6 +408,34 @@ async def validate_binance_configuration(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Error validating with Binance API: {str(e)}"
         )
+
+@router.patch("/{pair_uuid}/percentage", response_model=CurrencyPairResponse)
+async def update_pair_percentage(
+    pair_uuid: UUID,
+    data: CurrencyPairPercentageUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """Actualizar porcentaje de margen de un par derivado (MODERATOR+). Dispara scraping para reflejar el cambio."""
+    pair_repo = CurrencyPairRepository(db)
+    pair = pair_repo.get_by_uuid(pair_uuid)
+    if not pair:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Currency pair not found")
+
+    pair.derived_percentage = data.derived_percentage
+    pair.use_inverse_percentage = data.use_inverse_percentage
+    pair.updated_at = datetime.utcnow()
+    pair_repo.db.commit()
+    db.refresh(pair)
+
+    try:
+        from app.tasks.scraping_tasks import manual_scrape
+        manual_scrape.delay()
+    except Exception:
+        pass
+
+    return CurrencyPairResponse(**pair.dict())
+
 
 @router.delete("/{pair_uuid}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_currency_pair(

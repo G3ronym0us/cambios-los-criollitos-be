@@ -32,6 +32,7 @@ class ExchangeRateResponse(BaseModel):
     inverse_percentage: bool = False
     created_at: datetime
     updated_at: Optional[datetime] = None
+    base_rate: Optional[float] = None
     manual_rate: Optional[float] = None
     is_manual: bool = False
     automatic_rate: Optional[float] = None

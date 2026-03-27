@@ -17,8 +17,7 @@ class TransactionRepository:
         self,
         transaction_data: TransactionCreate,
         created_by_user_id: Optional[int] = None,
-        from_currency: str = None,
-        to_currency: str = None
+        currency_pair_id: Optional[int] = None
     ) -> Transaction:
         """
         Crear nueva transacción con distribución de ganancias
@@ -40,9 +39,8 @@ class TransactionRepository:
                 raise ValueError(f"User with UUID {transaction_data.user_uuid} not found")
             user_id = user.id
 
-        # Validar que se proporcionaron las monedas
-        if not from_currency or not to_currency:
-            raise ValueError("from_currency and to_currency must be provided")
+        if not currency_pair_id:
+            raise ValueError("currency_pair_id must be provided")
 
         # Calcular profit_amount basado en el porcentaje y el monto
         profit_amount = (transaction_data.to_amount * transaction_data.total_profit_percentage) / 100
@@ -50,8 +48,7 @@ class TransactionRepository:
         # Crear transacción
         db_transaction = Transaction(
             user_id=user_id,
-            from_currency=from_currency.upper(),
-            to_currency=to_currency.upper(),
+            currency_pair_id=currency_pair_id,
             from_amount=transaction_data.from_amount,
             to_amount=transaction_data.to_amount,
             exchange_rate=transaction_data.exchange_rate,
@@ -136,8 +133,7 @@ class TransactionRepository:
 
     def find_similar_transactions(
         self,
-        from_currency: str,
-        to_currency: str,
+        currency_pair_id: int,
         from_amount: float,
         tolerance_percentage: float = 1.0
     ) -> List[Transaction]:
@@ -145,29 +141,24 @@ class TransactionRepository:
         Buscar transacciones similares basadas en par de monedas y monto del mismo día
 
         Args:
-            from_currency: Moneda origen
-            to_currency: Moneda destino
+            currency_pair_id: ID del par de monedas
             from_amount: Monto origen a comparar
             tolerance_percentage: Porcentaje de tolerancia para considerar montos similares (default 1%)
 
         Returns:
             Lista de transacciones similares del mismo día
         """
-        # Calcular rango de montos
         lower_bound = from_amount * (1 - tolerance_percentage / 100)
         upper_bound = from_amount * (1 + tolerance_percentage / 100)
 
-        # Calcular inicio del día actual (00:00:00)
         now = datetime.utcnow()
         start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-        # Buscar transacciones similares del mismo día
         query = self.db.query(Transaction)\
             .options(joinedload(Transaction.profit_splits))\
             .filter(
                 and_(
-                    Transaction.from_currency == from_currency.upper(),
-                    Transaction.to_currency == to_currency.upper(),
+                    Transaction.currency_pair_id == currency_pair_id,
                     Transaction.from_amount >= lower_bound,
                     Transaction.from_amount <= upper_bound,
                     Transaction.created_at >= start_of_day,
@@ -182,7 +173,7 @@ class TransactionRepository:
                              skip: int = 0,
                              limit: int = 100,
                              status: Optional[TransactionStatus] = None,
-                             currency_pair: Optional[Tuple[str, str]] = None,
+                             currency_pair_id: Optional[int] = None,
                              user_id: Optional[int] = None,
                              start_date: Optional[datetime] = None,
                              end_date: Optional[datetime] = None) -> Tuple[List[Transaction], int]:
@@ -198,14 +189,8 @@ class TransactionRepository:
         if status:
             query = query.filter(Transaction.status == status)
 
-        if currency_pair:
-            from_curr, to_curr = currency_pair
-            query = query.filter(
-                and_(
-                    Transaction.from_currency == from_curr.upper(),
-                    Transaction.to_currency == to_curr.upper()
-                )
-            )
+        if currency_pair_id:
+            query = query.filter(Transaction.currency_pair_id == currency_pair_id)
 
         if user_id:
             query = query.filter(Transaction.user_id == user_id)
@@ -231,8 +216,7 @@ class TransactionRepository:
         self,
         transaction_id: int,
         transaction_data: TransactionUpdate,
-        from_currency: str = None,
-        to_currency: str = None
+        currency_pair_id: Optional[int] = None
     ) -> Optional[Transaction]:
         """Actualizar transacción"""
         transaction = self.get_by_id(transaction_id)
@@ -241,10 +225,8 @@ class TransactionRepository:
 
         update_data = transaction_data.dict(exclude_unset=True)
 
-        # Si se proporcionaron from_currency y to_currency desde currency_pair_uuid
-        if from_currency and to_currency:
-            update_data['from_currency'] = from_currency.upper()
-            update_data['to_currency'] = to_currency.upper()
+        if currency_pair_id is not None:
+            update_data['currency_pair_id'] = currency_pair_id
 
         # Remover campos que no pertenecen al modelo Transaction
         update_data.pop('currency_pair_uuid', None)
@@ -306,32 +288,58 @@ class TransactionRepository:
     def get_user_profit_report(self,
                                 user_id: int,
                                 start_date: Optional[datetime] = None,
-                                end_date: Optional[datetime] = None) -> Dict:
+                                end_date: Optional[datetime] = None,
+                                skip: int = 0,
+                                limit: int = 50) -> Dict:
         """
         Generar reporte de ganancias para un usuario específico
 
         Returns:
-            Dict con total_profit, transaction_count y lista de transacciones
+            Dict con total_profit, transaction_count y lista de transacciones paginada
         """
-        # Query base para profit splits del usuario
-        query = self.db.query(TransactionProfitSplit)\
-            .join(Transaction)\
-            .filter(TransactionProfitSplit.user_id == user_id)\
-            .filter(Transaction.status == TransactionStatus.COMPLETED)
+        from sqlalchemy import func as sa_func
+
+        # Totales agregados (sin paginación)
+        agg_query = self.db.query(
+            sa_func.sum(TransactionProfitSplit.profit_amount).label("total_profit"),
+            sa_func.count(TransactionProfitSplit.transaction_id.distinct()).label("transaction_count"),
+        ).join(Transaction)\
+         .filter(TransactionProfitSplit.user_id == user_id)\
+         .filter(Transaction.status == TransactionStatus.COMPLETED)
 
         if start_date:
-            query = query.filter(Transaction.created_at >= start_date)
+            agg_query = agg_query.filter(Transaction.created_at >= start_date)
         if end_date:
-            query = query.filter(Transaction.created_at <= end_date)
+            agg_query = agg_query.filter(Transaction.created_at <= end_date)
 
-        splits = query.all()
+        agg = agg_query.first()
+        total_profit = float(agg.total_profit or 0)
+        transaction_count = int(agg.transaction_count or 0)
 
-        # Calcular totales
-        total_profit = sum(split.profit_amount for split in splits)
-        transaction_count = len(set(split.transaction_id for split in splits))
+        # IDs de transacciones paginadas — usar subquery para evitar conflicto
+        # DISTINCT + ORDER BY en PostgreSQL requiere que la columna de orden esté en el SELECT
+        from sqlalchemy import text
+        inner_q = self.db.query(
+            TransactionProfitSplit.transaction_id,
+            Transaction.created_at.label("tx_created_at"),
+        ).join(Transaction)\
+         .filter(TransactionProfitSplit.user_id == user_id)\
+         .filter(Transaction.status == TransactionStatus.COMPLETED)
 
-        # Obtener transacciones completas
-        transaction_ids = [split.transaction_id for split in splits]
+        if start_date:
+            inner_q = inner_q.filter(Transaction.created_at >= start_date)
+        if end_date:
+            inner_q = inner_q.filter(Transaction.created_at <= end_date)
+
+        inner_q = inner_q.distinct()
+
+        subq = inner_q.subquery()
+        tx_id_rows = self.db.query(subq.c.transaction_id)\
+            .order_by(desc(subq.c.tx_created_at))\
+            .offset(skip).limit(limit).all()
+
+        transaction_ids = [row[0] for row in tx_id_rows]
+
         transactions = self.db.query(Transaction)\
             .options(joinedload(Transaction.profit_splits))\
             .filter(Transaction.id.in_(transaction_ids))\
@@ -342,7 +350,7 @@ class TransactionRepository:
             "user_id": user_id,
             "total_profit": total_profit,
             "transaction_count": transaction_count,
-            "transactions": transactions
+            "transactions": transactions,
         }
 
     def get_profit_summary(self,
@@ -372,7 +380,7 @@ class TransactionRepository:
         # Por par de monedas
         by_currency_pair = {}
         for t in transactions:
-            pair = f"{t.from_currency}/{t.to_currency}"
+            pair = t.currency_pair.pair_symbol if t.currency_pair else str(t.currency_pair_id)
             if pair not in by_currency_pair:
                 by_currency_pair[pair] = {
                     "total_profit": 0,

@@ -1,5 +1,5 @@
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import func, and_
+from sqlalchemy import func, and_, case as sa_case
 from typing import Optional, List
 from datetime import datetime
 from uuid import UUID
@@ -25,7 +25,7 @@ class FundRepository:
     def get_group_by_uuid(self, group_uuid: UUID) -> Optional[FundGroup]:
         return self.db.query(FundGroup)\
             .options(joinedload(FundGroup.members).joinedload(FundGroupMember.user))\
-            .filter(FundGroup.uuid == group_uuid)\
+            .filter(FundGroup.uuid == str(group_uuid))\
             .first()
 
     def get_group_by_name(self, name: str) -> Optional[FundGroup]:
@@ -107,7 +107,7 @@ class FundRepository:
                 joinedload(FundMovement.transaction),
                 joinedload(FundMovement.recorded_by)
             )\
-            .filter(FundMovement.uuid == movement_uuid)\
+            .filter(FundMovement.uuid == str(movement_uuid))\
             .first()
 
     def get_movements(
@@ -117,7 +117,9 @@ class FundRepository:
         movement_type: Optional[FundMovementType] = None,
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None,
-    ) -> List[FundMovement]:
+        skip: int = 0,
+        limit: int = 50,
+    ):
         query = self.db.query(FundMovement)\
             .options(
                 joinedload(FundMovement.user),
@@ -136,7 +138,9 @@ class FundRepository:
         if date_to:
             query = query.filter(FundMovement.movement_date <= date_to)
 
-        return query.order_by(FundMovement.movement_date.desc()).all()
+        total = query.count()
+        movements = query.order_by(FundMovement.movement_date.desc()).offset(skip).limit(limit).all()
+        return movements, total
 
     def delete_movement(self, movement_id: int) -> bool:
         movement = self.db.query(FundMovement).filter(FundMovement.id == movement_id).first()
@@ -239,19 +243,35 @@ class FundRepository:
         total_outflow_usdt = float(outflow_result.total_usdt)
         total_position_usdt = total_deposited_usdt - total_outflow_usdt
 
-        # Ganancia acumulada: suma de profit_amount_usdt de splits de miembros del grupo
-        # en transacciones COMPLETED
+        # Ganancia acumulada: splits de miembros MENOS splits de agentes externos
+        # en las mismas transacciones COMPLETED.
+        # Replica la columna "Acumulada" del Excel:
+        #   ganancia_neta = sum(member_splits) - sum(non_member_agent_splits)
+        # Subquery: IDs de transacciones donde al menos un miembro del grupo tiene split
+        member_tx_subq = (
+            self.db.query(TransactionProfitSplit.transaction_id)
+            .filter(TransactionProfitSplit.user_id.in_(member_user_ids))
+        )
         profit_result = self.db.query(
-            func.coalesce(func.sum(TransactionProfitSplit.profit_amount_usdt), 0).label("total")
+            func.coalesce(
+                func.sum(
+                    sa_case(
+                        (TransactionProfitSplit.user_id.in_(member_user_ids),
+                         TransactionProfitSplit.profit_amount_usdt),
+                        else_=-TransactionProfitSplit.profit_amount_usdt,
+                    )
+                ),
+                0,
+            ).label("total")
         ).join(Transaction, TransactionProfitSplit.transaction_id == Transaction.id)\
          .filter(
-             TransactionProfitSplit.user_id.in_(member_user_ids),
              Transaction.status == TransactionStatus.COMPLETED,
-             TransactionProfitSplit.profit_amount_usdt.isnot(None)
+             TransactionProfitSplit.profit_amount_usdt.isnot(None),
+             TransactionProfitSplit.transaction_id.in_(member_tx_subq),
          ).first()
 
         total_profit_usdt = float(profit_result.total)
-        available_funds_usdt = total_profit_usdt - total_position_usdt
+        available_funds_usdt = total_profit_usdt + total_position_usdt
 
         # Posición individual de cada miembro
         by_member = []

@@ -43,13 +43,13 @@ class FundGroupResponse(BaseModel):
 
 # ===== Fund Movement Schemas =====
 
-VALID_MOVEMENT_TYPES = {"deposit", "exchange", "personal", "adjustment"}
+VALID_MOVEMENT_TYPES = {"DEPOSIT", "EXCHANGE", "PERSONAL", "ADJUSTMENT"}
 
 
 class FundMovementCreate(BaseModel):
     group_uuid: UUID
     user_uuid: UUID
-    movement_type: str = Field(..., description="deposit | exchange | personal | adjustment")
+    movement_type: str = Field(..., description="DEPOSIT | EXCHANGE | PERSONAL | ADJUSTMENT")
     amount: float = Field(..., gt=0, description="Monto positivo del movimiento")
     currency: str = Field(..., min_length=1, max_length=10)
     amount_usdt: Optional[float] = None
@@ -61,9 +61,10 @@ class FundMovementCreate(BaseModel):
 
     @validator("movement_type")
     def validate_movement_type(cls, v):
-        if v not in VALID_MOVEMENT_TYPES:
+        v_upper = v.upper()
+        if v_upper not in VALID_MOVEMENT_TYPES:
             raise ValueError(f"movement_type must be one of: {', '.join(VALID_MOVEMENT_TYPES)}")
-        return v
+        return v_upper
 
 
 class FundMovementResponse(BaseModel):
@@ -121,5 +122,13 @@ class FundGroupBalanceResponse(BaseModel):
     total_outflow_usdt: float
     total_position_usdt: float       # deposited - outflow → "Total" Excel
     total_profit_usdt: float         # suma profit splits de miembros COMPLETED → "Acumulada"
-    available_funds_usdt: float      # profit - position → "Fondos" Excel
+    available_funds_usdt: float      # profit + position → "Fondos" Excel
     by_member: List[UserPositionResponse] = []
+
+
+class FundMovementList(BaseModel):
+    movements: List[FundMovementResponse]
+    total: int
+    page: int
+    per_page: int
+    total_pages: int

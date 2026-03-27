@@ -99,6 +99,19 @@ class ExchangeRateRepository:
             )
         ).order_by(desc(ExchangeRate.created_at)).limit(limit).all()
 
+    def get_rate_at_datetime(self, currency_pair_id: int, at: datetime) -> Optional[ExchangeRate]:
+        """Obtener la tasa que estaba activa en un momento específico.
+
+        Es el registro con el created_at más reciente que sea <= at.
+        """
+        return self.db.query(ExchangeRate)\
+            .filter(
+                ExchangeRate.currency_pair_id == currency_pair_id,
+                ExchangeRate.created_at <= at
+            )\
+            .order_by(desc(ExchangeRate.created_at))\
+            .first()
+
     def set_manual_rate(self, from_currency: str, to_currency: str, manual_rate: float) -> Optional[ExchangeRate]:
         """Establecer una tasa manual para un par de monedas"""
         try:

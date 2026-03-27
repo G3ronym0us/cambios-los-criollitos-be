@@ -17,13 +17,12 @@ class Transaction(UUIDMixin, Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # Usuario que registró la transacción
+    currency_pair_id = Column(Integer, ForeignKey("currency_pairs.id"), nullable=False, index=True)
 
     # Información de la transacción
-    from_currency = Column(String(10), nullable=False)
-    to_currency = Column(String(10), nullable=False)
     from_amount = Column(Float, nullable=False)  # Monto enviado
-    to_amount = Column(Float, nullable=False)    # Monto recibido
-    exchange_rate = Column(Float, nullable=False)
+    to_amount = Column(Float, nullable=True)     # Monto recibido (opcional en registros históricos)
+    exchange_rate = Column(Float, nullable=True)
 
     # Descripción y tipo
     description = Column(Text, nullable=True)
@@ -42,7 +41,16 @@ class Transaction(UUIDMixin, Base):
 
     # Relaciones
     user = relationship("User", back_populates="transactions")
+    currency_pair = relationship("CurrencyPair", lazy="joined")
     profit_splits = relationship("TransactionProfitSplit", back_populates="transaction", cascade="all, delete-orphan")
+
+    @property
+    def from_currency(self):
+        return self.currency_pair.from_currency.symbol if self.currency_pair else None
+
+    @property
+    def to_currency(self):
+        return self.currency_pair.to_currency.symbol if self.currency_pair else None
 
     def __repr__(self):
         return f"<Transaction(id={self.id}, {self.from_amount} {self.from_currency} -> {self.to_amount} {self.to_currency}, profit={self.profit_amount})>"

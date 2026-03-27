@@ -45,6 +45,17 @@ class ExchangeRate(UUIDMixin, Base):
         self.is_manual = False
         self.manual_rate = None
 
+    @property
+    def base_rate(self) -> float:
+        """Tasa cruda antes de aplicar el porcentaje de margen."""
+        adjusted = self.automatic_rate if self.is_manual and self.automatic_rate else self.rate
+        if self.percentage is None:
+            return adjusted
+        pct = self.percentage / 100
+        if self.inverse_percentage:
+            return adjusted * (1 - pct)
+        return adjusted / (1 - pct)
+
     def update_automatic_rate(self, new_rate):
         """Actualiza la tasa automática manteniendo la manual si está activa"""
         if self.is_manual:

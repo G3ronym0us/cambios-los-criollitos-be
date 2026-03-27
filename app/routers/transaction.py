@@ -23,31 +23,15 @@ router = APIRouter(prefix="/transactions", tags=["Transactions"])
 
 def enrich_transaction_response(transaction, db: Session) -> dict:
     """
-    Enriquecer una transacción con currency_pair_uuid y pair_symbol
+    Enriquecer una transacción con currency_pair_uuid, pair_symbol y símbolos de moneda del par.
     """
-    from app.models.currency_pair import CurrencyPair
-    from app.models.currency import Currency
-    from sqlalchemy.orm import aliased
-
-    # Crear aliases para evitar conflicto de nombres en JOINs
-    FromCurrency = aliased(Currency)
-    ToCurrency = aliased(Currency)
-
-    # Buscar el currency_pair correspondiente
-    currency_pair = db.query(CurrencyPair).join(
-        FromCurrency, CurrencyPair.from_currency_id == FromCurrency.id
-    ).join(
-        ToCurrency, CurrencyPair.to_currency_id == ToCurrency.id
-    ).filter(
-        FromCurrency.symbol == transaction.from_currency,
-        ToCurrency.symbol == transaction.to_currency
-    ).first()
-
+    cp = transaction.currency_pair
     response_data = transaction.dict()
-    response_data['currency_pair_uuid'] = currency_pair.uuid if currency_pair else None
-    response_data['pair_symbol'] = currency_pair.pair_symbol if currency_pair else f"{transaction.from_currency}/{transaction.to_currency}"
+    response_data['currency_pair_uuid'] = cp.uuid if cp else None
+    response_data['pair_symbol'] = cp.pair_symbol if cp else None
+    response_data['from_currency'] = cp.from_currency.symbol if cp else None
+    response_data['to_currency'] = cp.to_currency.symbol if cp else None
     response_data['profit_splits'] = [split.dict() for split in transaction.profit_splits]
-
     return response_data
 
 
@@ -117,8 +101,7 @@ async def create_transaction(
     # Verificar transacciones similares (solo si no es force=True)
     if not transaction_data.force:
         similar_transactions = transaction_repo.find_similar_transactions(
-            from_currency=currency_pair.from_currency.symbol,
-            to_currency=currency_pair.to_currency.symbol,
+            currency_pair_id=currency_pair.id,
             from_amount=transaction_data.from_amount
         )
 
@@ -133,7 +116,7 @@ async def create_transaction(
             warning_message = (
                 f"Se encontró una transacción similar del mismo día. "
                 f"Par: {currency_pair.pair_symbol}, "
-                f"Monto: {similar.from_amount} {similar.from_currency}, "
+                f"Monto: {similar.from_amount} {currency_pair.from_currency.symbol}, "
                 f"Hora: {similar.created_at.strftime('%H:%M:%S')}. "
                 f"Si desea continuar, envíe la solicitud con 'force': true."
             )
@@ -151,6 +134,7 @@ async def create_transaction(
             )
 
     # Si se usa configuración predefinida, cargar splits
+    config = None
     if transaction_data.commission_config_uuid:
         config = config_repo.get_by_uuid(transaction_data.commission_config_uuid)
         if not config:
@@ -181,23 +165,52 @@ async def create_transaction(
                     detail=f"User with UUID {split.user_uuid} not found"
                 )
 
-    # Crear transacción con from_currency y to_currency del par
     transaction = transaction_repo.create_transaction(
         transaction_data,
         created_by_user_id=current_user.id,
-        from_currency=currency_pair.from_currency.symbol,
-        to_currency=currency_pair.to_currency.symbol
+        currency_pair_id=currency_pair.id
     )
 
-    # Preparar respuesta enriquecida
-    response_data = transaction.dict()
-    response_data['currency_pair_uuid'] = currency_pair.uuid
-    response_data['pair_symbol'] = currency_pair.pair_symbol
-    response_data['from_currency'] = currency_pair.from_currency.symbol
-    response_data['to_currency'] = currency_pair.to_currency.symbol
-    response_data['profit_splits'] = [split.dict() for split in transaction.profit_splits]
+    # Crear FundMovement automático si aplica
+    if not transaction_data.skip_fund:
+        from app.repositories.fund_repository import FundRepository
+        from app.models.fund import FundMovementType
+        from datetime import datetime
 
-    return TransactionResponse(**response_data)
+        fund_repo = FundRepository(db)
+        effective_fund_group = None
+
+        if transaction_data.fund_group_uuid:
+            # Override explícito en el request
+            effective_fund_group = fund_repo.get_group_by_uuid(transaction_data.fund_group_uuid)
+            if not effective_fund_group:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Fund group with UUID {transaction_data.fund_group_uuid} not found"
+                )
+        elif config is not None and config.fund_group_id:
+            # Fondo configurado por defecto en la commission config
+            effective_fund_group = config.fund_group
+
+        if effective_fund_group:
+            amount_usdt = None
+            if transaction_data.usdt_rate:
+                amount_usdt = transaction.from_amount / transaction_data.usdt_rate
+
+            fund_repo.create_movement(
+                group_id=effective_fund_group.id,
+                user_id=current_user.id,
+                movement_type=FundMovementType.EXCHANGE,
+                amount=transaction.from_amount,
+                currency=currency_pair.from_currency.symbol,
+                movement_date=datetime.utcnow(),
+                amount_usdt=amount_usdt,
+                usdt_rate=transaction_data.usdt_rate,
+                transaction_id=transaction.id,
+                recorded_by_user_id=current_user.id,
+            )
+
+    return TransactionResponse(**enrich_transaction_response(transaction, db))
 
 
 @router.get("", response_model=TransactionList)
@@ -205,8 +218,7 @@ async def get_transactions(
     page: int = Query(1, ge=1, description="Número de página"),
     per_page: int = Query(20, ge=1, le=100, description="Transacciones por página"),
     status_filter: Optional[str] = Query(None, description="Filtrar por status: pending, completed, cancelled, failed"),
-    from_currency: Optional[str] = Query(None, description="Filtrar por moneda origen"),
-    to_currency: Optional[str] = Query(None, description="Filtrar por moneda destino"),
+    currency_pair_uuid: Optional[UUID] = Query(None, description="Filtrar por par de monedas (UUID)"),
     user_id: Optional[int] = Query(None, description="Filtrar por usuario"),
     start_date: Optional[datetime] = Query(None, description="Fecha inicio (ISO format)"),
     end_date: Optional[datetime] = Query(None, description="Fecha fin (ISO format)"),
@@ -227,17 +239,21 @@ async def get_transactions(
                 detail=f"Invalid status: {status_filter}. Valid options: pending, completed, cancelled, failed"
             )
 
-    # Construir tuple para currency_pair si ambos están presentes
-    currency_pair = None
-    if from_currency and to_currency:
-        currency_pair = (from_currency.upper(), to_currency.upper())
+    # Resolver currency_pair_uuid a currency_pair_id
+    cp_id = None
+    if currency_pair_uuid:
+        from app.repositories.currency_pair_repository import CurrencyPairRepository
+        pair = CurrencyPairRepository(db).get_by_uuid(currency_pair_uuid)
+        if not pair:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Currency pair not found")
+        cp_id = pair.id
 
     skip = (page - 1) * per_page
     transactions, total = transaction_repo.get_all_transactions(
         skip=skip,
         limit=per_page,
         status=status_enum,
-        currency_pair=currency_pair,
+        currency_pair_id=cp_id,
         user_id=user_id,
         start_date=start_date,
         end_date=end_date
@@ -313,9 +329,8 @@ async def update_transaction(
             detail=f"Transaction with UUID {transaction_uuid} not found"
         )
 
-    # Si se actualiza currency_pair_uuid, resolver las monedas
-    from_currency = None
-    to_currency = None
+    # Si se actualiza currency_pair_uuid, resolver el par
+    new_currency_pair_id = None
     if transaction_data.currency_pair_uuid:
         from app.repositories.currency_pair_repository import CurrencyPairRepository
         pair_repo = CurrencyPairRepository(db)
@@ -325,14 +340,12 @@ async def update_transaction(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Currency pair with UUID {transaction_data.currency_pair_uuid} not found"
             )
-        from_currency = currency_pair.from_currency.symbol
-        to_currency = currency_pair.to_currency.symbol
+        new_currency_pair_id = currency_pair.id
 
     updated_transaction = transaction_repo.update_transaction(
         transaction.id,
         transaction_data,
-        from_currency=from_currency,
-        to_currency=to_currency
+        currency_pair_id=new_currency_pair_id
     )
     if not updated_transaction:
         raise HTTPException(
@@ -374,6 +387,8 @@ async def get_user_profit_report(
     user_uuid: UUID,
     start_date: Optional[datetime] = Query(None, description="Fecha inicio para el reporte"),
     end_date: Optional[datetime] = Query(None, description="Fecha fin para el reporte"),
+    page: int = Query(1, ge=1, description="Número de página"),
+    per_page: int = Query(50, ge=1, le=200, description="Transacciones por página"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -404,20 +419,30 @@ async def get_user_profit_report(
         )
 
     transaction_repo = TransactionRepository(db)
+    skip = (page - 1) * per_page
     report_data = transaction_repo.get_user_profit_report(
         user_id=user.id,
         start_date=start_date,
-        end_date=end_date
+        end_date=end_date,
+        skip=skip,
+        limit=per_page
     )
+
+    total_count = report_data["transaction_count"]
+    import math
+    total_pages = math.ceil(total_count / per_page) if total_count > 0 else 0
 
     return UserProfitReport(
         user_uuid=user_uuid,
         username=user.username,
         email=user.email,
         total_profit=report_data["total_profit"],
-        transaction_count=report_data["transaction_count"],
+        transaction_count=total_count,
         transactions=[TransactionResponse(**enrich_transaction_response(t, db))
-                     for t in report_data["transactions"]]
+                     for t in report_data["transactions"]],
+        page=page,
+        per_page=per_page,
+        total_pages=total_pages
     )
 
 

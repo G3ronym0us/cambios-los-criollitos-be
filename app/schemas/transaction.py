@@ -34,21 +34,27 @@ class TransactionBase(BaseModel):
     """Schema base para transacciones"""
     currency_pair_uuid: UUID
     from_amount: float
-    to_amount: float
-    exchange_rate: float
+    to_amount: Optional[float] = None
+    exchange_rate: Optional[float] = None
     description: Optional[str] = None
     transaction_type: str = "conversion"
     total_profit_percentage: float = 0.0
 
-    @validator('from_amount', 'to_amount')
-    def validate_amount(cls, v):
+    @validator('from_amount')
+    def validate_from_amount(cls, v):
         if v <= 0:
+            raise ValueError('Amount must be greater than 0')
+        return v
+
+    @validator('to_amount')
+    def validate_to_amount(cls, v):
+        if v is not None and v <= 0:
             raise ValueError('Amount must be greater than 0')
         return v
 
     @validator('exchange_rate')
     def validate_exchange_rate(cls, v):
-        if v <= 0:
+        if v is not None and v <= 0:
             raise ValueError('Exchange rate must be greater than 0')
         return v
 
@@ -69,6 +75,8 @@ class TransactionCreate(TransactionBase):
     profit_splits: Optional[List[ProfitSplitCreate]] = Field(None, description="Splits manuales (alternativa a config_uuid)")
     force: bool = Field(False, description="Forzar creación ignorando advertencias de duplicados")
     usdt_rate: Optional[float] = None  # Tasa USDT/moneda_origen al momento de la transacción
+    fund_group_uuid: Optional[UUID] = Field(None, description="UUID del fondo al que aplica esta transacción. Overridea el fondo de la config si se especifica. Para splits manuales, permite vincular al fondo")
+    skip_fund: bool = Field(False, description="Si True, no crea movimiento de fondo aunque la config tenga uno configurado")
 
     @validator('profit_splits')
     def validate_profit_splits(cls, v, values):
@@ -122,13 +130,13 @@ class TransactionUpdate(BaseModel):
 class TransactionResponse(BaseModel):
     """Schema de respuesta para transacción"""
     uuid: UUID
-    currency_pair_uuid: UUID
+    currency_pair_uuid: Optional[UUID] = None
     pair_symbol: Optional[str] = None  # Incluido para facilidad (ej: "USDT/VES")
-    from_currency: str  # Incluido para compatibilidad
-    to_currency: str    # Incluido para compatibilidad
+    from_currency: Optional[str] = None
+    to_currency: Optional[str] = None
     from_amount: float
-    to_amount: float
-    exchange_rate: float
+    to_amount: Optional[float] = None
+    exchange_rate: Optional[float] = None
     description: Optional[str] = None
     transaction_type: str = "conversion"
     total_profit_percentage: float = 0.0
@@ -169,6 +177,9 @@ class UserProfitReport(BaseModel):
     total_profit: float
     transaction_count: int
     transactions: List[TransactionResponse] = []
+    page: int = 1
+    per_page: int = 50
+    total_pages: int = 0
 
 class ProfitSummary(BaseModel):
     """Resumen general de ganancias"""

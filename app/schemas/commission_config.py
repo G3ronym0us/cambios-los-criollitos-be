@@ -37,6 +37,7 @@ class CommissionConfigBase(BaseModel):
     name: str = Field(..., min_length=1, max_length=100, description="Nombre de la configuración")
     description: Optional[str] = Field(None, description="Descripción opcional")
     total_percentage: float = Field(..., ge=0, le=100, description="Porcentaje total de ganancia")
+    fund_group_uuid: Optional[UUID] = Field(None, description="UUID del fondo asociado (opcional). Al crear transacciones con esta config se generará un FundMovement EXCHANGE automáticamente")
 
 
 class CommissionConfigCreate(CommissionConfigBase):
@@ -65,6 +66,7 @@ class CommissionConfigUpdate(BaseModel):
     total_percentage: Optional[float] = Field(None, ge=0, le=100)
     is_active: Optional[bool] = None
     splits: Optional[List[ConfigSplitCreate]] = None
+    fund_group_uuid: Optional[UUID] = Field(None, description="UUID del fondo asociado. Pasar null para desvincular")
 
     @validator('splits')
     def validate_splits_sum(cls, v, values):
@@ -84,6 +86,7 @@ class CommissionConfigResponse(CommissionConfigBase):
     """Schema de respuesta para configuración de comisiones"""
     uuid: UUID
     pair_symbol: Optional[str] = None  # Incluido para compatibilidad
+    fund_group_name: Optional[str] = None
     is_active: bool
     created_at: datetime
     updated_at: Optional[datetime] = None

@@ -39,9 +39,21 @@ class CommissionConfigRepository:
         if not currency_pair:
             raise ValueError(f"Currency pair with UUID {config_data.currency_pair_uuid} not found")
 
+        # Resolver fund_group_id si se proporciona
+        fund_group_id = None
+        if config_data.fund_group_uuid:
+            from app.models.fund import FundGroup
+            fund_group = self.db.query(FundGroup).filter(
+                FundGroup.uuid == str(config_data.fund_group_uuid)
+            ).first()
+            if not fund_group:
+                raise ValueError(f"Fund group with UUID {config_data.fund_group_uuid} not found")
+            fund_group_id = fund_group.id
+
         # Crear configuración
         db_config = CommissionConfiguration(
             currency_pair_id=currency_pair.id,
+            fund_group_id=fund_group_id,
             name=config_data.name,
             description=config_data.description,
             total_percentage=config_data.total_percentage,
@@ -189,7 +201,20 @@ class CommissionConfigRepository:
         if not config:
             return None
 
-        update_data = config_data.dict(exclude_unset=True, exclude={'splits'})
+        update_data = config_data.dict(exclude_unset=True, exclude={'splits', 'fund_group_uuid'})
+
+        # Resolver fund_group_uuid → fund_group_id si se proporciona
+        if 'fund_group_uuid' in config_data.dict(exclude_unset=True):
+            if config_data.fund_group_uuid is None:
+                update_data['fund_group_id'] = None
+            else:
+                from app.models.fund import FundGroup
+                fund_group = self.db.query(FundGroup).filter(
+                    FundGroup.uuid == str(config_data.fund_group_uuid)
+                ).first()
+                if not fund_group:
+                    raise ValueError(f"Fund group with UUID {config_data.fund_group_uuid} not found")
+                update_data['fund_group_id'] = fund_group.id
 
         # Actualizar campos básicos
         for field, value in update_data.items():

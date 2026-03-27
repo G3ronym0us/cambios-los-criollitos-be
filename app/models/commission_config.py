@@ -20,6 +20,10 @@ class CommissionConfiguration(UUIDMixin, Base):
     # Par de divisas (foreign key a currency_pairs)
     currency_pair_id = Column(Integer, ForeignKey("currency_pairs.id"), nullable=False, index=True)
 
+    # Fondo asociado (opcional): al usar esta config al crear una transacción
+    # se crea automáticamente un FundMovement EXCHANGE en este grupo
+    fund_group_id = Column(Integer, ForeignKey("fund_groups.id"), nullable=True, index=True)
+
     # Nombre descriptivo de la configuración
     name = Column(String(100), nullable=False)
     description = Column(Text, nullable=True)
@@ -37,6 +41,7 @@ class CommissionConfiguration(UUIDMixin, Base):
 
     # Relaciones
     currency_pair = relationship("CurrencyPair", foreign_keys=[currency_pair_id])
+    fund_group = relationship("FundGroup", foreign_keys=[fund_group_id])
     splits = relationship("CommissionConfigurationSplit", back_populates="configuration", cascade="all, delete-orphan")
     created_by = relationship("User", foreign_keys=[created_by_user_id])
 
@@ -49,6 +54,8 @@ class CommissionConfiguration(UUIDMixin, Base):
             "uuid": self.uuid,
             "currency_pair_uuid": self.currency_pair.uuid if self.currency_pair else None,
             "pair_symbol": self.currency_pair.pair_symbol if self.currency_pair else None,
+            "fund_group_uuid": self.fund_group.uuid if self.fund_group else None,
+            "fund_group_name": self.fund_group.name if self.fund_group else None,
             "name": self.name,
             "description": self.description,
             "total_percentage": self.total_percentage,

@@ -118,7 +118,7 @@ class FundMovement(UUIDMixin, Base):
     usdt_rate = Column(Float, nullable=True)        # Tasa usada para la conversión
 
     # Vínculo opcional con una transacción (para movimientos tipo EXCHANGE)
-    transaction_id = Column(Integer, ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True)
+    transaction_id = Column(Integer, ForeignKey("transactions.id", ondelete="CASCADE"), nullable=True)
 
     reference = Column(String(200), nullable=True)  # Hash Binance/Kraken, ID externo, etc.
     notes = Column(Text, nullable=True)

@@ -56,7 +56,8 @@ class TransactionRepository:
             transaction_type=transaction_data.transaction_type,
             total_profit_percentage=transaction_data.total_profit_percentage,
             profit_amount=profit_amount,
-            status=TransactionStatus.PENDING
+            status=TransactionStatus.COMPLETED,
+            completed_at=datetime.utcnow()
         )
 
         self.db.add(db_transaction)

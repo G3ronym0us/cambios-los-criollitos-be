@@ -80,21 +80,24 @@ async def get_currency_pairs(
     limit: int = Query(100, ge=1, le=1000),
     active_only: bool = Query(False),
     monitored_only: bool = Query(False),
+    currency: Optional[str] = Query(None, description="Filter by currency symbol (e.g. VES, USDT). Returns pairs where the currency appears on either side"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_moderator_user)
 ):
     """Get all currency pairs with pagination and filters (MODERATOR+ access)"""
     pair_repo = CurrencyPairRepository(db)
-    
+
     if monitored_only:
         pairs = pair_repo.get_monitored_pairs()
+        if currency:
+            symbol = currency.upper()
+            pairs = [p for p in pairs if p.from_currency.symbol == symbol or p.to_currency.symbol == symbol]
         total = len(pairs)
         pairs = pairs[skip:skip + limit]
     else:
-        pairs = pair_repo.get_all_pairs(skip, limit, active_only)
-        # For total count, we'd need another query or estimate
+        pairs = pair_repo.get_all_pairs(skip, limit, active_only, currency_symbol=currency)
         total = len(pairs) + skip if len(pairs) == limit else skip + len(pairs)
-    
+
     return CurrencyPairList(
         pairs=[CurrencyPairResponse(**pair.dict()) for pair in pairs],
         total=total,

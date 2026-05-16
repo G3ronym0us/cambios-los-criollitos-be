@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Git Conventions
+
+- **Commit messages must always be in English.**
+
 ## Application Overview
 
 This is a **FastAPI currency exchange rate tracking system** that scrapes P2P exchange rates from Binance for Latin American currencies (VES, COP, BRL) and provides real-time conversion services. The backend includes user authentication with role-based permissions, background scraping tasks, commission configuration, and transaction tracking.

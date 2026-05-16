@@ -1,0 +1,87 @@
+version: '3.8'
+
+services:
+  backend:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8001:8000"
+    env_file:
+      - .env.dev
+    environment:
+      - PYTHONPATH=/app
+      - DATABASE_URL=postgresql://tasas_user:tasas_password@db:5432/tasas_db_dev
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - .:/app
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+    networks:
+      - tasas_dev_network
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: tasas_db_dev
+      POSTGRES_USER: tasas_user
+      POSTGRES_PASSWORD: tasas_password
+    volumes:
+      - postgres_data_dev:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    restart: unless-stopped
+    networks:
+      - tasas_dev_network
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6381:6379"
+    restart: unless-stopped
+    networks:
+      - tasas_dev_network
+
+  celery_worker:
+    build: .
+    command: celery -A app.tasks.scraping_tasks.celery_app worker --loglevel=info
+    env_file:
+      - .env.dev
+    environment:
+      - PYTHONPATH=/app
+      - DATABASE_URL=postgresql://tasas_user:tasas_password@db:5432/tasas_db_dev
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - .:/app
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+    networks:
+      - tasas_dev_network
+
+  celery_beat:
+    build: .
+    command: celery -A app.tasks.scraping_tasks.celery_app beat --loglevel=info
+    env_file:
+      - .env.dev
+    environment:
+      - PYTHONPATH=/app
+      - DATABASE_URL=postgresql://tasas_user:tasas_password@db:5432/tasas_db_dev
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - .:/app
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+    networks:
+      - tasas_dev_network
+
+volumes:
+  postgres_data_dev:
+
+networks:
+  tasas_dev_network:
+    driver: bridge

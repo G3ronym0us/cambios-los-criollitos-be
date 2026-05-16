@@ -1,0 +1,55 @@
+name: Deploy Dev Branch
+
+on:
+  push:
+    branches: [dev]
+
+jobs:
+  deploy:
+    name: Deploy Dev to EC2
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          script: |
+            set -e
+
+            # Install docker compose v2 plugin if not present
+            if ! docker compose version &>/dev/null 2>&1; then
+              mkdir -p ~/.docker/cli-plugins
+              curl -SL https://github.com/docker/compose/releases/download/v2.24.5/docker-compose-linux-x86_64 \
+                -o ~/.docker/cli-plugins/docker-compose
+              chmod +x ~/.docker/cli-plugins/docker-compose
+            fi
+
+            cd ${{ secrets.DEPLOY_DEV_PATH }}
+
+            echo "--- Pulling latest dev code ---"
+            git checkout -- .
+            git pull origin dev
+
+            echo "--- Cleaning unused Docker resources ---"
+            docker system prune -f
+
+            echo "--- Building and restarting dev containers ---"
+            docker compose -f docker-compose.dev.yml -p tasas-dev build
+            docker compose -f docker-compose.dev.yml -p tasas-dev up -d
+
+            echo "--- Waiting for services to be ready ---"
+            sleep 8
+
+            echo "--- Running database migrations ---"
+            docker compose -f docker-compose.dev.yml -p tasas-dev exec -T backend alembic upgrade head
+
+            echo "--- Health check ---"
+            curl -sf http://localhost:8001/api/health \
+              && echo "Dev health check passed" \
+              || echo "WARNING: Dev health check returned non-200"
+
+            echo "--- Dev deploy complete. Commit: $(git rev-parse --short HEAD) ---"

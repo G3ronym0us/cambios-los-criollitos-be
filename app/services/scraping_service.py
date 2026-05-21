@@ -3,6 +3,7 @@ from typing import List
 from sqlalchemy.orm import Session
 from app.services.scrapers.binance_scraper import BinanceP2PScraper
 from app.repositories.exchange_rate_repository import ExchangeRateRepository
+from app.services.alert_service import AlertService
 from app.database.connection import SessionLocal
 from app.models.exchange_rate import ExchangeRate
 
@@ -39,10 +40,14 @@ class ScrapingService:
             if all_rates:
                 # Guardar en base de datos
                 repo = ExchangeRateRepository(db)
-                success = repo.save_rates(all_rates)
-                
+                success, divergences = repo.save_rates(all_rates)
+
                 if success:
                     print(f"✅ Scraping completado: {len(all_rates)} tasas obtenidas y guardadas")
+                    if divergences:
+                        print(f"⚠️ {len(divergences)} divergencia(s) detectada(s) entre tasas manuales y Binance")
+                        alert_svc = AlertService(db)
+                        await alert_svc.process_divergences(divergences)
                     return True
                 else:
                     print("❌ Error guardando tasas en base de datos")

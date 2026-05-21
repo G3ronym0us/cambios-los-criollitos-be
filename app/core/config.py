@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     ROOT_USER_NAME: str = "System Administrator"
     
     # =================
+    # ALERTAS DE DIVERGENCIA DE TASAS
+    # =================
+    RATE_DIVERGENCE_THRESHOLD: float = 1.0  # % mínimo para generar alerta
+
+    # =================
     # SCRAPING
     # =================
     SCRAPING_INTERVAL_MINUTES: int = 5

@@ -14,7 +14,7 @@ from app.models.currency import CurrencyType
 
 router = APIRouter(prefix="/currencies", tags=["Currencies"], redirect_slashes=False)
 
-@router.post("/", response_model=CurrencyResponse, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=CurrencyResponse, status_code=status.HTTP_201_CREATED)
 async def create_currency(
     currency_data: CurrencyCreate,
     db: Session = Depends(get_db),

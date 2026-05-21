@@ -1,19 +1,27 @@
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import and_, desc
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from datetime import datetime, timedelta
 from uuid import UUID
 from app.models.exchange_rate import ExchangeRate
 from app.models.currency_pair import CurrencyPair
 from app.schemas.exchange_rate import ExchangeRateCreate, ExchangeRateUpdate
 from app.database.connection import get_db
+from app.core.config import settings
 
 class ExchangeRateRepository:
     def __init__(self, db: Session):
         self.db = db
 
-    def save_rates(self, rates: List[ExchangeRate]) -> bool:
-        """Guardar múltiples tasas de cambio"""
+    def save_rates(self, rates: List[ExchangeRate]) -> Tuple[bool, List[dict]]:
+        """Guardar múltiples tasas de cambio.
+
+        Returns:
+            (success, divergences) where divergences is a list of rate pairs
+            where the Binance automatic rate differs from the manual rate by
+            at least RATE_DIVERGENCE_THRESHOLD percent.
+        """
+        divergences: List[dict] = []
         try:
             # Desactivar tasas anteriores del mismo currency_pair que no tengan precio manual
             currency_pair_ids = set(rate.currency_pair_id for rate in rates if rate.currency_pair_id)
@@ -40,26 +48,42 @@ class ExchangeRateRepository:
                         ExchangeRate.is_active == True
                     )
                 ).first()
-                
+
                 if existing_manual:
+                    scraped_rate = rate.rate
+                    manual_rate = existing_manual.manual_rate
+
                     # Crear nuevo registro manteniendo la tasa manual
-                    rate.manual_rate = existing_manual.manual_rate
+                    rate.manual_rate = manual_rate
                     rate.is_manual = True
-                    rate.automatic_rate = rate.rate  # Guardar la tasa automática
-                    rate.rate = existing_manual.manual_rate  # Usar la tasa manual como activa
-                
+                    rate.automatic_rate = scraped_rate  # Guardar la tasa automática
+                    rate.rate = manual_rate  # Usar la tasa manual como activa
+
+                    # Detectar divergencia significativa
+                    if manual_rate and manual_rate != 0:
+                        diff_pct = abs(scraped_rate - manual_rate) / manual_rate * 100
+                        if diff_pct >= settings.RATE_DIVERGENCE_THRESHOLD:
+                            divergences.append({
+                                "currency_pair_id": rate.currency_pair_id,
+                                "from_currency": rate.from_currency,
+                                "to_currency": rate.to_currency,
+                                "manual_rate": manual_rate,
+                                "automatic_rate": scraped_rate,
+                                "diff_percentage": round(diff_pct, 4),
+                            })
+
                 rate.is_active = True
                 rate.created_at = datetime.utcnow()
                 self.db.add(rate)
 
             self.db.commit()
             print(f"✅ {len(rates)} tasas procesadas en base de datos")
-            return True
+            return True, divergences
 
         except Exception as e:
             print(f"❌ Error guardando tasas: {e}")
             self.db.rollback()
-            return False
+            return False, []
 
     def get_active_rates(self, from_currency: Optional[str] = None, to_currency: Optional[str] = None) -> List[ExchangeRate]:
         """Obtener tasas activas"""

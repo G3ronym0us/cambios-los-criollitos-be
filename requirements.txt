@@ -9,6 +9,9 @@ pydantic-settings==2.0.1
 # WebSockets
 websockets==12.0
 
+# Server-Sent Events
+sse-starlette==1.8.2
+
 # Selenium para scraping
 selenium==4.15.0
 

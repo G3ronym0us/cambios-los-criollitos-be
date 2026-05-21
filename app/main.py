@@ -6,7 +6,7 @@ from typing import List, Optional
 from datetime import datetime
 from contextlib import asynccontextmanager
 from app.services.scraper_service import BinanceP2PScraperService
-from app.routers import scraping, auth, currency, currency_pair, binance, rates, transaction, user, commission_config, fund
+from app.routers import scraping, auth, currency, currency_pair, binance, rates, transaction, user, commission_config, fund, notifications
 from app.database.connection import get_db
 
 # Modelos Pydantic
@@ -87,6 +87,7 @@ app.include_router(rates.router)
 app.include_router(transaction.router)
 app.include_router(commission_config.router)
 app.include_router(fund.router)
+app.include_router(notifications.router)
 
 # Rutas de la API
 @app.get("/")

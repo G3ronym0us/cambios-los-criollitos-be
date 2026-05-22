@@ -36,14 +36,13 @@ class CurrencyPairRepository:
         pair_symbol = CurrencyPair.create_pair_symbol(from_currency.symbol, to_currency.symbol)
 
         # Validate base_pair if provided
-        base_pair_id = None
+        base_pair = None
         if pair_data.base_pair_uuid:
             base_pair = self.get_by_uuid(pair_data.base_pair_uuid)
             if not base_pair:
                 raise ValueError("Base pair not found")
             if not (base_pair.binance_tracked or self.has_manual_rates(base_pair.id)):
                 raise ValueError("Base pair must be either Binance tracked or have manual rates")
-            base_pair_id = base_pair.id
 
         # Resolve usdt_pair_uuid to usdt_pair_id if provided
         usdt_pair_id = None
@@ -57,7 +56,7 @@ class CurrencyPairRepository:
             from_currency_id=from_currency.id,
             to_currency_id=to_currency.id,
             pair_type=pair_data.pair_type,
-            base_pair_id=base_pair_id,
+            base_pair=base_pair,
             derived_percentage=pair_data.derived_percentage,
             use_inverse_percentage=pair_data.use_inverse_percentage,
             pair_symbol=pair_symbol,

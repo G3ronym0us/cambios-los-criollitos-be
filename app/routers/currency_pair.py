@@ -29,23 +29,23 @@ async def create_currency_pair(
     currency_repo = CurrencyRepository(db)
     
     # Validate currencies exist
-    from_currency = currency_repo.get_by_id(pair_data.from_currency_id)
-    to_currency = currency_repo.get_by_id(pair_data.to_currency_id)
-    
+    from_currency = currency_repo.get_by_uuid(pair_data.from_currency_uuid)
+    to_currency = currency_repo.get_by_uuid(pair_data.to_currency_uuid)
+
     if not from_currency:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"From currency with ID {pair_data.from_currency_id} not found"
+            detail=f"From currency with UUID {pair_data.from_currency_uuid} not found"
         )
-    
+
     if not to_currency:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"To currency with ID {pair_data.to_currency_id} not found"
+            detail=f"To currency with UUID {pair_data.to_currency_uuid} not found"
         )
-    
+
     # Check if pair already exists
-    if pair_repo.pair_exists(pair_data.from_currency_id, pair_data.to_currency_id):
+    if pair_repo.pair_exists(from_currency.id, to_currency.id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Currency pair {from_currency.symbol}-{to_currency.symbol} already exists"
@@ -370,13 +370,13 @@ async def validate_binance_configuration(
     currency_repo = CurrencyRepository(db)
     
     # Validate currencies exist
-    from_currency = currency_repo.get_by_id(pair_data.from_currency_id)
-    to_currency = currency_repo.get_by_id(pair_data.to_currency_id)
-    
+    from_currency = currency_repo.get_by_uuid(pair_data.from_currency_uuid)
+    to_currency = currency_repo.get_by_uuid(pair_data.to_currency_uuid)
+
     if not from_currency or not to_currency:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid currency IDs provided"
+            detail="Invalid currency UUIDs provided"
         )
     
     # Only validate if binance_tracked is enabled

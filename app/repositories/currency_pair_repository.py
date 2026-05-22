@@ -56,6 +56,7 @@ class CurrencyPairRepository:
             from_currency_id=from_currency.id,
             to_currency_id=to_currency.id,
             pair_type=pair_data.pair_type,
+            base_pair_id=base_pair.id if base_pair else None,
             base_pair=base_pair,
             derived_percentage=pair_data.derived_percentage,
             use_inverse_percentage=pair_data.use_inverse_percentage,

@@ -5,6 +5,16 @@ from .currency import Currency
 from .currency_pair import CurrencyPair
 from .fund import FundGroup, FundGroupMember, FundMovement
 from .rate_alert import RateAlert
+from .whatsapp_client import WhatsAppClient
+from .whatsapp_operation import (
+    WhatsAppOperation,
+    WhatsAppOperationStatus,
+    WhatsAppAmountSide,
+    WhatsAppDeliveryStatus,
+)
+from .bcv_rate import BcvRate
 
 __all__ = ["User", "ExchangeRate", "Transaction", "Currency", "CurrencyPair",
-           "FundGroup", "FundGroupMember", "FundMovement", "RateAlert"]
+           "FundGroup", "FundGroupMember", "FundMovement", "RateAlert",
+           "WhatsAppClient", "WhatsAppOperation", "WhatsAppOperationStatus",
+           "WhatsAppAmountSide", "WhatsAppDeliveryStatus", "BcvRate"]

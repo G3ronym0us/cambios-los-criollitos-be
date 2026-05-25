@@ -22,7 +22,7 @@ async def manual_scraping(background_tasks: BackgroundTasks, db: Session = Depen
 @router.get("/scrape/status/{task_id}")
 async def get_scraping_status(task_id: str):
     """Obtener estado de una tarea de scraping"""
-    from app.tasks.scraping_tasks import celery_app
+    from app.celery_app import celery_app
     task = celery_app.AsyncResult(task_id)
     
     return {

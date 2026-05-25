@@ -1,24 +1,7 @@
 import asyncio
-from celery import Celery
+from app.celery_app import celery_app
 from app.services.scraping_service import ScrapingService
-from app.core.config import settings
 
-# Configurar Celery
-celery_app = Celery(
-    "scraping_tasks",
-    broker=settings.celery_broker_url_computed,
-    backend=settings.celery_result_backend_computed
-)
-
-# Configurar tareas periódicas
-celery_app.conf.beat_schedule = {
-    'scrape-rates-every-1-hour': {
-        'task': 'app.tasks.scraping_tasks.scrape_exchange_rates',
-        'schedule': 3600.0,  # 1 hora en segundos
-    },
-}
-
-celery_app.conf.timezone = 'UTC'
 
 @celery_app.task
 def scrape_exchange_rates():

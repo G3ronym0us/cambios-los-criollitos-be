@@ -109,6 +109,12 @@ class Settings(BaseSettings):
     CACHE_ENABLED: bool = True
 
     # =================
+    # BOT DE WHATSAPP (Service account)
+    # =================
+    BOT_API_KEY: Optional[str] = None              # Token compartido bot ↔ backend
+    BOT_SERVICE_USER_EMAIL: Optional[str] = None   # User existente que el bot "encarna"
+
+    # =================
     # COOKIE
     # =================
     COOKIE_NAME: str = "access_token"

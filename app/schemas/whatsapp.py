@@ -65,6 +65,16 @@ class WhatsAppOperationCancel(BaseModel):
     reason: Optional[str] = None
 
 
+class WhatsAppOperationNotes(BaseModel):
+    """Adjuntar/actualizar las notas (datos de pago) de una op activa.
+
+    Espejo de `updateOperationStatus(id, 'QUOTED'|'PENDING', { notes })` del bot:
+    reemplaza `notes` y, si `set_pending`, transiciona QUOTED→PENDING.
+    """
+    notes: str = Field(..., min_length=1)
+    set_pending: bool = False
+
+
 class WhatsAppOperationComplete(BaseModel):
     notes: Optional[str] = None
     # Si la op es venta de USD efectivo y el operador aún no recibió los billetes,
@@ -112,6 +122,121 @@ class WhatsAppOperationResponse(BaseModel):
 class WhatsAppOperationList(BaseModel):
     operations: List[WhatsAppOperationResponse]
     total: int
+
+
+class WhatsAppStatsResponse(BaseModel):
+    pending: int
+    completed: int
+    quoted: int
+    cancelled: int
+    completed_today: int
+
+
+# ===== Payments (comprobantes OCR) =====
+
+class WhatsAppPaymentCreate(BaseModel):
+    """Crear un pago (incoming u outgoing). Espejo de save*Payment del bot."""
+    client_phone: str = Field(..., min_length=3, max_length=64)
+    raw_text: Optional[str] = None
+    operation_uuid: Optional[UUID] = None
+    provider: Optional[str] = None
+    amount: Optional[float] = None
+    currency: Optional[str] = None
+    bank_from: Optional[str] = None
+    bank_to: Optional[str] = None
+    account_number: Optional[str] = None
+    identification: Optional[str] = None
+    phone_to: Optional[str] = None
+    reference: Optional[str] = None
+    # Solo outgoing: cadena de reenvío (Zelle entrante reenviado al grupo).
+    source_payment_id: Optional[int] = None
+
+
+class WhatsAppPaymentUpdate(BaseModel):
+    """Editar campos de un pago (correction tracking). Todos opcionales."""
+    provider: Optional[str] = None
+    amount: Optional[float] = None
+    currency: Optional[str] = None
+    bank_from: Optional[str] = None
+    bank_to: Optional[str] = None
+    identification: Optional[str] = None
+    phone_to: Optional[str] = None
+    reference: Optional[str] = None
+
+
+class WhatsAppPaymentLink(BaseModel):
+    operation_uuid: Optional[UUID] = None
+
+
+class WhatsAppPersonalExpense(BaseModel):
+    is_personal_expense: bool
+    personal_description: Optional[str] = None
+
+
+class WhatsAppIrrelevant(BaseModel):
+    is_irrelevant: bool
+
+
+class WhatsAppCreateOpFromPayment(BaseModel):
+    from_currency: str = Field(..., min_length=2, max_length=10)
+    to_currency: str = Field(..., min_length=2, max_length=10)
+    from_amount: float = Field(..., gt=0)
+    to_amount: float = Field(..., gt=0)
+
+    @validator('from_currency', 'to_currency')
+    def upper_currency(cls, v: str) -> str:
+        return v.upper()
+
+
+class WhatsAppIncomingPaymentResponse(BaseModel):
+    id: int
+    uuid: UUID
+    client_phone: str
+    client_name: Optional[str] = None
+    provider: Optional[str] = None
+    amount: Optional[float] = None
+    currency: Optional[str] = None
+    bank_from: Optional[str] = None
+    bank_to: Optional[str] = None
+    account_number: Optional[str] = None
+    identification: Optional[str] = None
+    phone_to: Optional[str] = None
+    reference: Optional[str] = None
+    raw_text: Optional[str] = None
+    operation_uuid: Optional[UUID] = None
+    corrected_at: Optional[datetime] = None
+    correction_original: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class WhatsAppOutgoingPaymentResponse(WhatsAppIncomingPaymentResponse):
+    is_personal_expense: int = 0
+    personal_description: Optional[str] = None
+    is_irrelevant: int = 0
+    source_payment_id: Optional[int] = None
+
+
+class WhatsAppIncomingPaymentList(BaseModel):
+    payments: List[WhatsAppIncomingPaymentResponse]
+    total: int
+
+
+class WhatsAppOutgoingPaymentList(BaseModel):
+    payments: List[WhatsAppOutgoingPaymentResponse]
+    total: int
+
+
+class WhatsAppCorrectedPayment(BaseModel):
+    table: str  # "incoming_payments" | "outgoing_payments"
+    id: int
+    client_phone: str
+    created_at: datetime
+    corrected_at: datetime
+    original: dict
+    corrected: dict
 
 
 # ===== BCV =====

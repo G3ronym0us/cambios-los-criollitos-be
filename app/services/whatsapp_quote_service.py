@@ -230,6 +230,33 @@ class WhatsAppQuoteService:
         self.db.refresh(op)
         return op
 
+    def attach_notes(self, op_uuid: UUID, notes: str, set_pending: bool = False) -> WhatsAppOperation:
+        """Adjunta/actualiza las notas (datos de pago) de una op activa.
+
+        Reemplaza `op.notes` (igual semántica que `updateOperationStatus(..., { notes })`
+        del bot). Si `set_pending` y la op está QUOTED → la transiciona a PENDING
+        (validando expiración), seteando `approved_at`. No-op de estado si ya es PENDING.
+        """
+        op = self._get_op_or_404(op_uuid)
+        if op.status in (WhatsAppOperationStatus.COMPLETED, WhatsAppOperationStatus.CANCELLED):
+            raise QuoteServiceError(
+                "invalid_status",
+                f"No se pueden adjuntar notas a una op en {op.status.value}",
+                409,
+            )
+
+        op.notes = notes
+
+        if set_pending and op.status == WhatsAppOperationStatus.QUOTED:
+            if op.expires_at <= datetime.utcnow():
+                raise QuoteServiceError("quote_expired", "La cotización expiró", 409)
+            op.status = WhatsAppOperationStatus.PENDING
+            op.approved_at = datetime.utcnow()
+
+        self.db.commit()
+        self.db.refresh(op)
+        return op
+
     # ---------- Completar (genera Transaction) ----------
 
     def complete_operation(
@@ -347,6 +374,7 @@ class WhatsAppQuoteService:
         status: Optional[str] = None,
         since: Optional[datetime] = None,
         limit: int = 100,
+        delivery_status: Optional[str] = None,
     ) -> list[WhatsAppOperation]:
         q = self.db.query(WhatsAppOperation)
         if phone:
@@ -357,9 +385,62 @@ class WhatsAppQuoteService:
                 q = q.filter(WhatsAppOperation.status == WhatsAppOperationStatus(status.upper()))
             except ValueError:
                 raise QuoteServiceError("invalid_status", f"Status inválido: {status}", 400)
+        if delivery_status:
+            try:
+                q = q.filter(WhatsAppOperation.delivery_status == WhatsAppDeliveryStatus(delivery_status.upper()))
+            except ValueError:
+                raise QuoteServiceError("invalid_delivery_status", f"delivery_status inválido: {delivery_status}", 400)
         if since:
             q = q.filter(WhatsAppOperation.created_at >= since)
         return q.order_by(WhatsAppOperation.created_at.desc()).limit(limit).all()
+
+    def mark_delivered(self, op_uuid: UUID) -> WhatsAppOperation:
+        """Marca como recibidos los USD efectivo de una op con entrega pendiente.
+
+        Espejo de `markDelivered(opId)` del bot: requiere delivery_status==PENDING.
+        """
+        op = self._get_op_or_404(op_uuid)
+        if op.delivery_status != WhatsAppDeliveryStatus.PENDING:
+            raise QuoteServiceError(
+                "invalid_status",
+                "La operación no tiene entrega de USD pendiente",
+                409,
+            )
+        op.delivery_status = WhatsAppDeliveryStatus.RECEIVED
+        op.delivered_at = datetime.utcnow()
+        self.db.commit()
+        self.db.refresh(op)
+        return op
+
+    def get_stats(self) -> dict:
+        """Conteos por estado + completados hoy (espejo de `getOperationStats` del bot)."""
+        from sqlalchemy import func as safunc
+
+        rows = (
+            self.db.query(WhatsAppOperation.status, safunc.count(WhatsAppOperation.id))
+            .group_by(WhatsAppOperation.status)
+            .all()
+        )
+        counts = {s.value: 0 for s in WhatsAppOperationStatus}
+        for st, cnt in rows:
+            counts[st.value] = cnt
+
+        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        completed_today = (
+            self.db.query(WhatsAppOperation)
+            .filter(
+                WhatsAppOperation.status == WhatsAppOperationStatus.COMPLETED,
+                WhatsAppOperation.completed_at >= today_start,
+            )
+            .count()
+        )
+        return {
+            "pending": counts["PENDING"],
+            "completed": counts["COMPLETED"],
+            "quoted": counts["QUOTED"],
+            "cancelled": counts["CANCELLED"],
+            "completed_today": completed_today,
+        }
 
     # ---------- Helpers ----------
 

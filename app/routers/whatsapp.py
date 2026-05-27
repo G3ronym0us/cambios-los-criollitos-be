@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.bot_auth import BotPrincipal, get_bot_principal
@@ -18,15 +18,27 @@ from app.schemas.whatsapp import (
     BcvRateResponse,
     WhatsAppClientResponse,
     WhatsAppClientUpsert,
+    WhatsAppCreateOpFromPayment,
+    WhatsAppIrrelevant,
     WhatsAppOperationApprove,
     WhatsAppOperationCancel,
     WhatsAppOperationComplete,
     WhatsAppOperationCreate,
     WhatsAppOperationList,
+    WhatsAppOperationNotes,
     WhatsAppOperationResponse,
+    WhatsAppPaymentCreate,
+    WhatsAppPaymentLink,
+    WhatsAppPaymentUpdate,
+    WhatsAppPersonalExpense,
+    WhatsAppStatsResponse,
 )
 from app.services.bcv_service import fetch_bcv_rate, get_cached_bcv_rate
+from app.services.whatsapp_payment_service import WhatsAppPaymentService
 from app.services.whatsapp_quote_service import QuoteServiceError, WhatsAppQuoteService
+
+
+_TABLE = Path(..., pattern="^(incoming|outgoing)$")
 
 
 router = APIRouter(prefix="/whatsapp", tags=["WhatsApp"])
@@ -102,6 +114,47 @@ def complete_operation(
     return WhatsAppOperationResponse.model_validate(op.dict())
 
 
+@router.patch("/operations/{op_uuid}/notes", response_model=WhatsAppOperationResponse)
+def attach_notes(
+    op_uuid: UUID,
+    payload: WhatsAppOperationNotes,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    """Adjunta/actualiza notas (datos de pago) en una op activa; opcionalmente QUOTED→PENDING."""
+    service = WhatsAppQuoteService(db)
+    try:
+        op = service.attach_notes(op_uuid, payload.notes, payload.set_pending)
+    except QuoteServiceError as exc:
+        _handle_service_error(exc)
+    return WhatsAppOperationResponse.model_validate(op.dict())
+
+
+@router.patch("/operations/{op_uuid}/delivered", response_model=WhatsAppOperationResponse)
+def mark_delivered(
+    op_uuid: UUID,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    """Marca como recibidos los USD efectivo (delivery_status PENDING→RECEIVED)."""
+    service = WhatsAppQuoteService(db)
+    try:
+        op = service.mark_delivered(op_uuid)
+    except QuoteServiceError as exc:
+        _handle_service_error(exc)
+    return WhatsAppOperationResponse.model_validate(op.dict())
+
+
+@router.get("/operations/stats", response_model=WhatsAppStatsResponse)
+def get_stats(
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    """Conteos por estado + completados hoy, para el dashboard."""
+    service = WhatsAppQuoteService(db)
+    return WhatsAppStatsResponse(**service.get_stats())
+
+
 @router.get("/operations/active", response_model=Optional[WhatsAppOperationResponse])
 def get_active_operation(
     phone: str = Query(..., min_length=4, max_length=32),
@@ -134,12 +187,15 @@ def list_operations(
     status_filter: Optional[str] = Query(None, alias="status"),
     since: Optional[datetime] = Query(None),
     limit: int = Query(100, ge=1, le=500),
+    delivery_status: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     principal: BotPrincipal = Depends(get_bot_principal),
 ):
     service = WhatsAppQuoteService(db)
     try:
-        ops = service.list_operations(phone=phone, status=status_filter, since=since, limit=limit)
+        ops = service.list_operations(
+            phone=phone, status=status_filter, since=since, limit=limit, delivery_status=delivery_status
+        )
     except QuoteServiceError as exc:
         _handle_service_error(exc)
     items = [WhatsAppOperationResponse.model_validate(op.dict()) for op in ops]
@@ -187,6 +243,120 @@ def upsert_client(
     db.commit()
     db.refresh(client)
     return WhatsAppClientResponse.model_validate(client.dict())
+
+
+# ---------- Payments (comprobantes OCR) ----------
+
+@router.get("/payments/corrected")
+def list_corrected_payments(
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    return WhatsAppPaymentService(db).list_corrected()
+
+
+@router.post("/payments/{table}", status_code=status.HTTP_201_CREATED)
+def create_payment(
+    payload: WhatsAppPaymentCreate,
+    table: str = _TABLE,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.create_payment(table, payload)
+    except QuoteServiceError as exc:
+        _handle_service_error(exc)
+
+
+@router.get("/payments/{table}")
+def list_payments(
+    table: str = _TABLE,
+    limit: int = Query(200, ge=1, le=1000),
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.list_payments(table, limit)
+    except QuoteServiceError as exc:
+        _handle_service_error(exc)
+
+
+@router.patch("/payments/{table}/{payment_id}")
+def update_payment(
+    payment_id: int,
+    payload: WhatsAppPaymentUpdate,
+    table: str = _TABLE,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.update_payment(table, payment_id, payload.dict(exclude_unset=True))
+    except QuoteServiceError as exc:
+        _handle_service_error(exc)
+
+
+@router.put("/payments/{table}/{payment_id}/operation")
+def link_payment_operation(
+    payment_id: int,
+    payload: WhatsAppPaymentLink,
+    table: str = _TABLE,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.set_operation(table, payment_id, payload.operation_uuid)
+    except QuoteServiceError as exc:
+        _handle_service_error(exc)
+
+
+@router.post("/payments/{table}/{payment_id}/create-operation")
+def create_operation_from_payment(
+    payment_id: int,
+    payload: WhatsAppCreateOpFromPayment,
+    table: str = _TABLE,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.create_operation_from_payment(
+            table, payment_id, payload.from_currency, payload.to_currency,
+            payload.from_amount, payload.to_amount,
+        )
+    except QuoteServiceError as exc:
+        _handle_service_error(exc)
+
+
+@router.patch("/payments/outgoing/{payment_id}/personal-expense")
+def set_personal_expense(
+    payment_id: int,
+    payload: WhatsAppPersonalExpense,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.set_personal_expense(payment_id, payload.is_personal_expense, payload.personal_description)
+    except QuoteServiceError as exc:
+        _handle_service_error(exc)
+
+
+@router.patch("/payments/outgoing/{payment_id}/irrelevant")
+def set_irrelevant(
+    payment_id: int,
+    payload: WhatsAppIrrelevant,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.set_irrelevant(payment_id, payload.is_irrelevant)
+    except QuoteServiceError as exc:
+        _handle_service_error(exc)
 
 
 # ---------- BCV ----------

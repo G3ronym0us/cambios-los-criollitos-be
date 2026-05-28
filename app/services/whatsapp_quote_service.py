@@ -11,7 +11,7 @@ El servicio nunca habla con HTTP; recibe Sessions y devuelve modelos.
 La capa router lo expone vía /whatsapp/...
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -64,7 +64,7 @@ class WhatsAppQuoteService:
 
     def upsert_client(self, phone: str, display_name: Optional[str] = None) -> WhatsAppClient:
         client = self.db.query(WhatsAppClient).filter(WhatsAppClient.phone == phone).first()
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if client is None:
             client = WhatsAppClient(phone=phone, display_name=display_name, last_seen_at=now)
             self.db.add(client)
@@ -157,7 +157,7 @@ class WhatsAppQuoteService:
         # Cancelar cualquier cotización previa QUOTED del mismo cliente
         self._cancel_previous_quoted(client.id)
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         op = WhatsAppOperation(
             client_id=client.id,
             currency_pair_id=currency_pair.id,
@@ -188,7 +188,7 @@ class WhatsAppQuoteService:
             )
             .all()
         )
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         for op in previous:
             op.status = WhatsAppOperationStatus.CANCELLED
             op.cancelled_at = now
@@ -203,11 +203,11 @@ class WhatsAppQuoteService:
                 f"Solo se puede aprobar una op en QUOTED; estado actual: {op.status.value}",
                 409,
             )
-        if op.expires_at <= datetime.utcnow():
+        if op.expires_at <= datetime.now(timezone.utc):
             raise QuoteServiceError("quote_expired", "La cotización expiró", 409)
 
         op.status = WhatsAppOperationStatus.PENDING
-        op.approved_at = datetime.utcnow()
+        op.approved_at = datetime.now(timezone.utc)
         if payload.notes:
             op.notes = (op.notes + "\n" if op.notes else "") + payload.notes
         self.db.commit()
@@ -223,7 +223,7 @@ class WhatsAppQuoteService:
                 409,
             )
         op.status = WhatsAppOperationStatus.CANCELLED
-        op.cancelled_at = datetime.utcnow()
+        op.cancelled_at = datetime.now(timezone.utc)
         if payload.reason:
             op.notes = (op.notes + "\n" if op.notes else "") + f"[cancel] {payload.reason}"
         self.db.commit()
@@ -248,10 +248,10 @@ class WhatsAppQuoteService:
         op.notes = notes
 
         if set_pending and op.status == WhatsAppOperationStatus.QUOTED:
-            if op.expires_at <= datetime.utcnow():
+            if op.expires_at <= datetime.now(timezone.utc):
                 raise QuoteServiceError("quote_expired", "La cotización expiró", 409)
             op.status = WhatsAppOperationStatus.PENDING
-            op.approved_at = datetime.utcnow()
+            op.approved_at = datetime.now(timezone.utc)
 
         self.db.commit()
         self.db.refresh(op)
@@ -277,15 +277,15 @@ class WhatsAppQuoteService:
         # Completar implica la aprobación (el operador es quien decide proceder). El camino
         # QUOTED→PENDING→COMPLETED sigue válido para flujos que sí confirmen con el cliente.
         if op.status == WhatsAppOperationStatus.QUOTED:
-            if op.expires_at <= datetime.utcnow():
+            if op.expires_at <= datetime.now(timezone.utc):
                 raise QuoteServiceError("quote_expired", "La cotización expiró", 409)
-            op.approved_at = datetime.utcnow()
+            op.approved_at = datetime.now(timezone.utc)
 
         # Crear Transaction reusando el repo existente (que dispara profit splits)
         tx = self._create_transaction_for_op(op, payload, bot_service_user)
 
         op.status = WhatsAppOperationStatus.COMPLETED
-        op.completed_at = datetime.utcnow()
+        op.completed_at = datetime.now(timezone.utc)
         op.transaction_id = tx.id
 
         # Delivery tracking: si la op es venta de USD efectivo y el operador todavía
@@ -407,7 +407,7 @@ class WhatsAppQuoteService:
                 409,
             )
         op.delivery_status = WhatsAppDeliveryStatus.RECEIVED
-        op.delivered_at = datetime.utcnow()
+        op.delivered_at = datetime.now(timezone.utc)
         self.db.commit()
         self.db.refresh(op)
         return op
@@ -425,7 +425,7 @@ class WhatsAppQuoteService:
         for st, cnt in rows:
             counts[st.value] = cnt
 
-        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         completed_today = (
             self.db.query(WhatsAppOperation)
             .filter(

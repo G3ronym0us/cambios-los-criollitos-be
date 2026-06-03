@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from app.core.dependencies import get_current_user
 from app.database.connection import get_db
 from app.models.user import User
+from app.schemas.whatsapp import WhatsAppPaymentLink
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
 from app.services.whatsapp_quote_service import QuoteServiceError
 
@@ -36,5 +37,21 @@ async def list_payments(
     service = WhatsAppPaymentService(db)
     try:
         return service.list_payments(table, limit)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.patch("/{table}/{payment_id}/operation")
+async def link_payment_operation(
+    table: Literal["incoming", "outgoing"],
+    payment_id: int,
+    payload: WhatsAppPaymentLink,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Vincula (o desvincula con operation_uuid=null) un pago a una operación. Operador JWT."""
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.set_operation(table, payment_id, payload.operation_uuid)
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)

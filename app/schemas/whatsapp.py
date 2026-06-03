@@ -228,6 +228,7 @@ class WhatsAppIncomingPaymentResponse(BaseModel):
     uuid: UUID
     client_phone: str
     client_name: Optional[str] = None
+    client_uuid: Optional[UUID] = None
     provider: Optional[str] = None
     amount: Optional[float] = None
     currency: Optional[str] = None

@@ -59,13 +59,18 @@ class WhatsAppPaymentService:
             raise QuoteServiceError("op_not_found", f"Operation {operation_uuid} no encontrada", 404)
         return op.id
 
-    def _client_name(self, phone: str) -> Optional[str]:
+    def _client_ref(self, phone: str) -> tuple[Optional[str], Optional[str]]:
+        """Devuelve (display_name, uuid) del cliente con ese teléfono, o (None, None)."""
         client = self.db.query(WhatsAppClient).filter(WhatsAppClient.phone == phone).first()
-        return client.display_name if client else None
+        if client is None:
+            return None, None
+        return client.display_name, str(client.uuid)
 
     def _with_name(self, payment) -> dict:
         d = payment.dict()
-        d["client_name"] = self._client_name(payment.client_phone)
+        name, client_uuid = self._client_ref(payment.client_phone)
+        d["client_name"] = name
+        d["client_uuid"] = client_uuid
         return d
 
     # ---------- Crear / listar ----------
@@ -91,6 +96,11 @@ class WhatsAppPaymentService:
             kwargs["source_payment_id"] = payload.source_payment_id
         row = Model(**kwargs)
         self.db.add(row)
+        # Garantiza un registro de cliente para el teléfono del pago (no para JIDs de
+        # grupo): así todo número con pagos tiene perfil. Sin display_name → la UI lo
+        # muestra como el propio número hasta que el operador le ponga nombre.
+        if not payload.client_phone.endswith("@g.us"):
+            WhatsAppQuoteService(self.db).upsert_client(payload.client_phone)
         self.db.commit()
         self.db.refresh(row)
         return self._with_name(row)
@@ -98,16 +108,17 @@ class WhatsAppPaymentService:
     def list_payments(self, table: str, limit: int = 200) -> list[dict]:
         Model = self._model(table)
         rows = (
-            self.db.query(Model, WhatsAppClient.display_name)
+            self.db.query(Model, WhatsAppClient.display_name, WhatsAppClient.uuid)
             .outerjoin(WhatsAppClient, WhatsAppClient.phone == Model.client_phone)
             .order_by(Model.created_at.desc())
             .limit(limit)
             .all()
         )
         out = []
-        for payment, display_name in rows:
+        for payment, display_name, client_uuid in rows:
             d = payment.dict()
             d["client_name"] = display_name
+            d["client_uuid"] = str(client_uuid) if client_uuid else None
             out.append(d)
         return out
 

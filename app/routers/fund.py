@@ -6,8 +6,8 @@ from uuid import UUID
 
 from app.database.connection import get_db
 from app.schemas.fund import (
-    FundGroupCreate, FundGroupResponse,
-    FundGroupMemberCreate, FundGroupMemberResponse,
+    FundGroupCreate, FundGroupUpdate, FundGroupResponse,
+    FundGroupMemberCreate, FundGroupMemberUpdate, FundGroupMemberResponse,
     FundMovementCreate, FundMovementResponse, FundMovementList,
     UserPositionResponse, FundGroupBalanceResponse,
 )
@@ -41,6 +41,7 @@ async def create_fund_group(
         name=group_data.name,
         currency=group_data.currency,
         description=group_data.description,
+        whatsapp_group_jid=group_data.whatsapp_group_jid,
     )
     return group
 
@@ -54,6 +55,25 @@ async def list_fund_groups(
     """Listar grupos de fondo"""
     fund_repo = FundRepository(db)
     return fund_repo.get_groups(active_only=active_only)
+
+
+@router.patch("/groups/{group_uuid}", response_model=FundGroupResponse)
+async def update_fund_group(
+    group_uuid: UUID,
+    payload: FundGroupUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """Actualizar un grupo (JID de WhatsApp). Requiere moderador."""
+    fund_repo = FundRepository(db)
+    group = fund_repo.get_group_by_uuid(group_uuid)
+    if not group:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fund group not found")
+    if payload.clear_whatsapp_group_jid:
+        fund_repo.update_group_whatsapp_jid(group, None)
+    elif payload.whatsapp_group_jid is not None:
+        fund_repo.update_group_whatsapp_jid(group, payload.whatsapp_group_jid)
+    return fund_repo.get_group_by_uuid(group_uuid)
 
 
 @router.post("/groups/{group_uuid}/members", response_model=FundGroupMemberResponse, status_code=status.HTTP_201_CREATED)
@@ -85,8 +105,39 @@ async def add_group_member(
         group_id=group.id,
         user_id=user.id,
         is_fund_manager=member_data.is_fund_manager,
+        whatsapp_phone=member_data.whatsapp_phone,
     )
     return member
+
+
+@router.patch("/groups/{group_uuid}/members/{user_uuid}", response_model=FundGroupMemberResponse)
+async def update_group_member(
+    group_uuid: UUID,
+    user_uuid: UUID,
+    payload: FundGroupMemberUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """Actualizar un miembro (número de WhatsApp del socio / rol). Requiere moderador."""
+    fund_repo = FundRepository(db)
+    user_repo = UserRepository(db)
+
+    group = fund_repo.get_group_by_uuid(group_uuid)
+    if not group:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fund group not found")
+    user = user_repo.get_by_uuid(user_uuid)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    member = fund_repo.get_member(group.id, user.id)
+    if not member:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found in this group")
+
+    return fund_repo.update_member(
+        member,
+        is_fund_manager=payload.is_fund_manager,
+        whatsapp_phone=payload.whatsapp_phone,
+        clear_whatsapp_phone=payload.clear_whatsapp_phone,
+    )
 
 
 @router.delete("/groups/{group_uuid}/members/{user_uuid}", status_code=status.HTTP_204_NO_CONTENT)

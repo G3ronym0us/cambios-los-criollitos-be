@@ -25,6 +25,9 @@ class FundGroup(UUIDMixin, Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(100), nullable=False, unique=True)
     currency = Column(String(10), nullable=False)  # Moneda base del fondo: "USD", "COP"
+    # JID del grupo de WhatsApp (...@g.us) asociado a este fondo. Permite que el backend
+    # resuelva el FundGroup a partir del JID que el bot manda al reenviar capturas.
+    whatsapp_group_jid = Column(String(64), nullable=True, index=True)
     description = Column(Text, nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -42,6 +45,7 @@ class FundGroup(UUIDMixin, Base):
             "uuid": self.uuid,
             "name": self.name,
             "currency": self.currency,
+            "whatsapp_group_jid": self.whatsapp_group_jid,
             "description": self.description,
             "is_active": self.is_active,
             "created_at": self.created_at,
@@ -61,6 +65,9 @@ class FundGroupMember(UUIDMixin, Base):
     group_id = Column(Integer, ForeignKey("fund_groups.id", ondelete="CASCADE"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     is_fund_manager = Column(Boolean, default=False, nullable=False)
+    # Número de WhatsApp del socio. Si está seteado (y is_fund_manager), el bot detecta
+    # los mensajes de este número como entrantes reportados por el socio (escenario VIA_PARTNER).
+    whatsapp_phone = Column(String(32), nullable=True, index=True)
     joined_at = Column(DateTime(timezone=True), server_default=func.now())
 
     # Relaciones
@@ -89,6 +96,7 @@ class FundGroupMember(UUIDMixin, Base):
             "user_uuid": self.user.uuid if self.user else None,
             "username": self.user.username if self.user else None,
             "is_fund_manager": self.is_fund_manager,
+            "whatsapp_phone": self.whatsapp_phone,
             "joined_at": self.joined_at,
         }
 

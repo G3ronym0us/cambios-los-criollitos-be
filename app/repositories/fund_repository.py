@@ -15,9 +15,26 @@ class FundRepository:
 
     # ===== Grupos =====
 
-    def create_fund_group(self, name: str, currency: str, description: Optional[str] = None) -> FundGroup:
-        group = FundGroup(name=name, currency=currency.upper(), description=description)
+    def create_fund_group(
+        self,
+        name: str,
+        currency: str,
+        description: Optional[str] = None,
+        whatsapp_group_jid: Optional[str] = None,
+    ) -> FundGroup:
+        group = FundGroup(
+            name=name,
+            currency=currency.upper(),
+            description=description,
+            whatsapp_group_jid=whatsapp_group_jid,
+        )
         self.db.add(group)
+        self.db.commit()
+        self.db.refresh(group)
+        return group
+
+    def update_group_whatsapp_jid(self, group: FundGroup, jid: Optional[str]) -> FundGroup:
+        group.whatsapp_group_jid = jid
         self.db.commit()
         self.db.refresh(group)
         return group
@@ -38,13 +55,37 @@ class FundRepository:
             query = query.filter(FundGroup.is_active == True)
         return query.order_by(FundGroup.name).all()
 
-    def add_member(self, group_id: int, user_id: int, is_fund_manager: bool = False) -> FundGroupMember:
+    def add_member(
+        self,
+        group_id: int,
+        user_id: int,
+        is_fund_manager: bool = False,
+        whatsapp_phone: Optional[str] = None,
+    ) -> FundGroupMember:
         member = FundGroupMember(
             group_id=group_id,
             user_id=user_id,
-            is_fund_manager=is_fund_manager
+            is_fund_manager=is_fund_manager,
+            whatsapp_phone=whatsapp_phone,
         )
         self.db.add(member)
+        self.db.commit()
+        self.db.refresh(member)
+        return member
+
+    def update_member(
+        self,
+        member: FundGroupMember,
+        is_fund_manager: Optional[bool] = None,
+        whatsapp_phone: Optional[str] = None,
+        clear_whatsapp_phone: bool = False,
+    ) -> FundGroupMember:
+        if is_fund_manager is not None:
+            member.is_fund_manager = is_fund_manager
+        if clear_whatsapp_phone:
+            member.whatsapp_phone = None
+        elif whatsapp_phone is not None:
+            member.whatsapp_phone = whatsapp_phone
         self.db.commit()
         self.db.refresh(member)
         return member

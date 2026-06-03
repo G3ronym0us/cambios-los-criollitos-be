@@ -102,6 +102,11 @@ class WhatsAppOperationResponse(BaseModel):
     amount_side: Literal["SEND", "RECEIVE"]
     bcv_usd: Optional[float] = None
     status: Literal["QUOTED", "PENDING", "COMPLETED", "CANCELLED"]
+    scenario: Literal["NORMAL", "ZELLE_DIRECT", "VIA_PARTNER"] = "NORMAL"
+    fund_group_uuid: Optional[UUID] = None
+    fund_group_name: Optional[str] = None
+    received_by_user_uuid: Optional[UUID] = None
+    received_by_username: Optional[str] = None
     delivery_status: Optional[Literal["PENDING", "RECEIVED"]] = None
     delivered_at: Optional[datetime] = None
     notes: Optional[str] = None
@@ -117,6 +122,36 @@ class WhatsAppOperationResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class WhatsAppOperationScenarioUpdate(BaseModel):
+    """
+    Setear/editar el escenario, grupo y receptor del entrante de una operación.
+    Todos opcionales (PATCH parcial). El grupo se resuelve por `fund_group_uuid` o,
+    para el bot, por `group_jid` (FundGroup.whatsapp_group_jid).
+    """
+    scenario: Optional[Literal["NORMAL", "ZELLE_DIRECT", "VIA_PARTNER"]] = None
+    fund_group_uuid: Optional[UUID] = None
+    group_jid: Optional[str] = None
+    received_by_user_uuid: Optional[UUID] = None
+    # Permite explícitamente limpiar el grupo / receptor (poner a NULL) cuando True.
+    clear_fund_group: bool = False
+    clear_received_by: bool = False
+
+
+class WhatsAppPartnerResponse(BaseModel):
+    """Socio (FundGroupMember con whatsapp_phone) que reporta entrantes desde su número."""
+    whatsapp_phone: str
+    user_uuid: UUID
+    username: Optional[str] = None
+    group_uuid: UUID
+    group_name: str
+    group_jid: Optional[str] = None
+
+
+class WhatsAppPartnerList(BaseModel):
+    partners: List[WhatsAppPartnerResponse]
+    total: int
 
 
 class WhatsAppOperationList(BaseModel):

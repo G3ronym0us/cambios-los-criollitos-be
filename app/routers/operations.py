@@ -23,6 +23,7 @@ from app.models.user import User
 from app.schemas.whatsapp import (
     WhatsAppOperationList,
     WhatsAppOperationResponse,
+    WhatsAppOperationScenarioUpdate,
     WhatsAppStatsResponse,
 )
 from app.services.whatsapp_quote_service import QuoteServiceError, WhatsAppQuoteService
@@ -75,4 +76,20 @@ async def get_operation(
     op = service.get_by_uuid(op_uuid)
     if op is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Operación no encontrada")
+    return WhatsAppOperationResponse.model_validate(op.dict())
+
+
+@router.patch("/{op_uuid}/scenario", response_model=WhatsAppOperationResponse)
+async def update_operation_scenario(
+    op_uuid: UUID,
+    payload: WhatsAppOperationScenarioUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Edición manual del escenario/grupo/receptor del entrante desde el dashboard."""
+    service = WhatsAppQuoteService(db)
+    try:
+        op = service.set_scenario(op_uuid, payload)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
     return WhatsAppOperationResponse.model_validate(op.dict())

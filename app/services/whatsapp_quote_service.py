@@ -18,6 +18,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.models.currency_pair import CurrencyPair
+from app.models.fund import FundGroup, FundGroupMember
 from app.models.transaction import Transaction, TransactionStatus
 from app.models.user import User
 from app.models.whatsapp_client import WhatsAppClient
@@ -25,6 +26,7 @@ from app.models.whatsapp_operation import (
     WhatsAppAmountSide,
     WhatsAppDeliveryStatus,
     WhatsAppOperation,
+    WhatsAppOperationScenario,
     WhatsAppOperationStatus,
 )
 from app.repositories.commission_config_repository import CommissionConfigRepository
@@ -36,6 +38,7 @@ from app.schemas.whatsapp import (
     WhatsAppOperationCancel,
     WhatsAppOperationComplete,
     WhatsAppOperationCreate,
+    WhatsAppOperationScenarioUpdate,
 )
 from app.services.bcv_service import get_cached_bcv_rate
 from app.services.whatsapp_rate_resolver import WhatsAppRateResolver
@@ -411,6 +414,90 @@ class WhatsAppQuoteService:
         self.db.commit()
         self.db.refresh(op)
         return op
+
+    # ---------- Escenario / grupo / receptor del entrante ----------
+
+    def set_scenario(self, op_uuid: UUID, payload: WhatsAppOperationScenarioUpdate) -> WhatsAppOperation:
+        """
+        Setea/edita el escenario, el FundGroup y el receptor del pago entrante de una op.
+        Usado tanto por el bot (clasificación automática, resuelve el grupo por `group_jid`)
+        como por el front (edición manual, resuelve por `fund_group_uuid`/`received_by_user_uuid`).
+        """
+        op = self._get_op_or_404(op_uuid)
+
+        if payload.scenario is not None:
+            op.scenario = WhatsAppOperationScenario(payload.scenario)
+
+        # Grupo: por uuid (front) o por JID del grupo de WhatsApp (bot). clear_fund_group lo limpia.
+        if payload.clear_fund_group:
+            op.fund_group_id = None
+        elif payload.fund_group_uuid is not None:
+            group = self.db.query(FundGroup).filter(FundGroup.uuid == str(payload.fund_group_uuid)).first()
+            if group is None:
+                raise QuoteServiceError("fund_group_not_found", "FundGroup no encontrado", 404)
+            op.fund_group_id = group.id
+        elif payload.group_jid:
+            group = self.db.query(FundGroup).filter(FundGroup.whatsapp_group_jid == payload.group_jid).first()
+            if group is None:
+                raise QuoteServiceError(
+                    "fund_group_not_found",
+                    f"No hay FundGroup asociado al grupo {payload.group_jid}",
+                    404,
+                )
+            op.fund_group_id = group.id
+
+        # Receptor del entrante. clear_received_by lo limpia (vuelve a operador).
+        if payload.clear_received_by:
+            op.received_by_user_id = None
+        elif payload.received_by_user_uuid is not None:
+            user = self.db.query(User).filter(User.uuid == str(payload.received_by_user_uuid)).first()
+            if user is None:
+                raise QuoteServiceError("user_not_found", "Usuario receptor no encontrado", 404)
+            op.received_by_user_id = user.id
+
+        self.db.commit()
+        self.db.refresh(op)
+        return op
+
+    def find_operation_for_group_forwarding(self, client_phone: str) -> Optional[WhatsAppOperation]:
+        """
+        Resuelve la operación a etiquetar cuando se reenvía un comprobante al grupo
+        (escenario ZELLE_DIRECT). Prioriza la op activa del cliente; si no hay, la más
+        reciente (cualquier estado).
+        """
+        active = self.get_active_for_phone(client_phone)
+        if active is not None:
+            return active
+        return (
+            self.db.query(WhatsAppOperation)
+            .join(WhatsAppClient, WhatsAppClient.id == WhatsAppOperation.client_id)
+            .filter(WhatsAppClient.phone == client_phone)
+            .order_by(WhatsAppOperation.created_at.desc())
+            .first()
+        )
+
+    def list_partners(self) -> list[dict]:
+        """
+        Lista socios: miembros de fondo con `whatsapp_phone` seteado. El bot usa esto para
+        detectar mensajes de socios (ej. Jean) y clasificar el escenario VIA_PARTNER.
+        """
+        members = (
+            self.db.query(FundGroupMember)
+            .filter(FundGroupMember.whatsapp_phone.isnot(None))
+            .all()
+        )
+        result: list[dict] = []
+        for m in members:
+            group = m.group
+            result.append({
+                "whatsapp_phone": m.whatsapp_phone,
+                "user_uuid": m.user.uuid if m.user else None,
+                "username": m.user.username if m.user else None,
+                "group_uuid": group.uuid if group else None,
+                "group_name": group.name if group else None,
+                "group_jid": group.whatsapp_group_jid if group else None,
+            })
+        return result
 
     def get_stats(self) -> dict:
         """Conteos por estado + completados hoy (espejo de `getOperationStats` del bot)."""

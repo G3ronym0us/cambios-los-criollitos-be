@@ -10,11 +10,27 @@ class FundGroupCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     currency: str = Field(..., min_length=1, max_length=10)
     description: Optional[str] = None
+    # JID del grupo de WhatsApp (...@g.us) para resolver el FundGroup desde el bot.
+    whatsapp_group_jid: Optional[str] = Field(None, max_length=64)
+
+
+class FundGroupUpdate(BaseModel):
+    """Actualización parcial de un grupo (de momento solo el JID de WhatsApp)."""
+    whatsapp_group_jid: Optional[str] = Field(None, max_length=64)
+    clear_whatsapp_group_jid: bool = False
 
 
 class FundGroupMemberCreate(BaseModel):
     user_uuid: UUID
     is_fund_manager: bool = False
+    # Número de WhatsApp del socio: activa la detección automática del escenario VIA_PARTNER.
+    whatsapp_phone: Optional[str] = Field(None, max_length=32)
+
+
+class FundGroupMemberUpdate(BaseModel):
+    is_fund_manager: Optional[bool] = None
+    whatsapp_phone: Optional[str] = Field(None, max_length=32)
+    clear_whatsapp_phone: bool = False
 
 
 class FundGroupMemberResponse(BaseModel):
@@ -22,6 +38,7 @@ class FundGroupMemberResponse(BaseModel):
     user_uuid: UUID
     username: Optional[str] = None
     is_fund_manager: bool
+    whatsapp_phone: Optional[str] = None
     joined_at: datetime
 
     class Config:
@@ -34,6 +51,7 @@ class FundGroupResponse(BaseModel):
     currency: str
     description: Optional[str] = None
     is_active: bool
+    whatsapp_group_jid: Optional[str] = None
     created_at: datetime
     members: List[FundGroupMemberResponse] = []
 

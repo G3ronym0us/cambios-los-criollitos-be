@@ -27,6 +27,9 @@ from app.schemas.whatsapp import (
     WhatsAppOperationList,
     WhatsAppOperationNotes,
     WhatsAppOperationResponse,
+    WhatsAppOperationScenarioUpdate,
+    WhatsAppPartnerList,
+    WhatsAppPartnerResponse,
     WhatsAppPaymentCreate,
     WhatsAppPaymentLink,
     WhatsAppPaymentUpdate,
@@ -143,6 +146,33 @@ def mark_delivered(
     except QuoteServiceError as exc:
         _handle_service_error(exc)
     return WhatsAppOperationResponse.model_validate(op.dict())
+
+
+@router.patch("/operations/{op_uuid}/scenario", response_model=WhatsAppOperationResponse)
+def set_operation_scenario(
+    op_uuid: UUID,
+    payload: WhatsAppOperationScenarioUpdate,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    """Clasifica/edita el escenario, grupo (por uuid o group_jid) y receptor del entrante."""
+    service = WhatsAppQuoteService(db)
+    try:
+        op = service.set_scenario(op_uuid, payload)
+    except QuoteServiceError as exc:
+        _handle_service_error(exc)
+    return WhatsAppOperationResponse.model_validate(op.dict())
+
+
+@router.get("/partners", response_model=WhatsAppPartnerList)
+def list_partners(
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    """Socios (FundGroupMember con whatsapp_phone) que reportan entrantes desde su número."""
+    service = WhatsAppQuoteService(db)
+    partners = [WhatsAppPartnerResponse.model_validate(p) for p in service.list_partners()]
+    return WhatsAppPartnerList(partners=partners, total=len(partners))
 
 
 @router.get("/operations/stats", response_model=WhatsAppStatsResponse)

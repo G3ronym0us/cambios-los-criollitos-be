@@ -23,6 +23,22 @@ class WhatsAppDeliveryStatus(enum.Enum):
     RECEIVED = "RECEIVED"
 
 
+class WhatsAppOperationScenario(enum.Enum):
+    """
+    Comportamiento/escenario de la operación según quién recibe el entrante y a quién
+    se le envía el saliente.
+
+    - NORMAL:       cliente <-> operador, sin grupo (default histórico).
+    - ZELLE_DIRECT: el cliente envía un Zelle (entrante), yo gestiono el cambio,
+                    reenvío el Zelle al grupo (ledger) y pago en Bs al cliente.
+    - VIA_PARTNER:  un socio (ej. Jean) recibe el entrante en su WhatsApp y me reporta
+                    monto+datos; yo pago en Bs y subo el capture al grupo.
+    """
+    NORMAL = "NORMAL"
+    ZELLE_DIRECT = "ZELLE_DIRECT"
+    VIA_PARTNER = "VIA_PARTNER"
+
+
 class WhatsAppOperation(UUIDMixin, Base):
     """
     Operación originada en WhatsApp. Ciclo: QUOTED -> PENDING -> COMPLETED.
@@ -48,6 +64,18 @@ class WhatsAppOperation(UUIDMixin, Base):
     bcv_usd = Column(Float, nullable=True)
 
     status = Column(SQLEnum(WhatsAppOperationStatus), nullable=False, default=WhatsAppOperationStatus.QUOTED, index=True)
+
+    # Escenario/comportamiento de la operación (clasificado por el bot, editable a mano)
+    scenario = Column(
+        SQLEnum(WhatsAppOperationScenario),
+        nullable=False,
+        server_default=WhatsAppOperationScenario.NORMAL.value,
+        index=True,
+    )
+    # Grupo contable (FundGroup, ej. "cambios d&j") al que pertenece el cambio
+    fund_group_id = Column(Integer, ForeignKey("fund_groups.id", ondelete="SET NULL"), nullable=True, index=True)
+    # Quién recibió el pago ENTRANTE. NULL = operador (yo); un socio (Jean) = su User.
+    received_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
 
     # Tracking de entrega de USD efectivo (cliente vende USD físico al operador)
     delivery_status = Column(SQLEnum(WhatsAppDeliveryStatus), nullable=True)
@@ -75,6 +103,8 @@ class WhatsAppOperation(UUIDMixin, Base):
     client = relationship("WhatsAppClient", back_populates="operations")
     currency_pair = relationship("CurrencyPair", lazy="joined")
     transaction = relationship("Transaction", foreign_keys=[transaction_id])
+    fund_group = relationship("FundGroup", foreign_keys=[fund_group_id])
+    received_by = relationship("User", foreign_keys=[received_by_user_id])
 
     def __repr__(self):
         return (
@@ -102,6 +132,11 @@ class WhatsAppOperation(UUIDMixin, Base):
             "amount_side": self.amount_side.value if self.amount_side else None,
             "bcv_usd": self.bcv_usd,
             "status": self.status.value if self.status else None,
+            "scenario": self.scenario.value if self.scenario else None,
+            "fund_group_uuid": self.fund_group.uuid if self.fund_group else None,
+            "fund_group_name": self.fund_group.name if self.fund_group else None,
+            "received_by_user_uuid": self.received_by.uuid if self.received_by else None,
+            "received_by_username": self.received_by.username if self.received_by else None,
             "delivery_status": self.delivery_status.value if self.delivery_status else None,
             "delivered_at": self.delivered_at,
             "notes": self.notes,

@@ -108,17 +108,24 @@ class WhatsAppPaymentService:
     def list_payments(self, table: str, limit: int = 200) -> list[dict]:
         Model = self._model(table)
         rows = (
-            self.db.query(Model, WhatsAppClient.display_name, WhatsAppClient.uuid)
+            self.db.query(
+                Model,
+                WhatsAppClient.display_name,
+                WhatsAppClient.uuid,
+                WhatsAppOperation.status,
+            )
             .outerjoin(WhatsAppClient, WhatsAppClient.phone == Model.client_phone)
+            .outerjoin(WhatsAppOperation, WhatsAppOperation.id == Model.whatsapp_operation_id)
             .order_by(Model.created_at.desc())
             .limit(limit)
             .all()
         )
         out = []
-        for payment, display_name, client_uuid in rows:
+        for payment, display_name, client_uuid, op_status in rows:
             d = payment.dict()
             d["client_name"] = display_name
             d["client_uuid"] = str(client_uuid) if client_uuid else None
+            d["operation_status"] = op_status.value if op_status else None
             out.append(d)
         return out
 

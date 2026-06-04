@@ -1,6 +1,7 @@
 import enum
 import uuid as _uuid
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Text, Enum as SQLEnum, UniqueConstraint
+from sqlalchemy.types import TypeDecorator
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from app.database.connection import Base
@@ -12,6 +13,32 @@ class FundMovementType(enum.Enum):
     EXCHANGE   = "EXCHANGE"    # Cambio gestionado: gestor envía USD al cliente, sale del fondo
     PERSONAL   = "PERSONAL"    # Gasto personal del gestor con fondos del fondo (queda como deuda)
     ADJUSTMENT = "ADJUSTMENT"  # Corrección manual
+
+
+class CaseInsensitiveEnum(TypeDecorator):
+    """Enum respaldado por VARCHAR, tolerante a mayúsc/minúsc al leer y que normaliza a
+    MAYÚSCULA al escribir. La columna `fund_movements.movement_type` ya es varchar y tuvo
+    data legacy en minúscula ('deposit'); con esto una sola fila con caso raro no vuelve a
+    tumbar la query entera con LookupError, y las escrituras quedan consistentes en mayúscula.
+    """
+    impl = String(20)
+    cache_ok = True
+
+    def __init__(self, enum_cls, *args, **kwargs):
+        self._enum_cls = enum_cls
+        super().__init__(*args, **kwargs)
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, self._enum_cls):
+            return value.value.upper()
+        return str(value).upper()
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        return self._enum_cls(value.upper())
 
 
 class FundGroup(UUIDMixin, Base):
@@ -118,7 +145,7 @@ class FundMovement(UUIDMixin, Base):
     group_id = Column(Integer, ForeignKey("fund_groups.id"), nullable=False, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
 
-    movement_type = Column(SQLEnum(FundMovementType), nullable=False, index=True)
+    movement_type = Column(CaseInsensitiveEnum(FundMovementType), nullable=False, index=True)
     amount = Column(Float, nullable=False)          # Siempre positivo; el tipo determina signo
     currency = Column(String(10), nullable=False)
 

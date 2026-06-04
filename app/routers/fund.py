@@ -261,7 +261,13 @@ async def create_movement(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
         transaction_id = tx.id
 
-    movement_type = FundMovementType(movement_data.movement_type)
+    try:
+        movement_type = FundMovementType(movement_data.movement_type.upper())
+    except (ValueError, AttributeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid movement_type '{movement_data.movement_type}'. Valid: DEPOSIT, EXCHANGE, PERSONAL, ADJUSTMENT",
+        )
 
     movement = fund_repo.create_movement(
         group_id=group.id,

@@ -26,6 +26,10 @@ class UserUpdate(BaseModel):
     is_fund_manager: Optional[bool] = None
 
 class UserResponse(UserBase):
+    # Output-only: no validar el email con EmailStr. Cuentas de servicio internas usan TLDs
+    # reservados (ej. el bot: bot@tasas.local) que el validador de EmailStr rechaza, lo que
+    # tumbaba GET /users entero. La validación estricta se mantiene en UserCreate/UserUpdate.
+    email: str
     uuid: UUID
     role: Optional[str] = None
     role_display: Optional[str] = None

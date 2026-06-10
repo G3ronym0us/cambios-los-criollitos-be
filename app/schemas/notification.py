@@ -22,3 +22,21 @@ class RateAlertOut(BaseModel):
 class RateAlertList(BaseModel):
     alerts: List[RateAlertOut]
     total: int
+
+
+class PushKeys(BaseModel):
+    p256dh: str
+    auth: str
+
+
+class PushSubscriptionIn(BaseModel):
+    endpoint: str
+    keys: PushKeys
+
+
+class PushUnsubscribeIn(BaseModel):
+    endpoint: str
+
+
+class PushPublicKeyOut(BaseModel):
+    public_key: str

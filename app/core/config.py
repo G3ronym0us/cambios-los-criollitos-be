@@ -113,6 +113,14 @@ class Settings(BaseSettings):
     # =================
     BOT_API_KEY: Optional[str] = None              # Token compartido bot ↔ backend
     BOT_SERVICE_USER_EMAIL: Optional[str] = None   # User existente que el bot "encarna"
+    BOT_NOTIFY_URL: Optional[str] = None           # Base URL del dashboard del bot (ej. http://localhost:3457) para avisos al operador
+
+    # =================
+    # WEB PUSH (VAPID)
+    # =================
+    VAPID_PRIVATE_KEY: Optional[str] = None        # Clave privada raw base64url (py_vapid)
+    VAPID_PUBLIC_KEY: Optional[str] = None         # Clave pública uncompressed point base64url
+    VAPID_CLAIMS_SUB: str = "mailto:admin@example.com"
 
     # =================
     # COOKIE

@@ -12,6 +12,8 @@ services:
       - REDIS_URL=redis://redis:6379/0
     volumes:
       - .:/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - db
       - redis
@@ -50,6 +52,8 @@ services:
       - REDIS_URL=redis://redis:6379/0
     volumes:
       - .:/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - db
       - redis

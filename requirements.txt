@@ -50,3 +50,4 @@ python-decouple==3.8
 pydantic[email]==2.5.0
 email-validator==2.1.0
 
+pywebpush==2.3.0

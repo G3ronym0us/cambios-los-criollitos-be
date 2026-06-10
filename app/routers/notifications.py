@@ -10,7 +10,15 @@ from app.core.dependencies import get_current_active_user, get_moderator_user
 from app.database.connection import get_db
 from app.models.user import User
 from app.repositories.rate_alert_repository import RateAlertRepository
-from app.schemas.notification import RateAlertOut, RateAlertList
+from app.repositories.push_subscription_repository import PushSubscriptionRepository
+from app.schemas.notification import (
+    RateAlertOut,
+    RateAlertList,
+    PushSubscriptionIn,
+    PushUnsubscribeIn,
+    PushPublicKeyOut,
+)
+from app.services import web_push_service
 from app.core.redis_pubsub import RATE_ALERTS_CHANNEL
 
 import redis.asyncio as aioredis
@@ -86,3 +94,61 @@ def acknowledge_alert(
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
     return alert
+
+
+# ── Web Push ──────────────────────────────────────────────────────────────────
+
+
+@router.get("/push/public-key", response_model=PushPublicKeyOut)
+def get_push_public_key(
+    current_user: User = Depends(get_moderator_user),
+):
+    """VAPID public key que el navegador necesita para suscribirse."""
+    if not web_push_service.is_configured():
+        raise HTTPException(status_code=503, detail="Web push no configurado (VAPID keys)")
+    return PushPublicKeyOut(public_key=settings.VAPID_PUBLIC_KEY)
+
+
+@router.post("/push/subscribe")
+def push_subscribe(
+    subscription: PushSubscriptionIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """Registra (o actualiza) la suscripción push de este dispositivo."""
+    repo = PushSubscriptionRepository(db)
+    repo.upsert(
+        user_id=current_user.id,
+        endpoint=subscription.endpoint,
+        p256dh=subscription.keys.p256dh,
+        auth=subscription.keys.auth,
+    )
+    return {"ok": True}
+
+
+@router.post("/push/unsubscribe")
+def push_unsubscribe(
+    body: PushUnsubscribeIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """Elimina la suscripción push de este dispositivo."""
+    repo = PushSubscriptionRepository(db)
+    deleted = repo.delete_by_endpoint(body.endpoint)
+    return {"ok": True, "deleted": deleted}
+
+
+@router.post("/push/test")
+def push_test(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """Envía una notificación de prueba a los dispositivos del usuario actual."""
+    repo = PushSubscriptionRepository(db)
+    subs = repo.get_by_user(current_user.id)
+    if not subs:
+        raise HTTPException(status_code=404, detail="No hay suscripciones para este usuario")
+    sent = web_push_service.send_to_subscriptions(
+        db, subs, "🔔 Prueba", "Las notificaciones push están funcionando."
+    )
+    return {"ok": True, "sent": sent}

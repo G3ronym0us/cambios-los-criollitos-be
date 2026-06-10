@@ -14,9 +14,10 @@ from .whatsapp_operation import (
 )
 from .bcv_rate import BcvRate
 from .whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
+from .push_subscription import PushSubscription
 
 __all__ = ["User", "ExchangeRate", "Transaction", "Currency", "CurrencyPair",
            "FundGroup", "FundGroupMember", "FundMovement", "RateAlert",
            "WhatsAppClient", "WhatsAppOperation", "WhatsAppOperationStatus",
            "WhatsAppAmountSide", "WhatsAppDeliveryStatus", "BcvRate",
-           "WhatsAppIncomingPayment", "WhatsAppOutgoingPayment"]
+           "WhatsAppIncomingPayment", "WhatsAppOutgoingPayment", "PushSubscription"]

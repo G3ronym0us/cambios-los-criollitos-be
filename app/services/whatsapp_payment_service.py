@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 from uuid import UUID
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.models.whatsapp_client import WhatsAppClient
@@ -105,9 +106,9 @@ class WhatsAppPaymentService:
         self.db.refresh(row)
         return self._with_name(row)
 
-    def list_payments(self, table: str, limit: int = 200) -> list[dict]:
-        Model = self._model(table)
-        rows = (
+    def _payments_base_query(self, Model):
+        """Query base con joins a cliente (display_name/uuid) y a la op (status)."""
+        return (
             self.db.query(
                 Model,
                 WhatsAppClient.display_name,
@@ -116,18 +117,66 @@ class WhatsAppPaymentService:
             )
             .outerjoin(WhatsAppClient, WhatsAppClient.phone == Model.client_phone)
             .outerjoin(WhatsAppOperation, WhatsAppOperation.id == Model.whatsapp_operation_id)
-            .order_by(Model.created_at.desc())
-            .limit(limit)
-            .all()
         )
-        out = []
-        for payment, display_name, client_uuid, op_status in rows:
-            d = payment.dict()
-            d["client_name"] = display_name
-            d["client_uuid"] = str(client_uuid) if client_uuid else None
-            d["operation_status"] = op_status.value if op_status else None
-            out.append(d)
-        return out
+
+    @staticmethod
+    def _row_to_dict(payment, display_name, client_uuid, op_status) -> dict:
+        d = payment.dict()
+        d["client_name"] = display_name
+        d["client_uuid"] = str(client_uuid) if client_uuid else None
+        d["operation_status"] = op_status.value if op_status else None
+        return d
+
+    def list_payments(self, table: str, limit: int = 200) -> list[dict]:
+        """Lista simple (sin paginar). La usa el bot vía /whatsapp/payments/{table}."""
+        Model = self._model(table)
+        rows = self._payments_base_query(Model).order_by(Model.created_at.desc()).limit(limit).all()
+        return [self._row_to_dict(*r) for r in rows]
+
+    def list_payments_page(
+        self,
+        table: str,
+        limit: int = 50,
+        offset: int = 0,
+        search: Optional[str] = None,
+        out_class: str = "ALL",
+    ) -> dict:
+        """Página de pagos para el front: búsqueda + clasificación server-side. Devuelve {items, total}."""
+        Model = self._model(table)
+        q = self._payments_base_query(Model)
+
+        search = (search or "").strip()
+        if search:
+            like = f"%{search}%"
+            q = q.filter(
+                or_(
+                    WhatsAppClient.display_name.ilike(like),
+                    Model.client_phone.ilike(like),
+                    Model.bank_from.ilike(like),
+                    Model.bank_to.ilike(like),
+                    Model.reference.ilike(like),
+                    Model.provider.ilike(like),
+                )
+            )
+
+        # Clasificación solo aplica a salientes (las columnas existen únicamente ahí).
+        if table == "outgoing" and out_class and out_class != "ALL":
+            if out_class == "PERSONAL":
+                q = q.filter(Model.is_personal_expense.is_(True))
+            elif out_class == "IRRELEVANT":
+                q = q.filter(Model.is_irrelevant.is_(True))
+            elif out_class == "OPERATIONAL":
+                q = q.filter(Model.is_personal_expense.is_(False), Model.is_irrelevant.is_(False))
+            elif out_class == "UNLINKED":
+                q = q.filter(
+                    Model.is_personal_expense.is_(False),
+                    Model.is_irrelevant.is_(False),
+                    Model.whatsapp_operation_id.is_(None),
+                )
+
+        total = q.count()
+        rows = q.order_by(Model.created_at.desc()).limit(limit).offset(offset).all()
+        return {"items": [self._row_to_dict(*r) for r in rows], "total": total}
 
     # ---------- Editar (correction tracking) ----------
 

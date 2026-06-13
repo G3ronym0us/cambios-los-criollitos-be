@@ -29,14 +29,17 @@ router = APIRouter(prefix="/payments", tags=["Payments"])
 @router.get("/{table}")
 async def list_payments(
     table: Literal["incoming", "outgoing"],
-    limit: int = Query(300, ge=1, le=1000),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    search: str | None = Query(None),
+    out_class: str = Query("ALL"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Lista pagos entrantes o salientes del bot. Cualquier operador autenticado."""
+    """Página de pagos (paginada + búsqueda/clasificación server-side). Devuelve {items, total}."""
     service = WhatsAppPaymentService(db)
     try:
-        return service.list_payments(table, limit)
+        return service.list_payments_page(table, limit, offset, search, out_class)
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 

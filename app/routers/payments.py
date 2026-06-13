@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from app.core.dependencies import get_current_user
 from app.database.connection import get_db
 from app.models.user import User
-from app.schemas.whatsapp import WhatsAppPaymentLink
+from app.schemas.whatsapp import WhatsAppIrrelevant, WhatsAppPaymentLink, WhatsAppPersonalExpense
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
 from app.services.whatsapp_quote_service import QuoteServiceError
 
@@ -53,5 +53,39 @@ async def link_payment_operation(
     service = WhatsAppPaymentService(db)
     try:
         return service.set_operation(table, payment_id, payload.operation_uuid)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.patch("/outgoing/{payment_id}/personal-expense")
+async def mark_personal_expense(
+    payment_id: int,
+    payload: WhatsAppPersonalExpense,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Marca/desmarca un pago saliente como gasto personal (auto-desvincula la op). Operador JWT."""
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.set_personal_expense(
+            payment_id, payload.is_personal_expense, payload.personal_description
+        )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.patch("/outgoing/{payment_id}/irrelevant")
+async def mark_irrelevant(
+    payment_id: int,
+    payload: WhatsAppIrrelevant,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Marca/desmarca un pago saliente como irrelevante (auto-desvincula la op). Operador JWT."""
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.set_irrelevant(
+            payment_id, payload.is_irrelevant, payload.irrelevant_description
+        )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)

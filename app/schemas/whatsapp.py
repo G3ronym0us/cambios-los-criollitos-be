@@ -210,6 +210,7 @@ class WhatsAppPersonalExpense(BaseModel):
 
 class WhatsAppIrrelevant(BaseModel):
     is_irrelevant: bool
+    irrelevant_description: Optional[str] = None
 
 
 class WhatsAppCreateOpFromPayment(BaseModel):
@@ -252,6 +253,7 @@ class WhatsAppOutgoingPaymentResponse(WhatsAppIncomingPaymentResponse):
     is_personal_expense: int = 0
     personal_description: Optional[str] = None
     is_irrelevant: int = 0
+    irrelevant_description: Optional[str] = None
     source_payment_id: Optional[int] = None
 
 

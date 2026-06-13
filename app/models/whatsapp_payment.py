@@ -85,6 +85,7 @@ class WhatsAppOutgoingPayment(UUIDMixin, Base):
     is_personal_expense = Column(Boolean, nullable=False, server_default="false")
     personal_description = Column(Text, nullable=True)
     is_irrelevant = Column(Boolean, nullable=False, server_default="false")
+    irrelevant_description = Column(Text, nullable=True)
     # Cadena de reenvío: comprobante Zelle entrante reenviado al grupo de la cuenta alquilada.
     source_payment_id = Column(
         Integer, ForeignKey("whatsapp_incoming_payments.id", ondelete="SET NULL"), nullable=True, index=True
@@ -114,6 +115,7 @@ class WhatsAppOutgoingPayment(UUIDMixin, Base):
             "is_personal_expense": 1 if self.is_personal_expense else 0,
             "personal_description": self.personal_description,
             "is_irrelevant": 1 if self.is_irrelevant else 0,
+            "irrelevant_description": self.irrelevant_description,
             "source_payment_id": self.source_payment_id,
             "corrected_at": self.corrected_at,
             "correction_original": self.correction_original,

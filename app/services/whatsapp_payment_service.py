@@ -183,11 +183,14 @@ class WhatsAppPaymentService:
         self.db.refresh(row)
         return self._with_name(row)
 
-    def set_irrelevant(self, payment_id: int, is_irrelevant: bool) -> dict:
+    def set_irrelevant(self, payment_id: int, is_irrelevant: bool, description: Optional[str] = None) -> dict:
         row = self._get_or_404("outgoing", payment_id)
         row.is_irrelevant = is_irrelevant
         if is_irrelevant:
+            row.irrelevant_description = description
             row.whatsapp_operation_id = None
+        else:
+            row.irrelevant_description = None
         self.db.commit()
         self.db.refresh(row)
         return self._with_name(row)

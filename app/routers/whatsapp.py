@@ -384,7 +384,7 @@ def set_irrelevant(
 ):
     service = WhatsAppPaymentService(db)
     try:
-        return service.set_irrelevant(payment_id, payload.is_irrelevant)
+        return service.set_irrelevant(payment_id, payload.is_irrelevant, payload.irrelevant_description)
     except QuoteServiceError as exc:
         _handle_service_error(exc)
 

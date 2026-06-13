@@ -22,8 +22,11 @@ from app.models.whatsapp_operation import (
     WhatsAppOperation,
     WhatsAppOperationStatus,
 )
+from app.models.fund import FundGroup, FundMovement, FundMovementType
+from app.models.user import User
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from app.repositories.currency_pair_repository import CurrencyPairRepository
+from app.repositories.fund_repository import FundRepository
 from app.services.whatsapp_quote_service import QuoteServiceError, WhatsAppQuoteService
 
 
@@ -176,7 +179,32 @@ class WhatsAppPaymentService:
 
         total = q.count()
         rows = q.order_by(Model.created_at.desc()).limit(limit).offset(offset).all()
-        return {"items": [self._row_to_dict(*r) for r in rows], "total": total}
+        items = [self._row_to_dict(*r) for r in rows]
+        if table == "incoming" and items:
+            self._attach_deposits(items)
+        return {"items": items, "total": total}
+
+    def _attach_deposits(self, items: list[dict]) -> None:
+        """Agrega a cada pago entrante un bloque `deposit` (o None) si tiene un FundMovement asociado."""
+        ids = [it["id"] for it in items]
+        rows = (
+            self.db.query(FundMovement, FundGroup.name)
+            .outerjoin(FundGroup, FundGroup.id == FundMovement.group_id)
+            .filter(FundMovement.incoming_payment_id.in_(ids))
+            .all()
+        )
+        by_payment = {
+            mv.incoming_payment_id: {
+                "uuid": mv.uuid,
+                "method": mv.deposit_method,
+                "amount": mv.amount,
+                "currency": mv.currency,
+                "group_name": group_name,
+            }
+            for mv, group_name in rows
+        }
+        for it in items:
+            it["deposit"] = by_payment.get(it["id"])
 
     # ---------- Editar (correction tracking) ----------
 
@@ -243,6 +271,53 @@ class WhatsAppPaymentService:
         self.db.commit()
         self.db.refresh(row)
         return self._with_name(row)
+
+    # ---------- Depósito a fondo desde pago entrante ----------
+
+    def create_deposit_from_payment(
+        self,
+        payment_id: int,
+        group_uuid: UUID,
+        user_uuid: UUID,
+        amount: float,
+        currency: str,
+        deposit_method: str,
+        reference: Optional[str] = None,
+        notes: Optional[str] = None,
+        recorded_by_user_id: Optional[int] = None,
+    ) -> dict:
+        """Registra un pago ENTRANTE como depósito (FundMovement DEPOSIT) a un fondo."""
+        row = self._get_or_404("incoming", payment_id)
+
+        group = self.db.query(FundGroup).filter(FundGroup.uuid == str(group_uuid)).first()
+        if group is None:
+            raise QuoteServiceError("fund_group_not_found", f"Fondo {group_uuid} no encontrado", 404)
+
+        user = self.db.query(User).filter(User.uuid == user_uuid).first()
+        if user is None:
+            raise QuoteServiceError("user_not_found", f"Usuario {user_uuid} no encontrado", 404)
+
+        if amount is None or amount <= 0:
+            raise QuoteServiceError("invalid_amount", "El monto debe ser > 0", 400)
+
+        FundRepository(self.db).create_movement(
+            group_id=group.id,
+            user_id=user.id,
+            movement_type=FundMovementType.DEPOSIT,
+            amount=amount,
+            currency=currency,
+            movement_date=datetime.utcnow(),
+            reference=reference,
+            notes=notes,
+            recorded_by_user_id=recorded_by_user_id,
+            deposit_method=deposit_method,
+            incoming_payment_id=row.id,
+        )
+
+        # Devolver el pago con el bloque `deposit` ya adjunto.
+        d = self._with_name(row)
+        self._attach_deposits([d])
+        return d
 
     # ---------- Crear operación desde pago ----------
 

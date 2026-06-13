@@ -19,7 +19,12 @@ from sqlalchemy.orm import Session
 from app.core.dependencies import get_current_user
 from app.database.connection import get_db
 from app.models.user import User
-from app.schemas.whatsapp import WhatsAppIrrelevant, WhatsAppPaymentLink, WhatsAppPersonalExpense
+from app.schemas.whatsapp import (
+    WhatsAppIrrelevant,
+    WhatsAppPaymentDeposit,
+    WhatsAppPaymentLink,
+    WhatsAppPersonalExpense,
+)
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
 from app.services.whatsapp_quote_service import QuoteServiceError
 
@@ -89,6 +94,31 @@ async def mark_irrelevant(
     try:
         return service.set_irrelevant(
             payment_id, payload.is_irrelevant, payload.irrelevant_description
+        )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.post("/incoming/{payment_id}/deposit")
+async def register_payment_deposit(
+    payment_id: int,
+    payload: WhatsAppPaymentDeposit,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Registra un pago entrante como depósito (FundMovement DEPOSIT) a un fondo. Operador JWT."""
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.create_deposit_from_payment(
+            payment_id,
+            payload.group_uuid,
+            payload.user_uuid,
+            payload.amount,
+            payload.currency,
+            payload.deposit_method,
+            payload.reference,
+            payload.notes,
+            recorded_by_user_id=current_user.id,
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)

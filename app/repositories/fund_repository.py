@@ -120,6 +120,8 @@ class FundRepository:
         reference: Optional[str] = None,
         notes: Optional[str] = None,
         recorded_by_user_id: Optional[int] = None,
+        deposit_method: Optional[str] = None,
+        incoming_payment_id: Optional[int] = None,
     ) -> FundMovement:
         movement = FundMovement(
             group_id=group_id,
@@ -134,6 +136,8 @@ class FundRepository:
             notes=notes,
             recorded_by_user_id=recorded_by_user_id,
             movement_date=movement_date,
+            deposit_method=deposit_method,
+            incoming_payment_id=incoming_payment_id,
         )
         self.db.add(movement)
         self.db.commit()

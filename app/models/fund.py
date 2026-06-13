@@ -15,6 +15,15 @@ class FundMovementType(enum.Enum):
     ADJUSTMENT = "ADJUSTMENT"  # Corrección manual
 
 
+class FundDepositMethod(enum.Enum):
+    """Origen/método de un depósito al fondo. Se guarda como string en fund_movements.deposit_method."""
+    ZELLE    = "ZELLE"
+    BINANCE  = "BINANCE"
+    KRAKEN   = "KRAKEN"
+    TRANSFER = "TRANSFER"
+    OTHER    = "OTHER"
+
+
 class CaseInsensitiveEnum(TypeDecorator):
     """Enum respaldado por VARCHAR, tolerante a mayúsc/minúsc al leer y que normaliza a
     MAYÚSCULA al escribir. La columna `fund_movements.movement_type` ya es varchar y tuvo
@@ -158,6 +167,16 @@ class FundMovement(UUIDMixin, Base):
     reference = Column(String(200), nullable=True)  # Hash Binance/Kraken, ID externo, etc.
     notes = Column(Text, nullable=True)
 
+    # Solo para DEPOSIT: método/origen (ZELLE/BINANCE/KRAKEN/TRANSFER/OTHER) y el pago entrante
+    # (comprobante OCR) desde el que se registró el depósito.
+    deposit_method = Column(String(20), nullable=True)
+    incoming_payment_id = Column(
+        Integer,
+        ForeignKey("whatsapp_incoming_payments.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     recorded_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     movement_date = Column(DateTime(timezone=True), nullable=False, index=True)
 
@@ -188,6 +207,8 @@ class FundMovement(UUIDMixin, Base):
             "transaction_uuid": self.transaction.uuid if self.transaction else None,
             "reference": self.reference,
             "notes": self.notes,
+            "deposit_method": self.deposit_method,
+            "incoming_payment_id": self.incoming_payment_id,
             "recorded_by_uuid": self.recorded_by.uuid if self.recorded_by else None,
             "recorded_by_username": self.recorded_by.username if self.recorded_by else None,
             "movement_date": self.movement_date,

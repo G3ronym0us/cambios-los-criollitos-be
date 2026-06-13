@@ -243,6 +243,28 @@ class WhatsAppCreateOpFromPayment(BaseModel):
         return v.upper()
 
 
+class WhatsAppCreateOpManual(BaseModel):
+    """Crear operación a mano desde un pago (operador). Soporta dirección y fondo (+EXCHANGE)."""
+    from_currency: str = Field(..., min_length=2, max_length=10)
+    to_currency: str = Field(..., min_length=2, max_length=10)
+    from_amount: float = Field(..., gt=0)
+    to_amount: float = Field(..., gt=0)
+    amount_side: str = "SEND"
+    fund_group_uuid: Optional[UUID] = None
+    exchange_user_uuid: Optional[UUID] = None
+
+    @validator('from_currency', 'to_currency')
+    def upper_currency(cls, v: str) -> str:
+        return v.upper()
+
+    @validator('amount_side')
+    def validate_side(cls, v: str) -> str:
+        v_up = v.upper()
+        if v_up not in {"SEND", "RECEIVE"}:
+            raise ValueError("amount_side must be SEND or RECEIVE")
+        return v_up
+
+
 class WhatsAppIncomingPaymentResponse(BaseModel):
     id: int
     uuid: UUID

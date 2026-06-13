@@ -20,6 +20,7 @@ from app.core.dependencies import get_current_user
 from app.database.connection import get_db
 from app.models.user import User
 from app.schemas.whatsapp import (
+    WhatsAppCreateOpManual,
     WhatsAppIrrelevant,
     WhatsAppPaymentDeposit,
     WhatsAppPaymentLink,
@@ -94,6 +95,33 @@ async def mark_irrelevant(
     try:
         return service.set_irrelevant(
             payment_id, payload.is_irrelevant, payload.irrelevant_description
+        )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.post("/{table}/{payment_id}/create-operation")
+async def create_operation_from_payment(
+    table: Literal["incoming", "outgoing"],
+    payment_id: int,
+    payload: WhatsAppCreateOpManual,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Crea una operación a mano desde un pago y lo vincula. Soporta fondo (+EXCHANGE). Operador JWT."""
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.create_operation_from_payment(
+            table,
+            payment_id,
+            payload.from_currency,
+            payload.to_currency,
+            payload.from_amount,
+            payload.to_amount,
+            amount_side=payload.amount_side,
+            fund_group_uuid=payload.fund_group_uuid,
+            exchange_user_uuid=payload.exchange_user_uuid,
+            recorded_by_user_id=current_user.id,
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)

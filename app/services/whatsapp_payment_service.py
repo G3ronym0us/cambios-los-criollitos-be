@@ -324,10 +324,19 @@ class WhatsAppPaymentService:
     def create_operation_from_payment(
         self, table: str, payment_id: int, from_currency: str, to_currency: str,
         from_amount: float, to_amount: float,
+        amount_side: str = "SEND",
+        fund_group_uuid: Optional[UUID] = None,
+        exchange_user_uuid: Optional[UUID] = None,
+        recorded_by_user_id: Optional[int] = None,
     ) -> dict:
         row = self._get_or_404(table, payment_id)
         if from_amount <= 0 or to_amount <= 0:
             raise QuoteServiceError("invalid_amount", "Montos deben ser > 0", 400)
+
+        try:
+            side = WhatsAppAmountSide(amount_side)
+        except ValueError:
+            raise QuoteServiceError("invalid_amount_side", f"amount_side inválido: {amount_side}", 400)
 
         pair_symbol = f"{from_currency}-{to_currency}"
         pair = self.pair_repo.get_by_symbol(pair_symbol)
@@ -335,6 +344,13 @@ class WhatsAppPaymentService:
             pair = self.pair_repo.get_by_symbol(f"{to_currency}-{from_currency}")
         if pair is None:
             raise QuoteServiceError("pair_not_found", f"No existe currency pair para {from_currency}/{to_currency}", 404)
+
+        # Fondo opcional (etiqueta + movimiento EXCHANGE). Resolver antes de crear la op.
+        group = None
+        if fund_group_uuid is not None:
+            group = self.db.query(FundGroup).filter(FundGroup.uuid == str(fund_group_uuid)).first()
+            if group is None:
+                raise QuoteServiceError("fund_group_not_found", f"Fondo {fund_group_uuid} no encontrado", 404)
 
         quote_svc = WhatsAppQuoteService(self.db)
         client = quote_svc.upsert_client(row.client_phone)
@@ -348,9 +364,10 @@ class WhatsAppPaymentService:
             to_amount=to_amount,
             rate_used=to_amount / from_amount,
             inverse_percentage=False,
-            amount_side=WhatsAppAmountSide.SEND,
+            amount_side=side,
             status=WhatsAppOperationStatus.PENDING,
             delivery_status=WhatsAppDeliveryStatus.PENDING if track_delivery else None,
+            fund_group_id=group.id if group else None,
             quoted_at=now,
             expires_at=now + timedelta(minutes=QUOTE_TTL_MINUTES),
             approved_at=now,
@@ -358,6 +375,35 @@ class WhatsAppPaymentService:
         self.db.add(op)
         self.db.flush()
         row.whatsapp_operation_id = op.id
+
+        # Salida con fondo: registrar el EXCHANGE (sale plata del fondo) por el lado de la op
+        # cuya moneda coincide con la moneda base del fondo.
+        if group is not None:
+            exchange_user_id = recorded_by_user_id
+            if exchange_user_uuid is not None:
+                user = self.db.query(User).filter(User.uuid == exchange_user_uuid).first()
+                if user is None:
+                    raise QuoteServiceError("user_not_found", f"Usuario {exchange_user_uuid} no encontrado", 404)
+                exchange_user_id = user.id
+            if exchange_user_id is None:
+                raise QuoteServiceError("exchange_user_required", "Falta el gestor del movimiento EXCHANGE", 400)
+
+            base = (group.currency or "").upper()
+            if base == from_currency.upper():
+                mv_amount, mv_currency = from_amount, from_currency
+            else:
+                mv_amount, mv_currency = to_amount, to_currency
+
+            FundRepository(self.db).create_movement(
+                group_id=group.id,
+                user_id=exchange_user_id,
+                movement_type=FundMovementType.EXCHANGE,
+                amount=mv_amount,
+                currency=mv_currency,
+                movement_date=now,
+                recorded_by_user_id=recorded_by_user_id,
+            )
+
         self.db.commit()
         self.db.refresh(op)
         return op.dict()

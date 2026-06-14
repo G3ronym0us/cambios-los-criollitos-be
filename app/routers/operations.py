@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from app.core.dependencies import get_current_user
 from app.database.connection import get_db
 from app.models.user import User
+from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from app.schemas.whatsapp import (
     WhatsAppOperationList,
     WhatsAppOperationResponse,
@@ -53,7 +54,28 @@ async def list_operations(
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
-    items = [WhatsAppOperationResponse.model_validate(op.dict()) for op in ops]
+
+    # Marca qué operaciones ya tienen un pago entrante/saliente vinculado, para que el
+    # selector de "vincular pago" pueda ocultar las que ya están tomadas de ese lado.
+    op_ids = [op.id for op in ops]
+    inc_taken: set[int] = set()
+    out_taken: set[int] = set()
+    if op_ids:
+        inc_taken = {
+            r[0] for r in db.query(WhatsAppIncomingPayment.whatsapp_operation_id)
+            .filter(WhatsAppIncomingPayment.whatsapp_operation_id.in_(op_ids)).distinct().all()
+        }
+        out_taken = {
+            r[0] for r in db.query(WhatsAppOutgoingPayment.whatsapp_operation_id)
+            .filter(WhatsAppOutgoingPayment.whatsapp_operation_id.in_(op_ids)).distinct().all()
+        }
+
+    items = []
+    for op in ops:
+        d = op.dict()
+        d["has_incoming_payment"] = op.id in inc_taken
+        d["has_outgoing_payment"] = op.id in out_taken
+        items.append(WhatsAppOperationResponse.model_validate(d))
     return WhatsAppOperationList(operations=items, total=len(items))
 
 

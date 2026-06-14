@@ -119,6 +119,9 @@ class WhatsAppOperationResponse(BaseModel):
     cancelled_at: Optional[datetime] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
+    # Marcas de vínculo con pagos (inyectadas por el router de operaciones).
+    has_incoming_payment: bool = False
+    has_outgoing_payment: bool = False
 
     class Config:
         from_attributes = True

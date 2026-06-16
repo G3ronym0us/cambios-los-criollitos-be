@@ -116,6 +116,14 @@ class Settings(BaseSettings):
     BOT_NOTIFY_URL: Optional[str] = None           # Base URL del dashboard del bot (ej. http://localhost:3457) para avisos al operador
 
     # =================
+    # ACTUALIZACIÓN EXTERNA DE TASAS (script del operador)
+    # =================
+    # Para monedas cuyo P2P no se puede leer desde el servidor (ej. BRL: Binance dejó
+    # de exponer anuncios USDT/BRL en su API pública global). Un script corre en la
+    # máquina del operador (en el país) y empuja la tasa con X-API-Key.
+    EXTERNAL_RATE_API_KEY: Optional[str] = None    # Token compartido script ↔ backend
+
+    # =================
     # WEB PUSH (VAPID)
     # =================
     VAPID_PRIVATE_KEY: Optional[str] = None        # Clave privada raw base64url (py_vapid)

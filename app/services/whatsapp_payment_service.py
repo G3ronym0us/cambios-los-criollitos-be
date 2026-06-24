@@ -27,6 +27,7 @@ from app.models.user import User
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.repositories.fund_repository import FundRepository
+from app.schemas.whatsapp import WhatsAppOperationComplete
 from app.services.whatsapp_quote_service import QuoteServiceError, WhatsAppQuoteService
 
 
@@ -494,6 +495,26 @@ class WhatsAppPaymentService:
                 movement_date=now,
                 recorded_by_user_id=recorded_by_user_id,
             )
+
+        # Completar directo salvo entrega física de USD: en una venta de USD físico (from=USD)
+        # el cliente queda pendiente de entregar el efectivo, así que la op se queda en PENDING
+        # (delivery). El resto (ZELLE-VES, PayPal, etc.) se completa al instante y genera su
+        # Transaction. El movimiento EXCHANGE del fondo ya se registró arriba; la Transaction es
+        # solo el registro contable/ganancia (no toca fondos), por eso no hay doble conteo.
+        if from_currency.upper() != "USD":
+            completing_user = (
+                self.db.query(User).filter(User.id == recorded_by_user_id).first()
+                if recorded_by_user_id
+                else None
+            )
+            if completing_user is None:
+                raise QuoteServiceError(
+                    "complete_user_required", "Falta el usuario que completa la operación", 400
+                )
+            tx = quote_svc._create_transaction_for_op(op, WhatsAppOperationComplete(), completing_user)
+            op.status = WhatsAppOperationStatus.COMPLETED
+            op.completed_at = now
+            op.transaction_id = tx.id
 
         self.db.commit()
         self.db.refresh(op)

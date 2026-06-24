@@ -10,11 +10,14 @@ from app.schemas.fund import (
     FundGroupMemberCreate, FundGroupMemberUpdate, FundGroupMemberResponse,
     FundMovementCreate, FundMovementResponse, FundMovementList,
     UserPositionResponse, FundGroupBalanceResponse,
+    FundPendingDepositResponse, FundPendingDepositConfirm,
 )
 from app.repositories.fund_repository import FundRepository
 from app.repositories.user_repository import UserRepository
 from app.models.fund import FundMovementType
 from app.models.user import User
+from app.services.fund_pending_deposit_service import FundPendingDepositService
+from app.services.whatsapp_quote_service import QuoteServiceError
 from app.core.dependencies import get_current_user, get_moderator_user, get_root_user
 
 router = APIRouter(prefix="/funds", tags=["Funds"])
@@ -313,6 +316,57 @@ async def delete_movement(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Movement not found")
 
     fund_repo.delete_movement(movement.id)
+
+
+# ===== Pending deposits (detectados por el bot, confirmables aquí) =====
+
+@router.get("/pending-deposits", response_model=List[FundPendingDepositResponse])
+async def list_pending_deposits(
+    status_filter: str = Query("PENDING", alias="status", description="PENDING | CONFIRMED | REJECTED | ALL"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """Lista los depósitos detectados por el bot pendientes de confirmar."""
+    try:
+        return FundPendingDepositService(db).list_pending(status_filter)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.post("/pending-deposits/{deposit_uuid}/confirm", response_model=FundPendingDepositResponse)
+async def confirm_pending_deposit(
+    deposit_uuid: UUID,
+    payload: FundPendingDepositConfirm,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """Confirma un depósito pendiente → crea el FundMovement DEPOSIT."""
+    try:
+        return FundPendingDepositService(db).confirm(
+            deposit_uuid,
+            deposit_method=payload.deposit_method,
+            recorded_by_user_id=current_user.id,
+            amount=payload.amount,
+            currency=payload.currency,
+            user_uuid=payload.user_uuid,
+            reference=payload.reference,
+            notes=payload.notes,
+        )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.post("/pending-deposits/{deposit_uuid}/reject", response_model=FundPendingDepositResponse)
+async def reject_pending_deposit(
+    deposit_uuid: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """Descarta un depósito pendiente sin crear movimiento."""
+    try:
+        return FundPendingDepositService(db).reject(deposit_uuid, current_user.id)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
 
 # ===== User position =====

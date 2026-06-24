@@ -36,11 +36,17 @@ class WhatsAppIncomingPayment(UUIDMixin, Base):
     whatsapp_operation_id = Column(
         Integer, ForeignKey("whatsapp_operations.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Grupo contable (FundGroup) donde se contabilizó este entrante al reenviarlo (escenario
+    # ZELLE_DIRECT). Reemplaza al antiguo "saliente fantasma" que duplicaba el comprobante.
+    fund_group_id = Column(
+        Integer, ForeignKey("fund_groups.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     corrected_at = Column(DateTime(timezone=True), nullable=True)
     correction_original = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     operation = relationship("WhatsAppOperation", foreign_keys=[whatsapp_operation_id])
+    fund_group = relationship("FundGroup", foreign_keys=[fund_group_id])
 
     def dict(self):
         return {
@@ -58,6 +64,8 @@ class WhatsAppIncomingPayment(UUIDMixin, Base):
             "reference": self.reference,
             "raw_text": self.raw_text,
             "operation_uuid": self.operation.uuid if self.operation else None,
+            "fund_group_uuid": self.fund_group.uuid if self.fund_group else None,
+            "fund_group_name": self.fund_group.name if self.fund_group else None,
             "corrected_at": self.corrected_at,
             "correction_original": self.correction_original,
             "created_at": self.created_at,

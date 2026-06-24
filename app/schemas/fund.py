@@ -150,3 +150,40 @@ class FundMovementList(BaseModel):
     page: int
     per_page: int
     total_pages: int
+
+
+# ===== Pending Deposits (detectados por el bot, confirmables desde /admin/funds) =====
+
+class FundPendingDepositResponse(BaseModel):
+    uuid: UUID
+    group_uuid: Optional[UUID] = None
+    group_name: Optional[str] = None
+    detected_user_uuid: Optional[UUID] = None
+    detected_username: Optional[str] = None
+    amount: Optional[float] = None
+    currency: Optional[str] = None
+    provider: Optional[str] = None
+    reference: Optional[str] = None
+    raw_text: Optional[str] = None
+    status: str
+    confirmed_movement_uuid: Optional[UUID] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class FundPendingDepositConfirm(BaseModel):
+    """Confirmar un depósito pendiente → crea un FundMovement DEPOSIT."""
+    deposit_method: str = Field("ZELLE", description="ZELLE | BINANCE | KRAKEN | TRANSFER | OTHER")
+    amount: Optional[float] = Field(None, gt=0)       # override del monto detectado
+    currency: Optional[str] = None                    # override de la moneda detectada
+    user_uuid: Optional[UUID] = None                  # depositante (default: gestor detectado)
+    reference: Optional[str] = None
+    notes: Optional[str] = None
+
+    @validator('deposit_method')
+    def validate_method(cls, v: str) -> str:
+        allowed = {"ZELLE", "BINANCE", "KRAKEN", "TRANSFER", "OTHER"}
+        v_up = v.upper()
+        if v_up not in allowed:
+            raise ValueError(f"deposit_method must be one of: {', '.join(sorted(allowed))}")
+        return v_up

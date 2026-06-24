@@ -19,6 +19,7 @@ from app.schemas.whatsapp import (
     WhatsAppClientResponse,
     WhatsAppClientUpsert,
     WhatsAppCreateOpFromPayment,
+    WhatsAppForwardToGroup,
     WhatsAppIrrelevant,
     WhatsAppOperationApprove,
     WhatsAppOperationCancel,
@@ -31,12 +32,14 @@ from app.schemas.whatsapp import (
     WhatsAppPartnerList,
     WhatsAppPartnerResponse,
     WhatsAppPaymentCreate,
+    WhatsAppPendingDepositCreate,
     WhatsAppPaymentLink,
     WhatsAppPaymentUpdate,
     WhatsAppPersonalExpense,
     WhatsAppStatsResponse,
 )
 from app.services.bcv_service import fetch_bcv_rate, get_cached_bcv_rate
+from app.services.fund_pending_deposit_service import FundPendingDepositService
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
 from app.services.whatsapp_quote_service import QuoteServiceError, WhatsAppQuoteService
 
@@ -361,6 +364,21 @@ def create_operation_from_payment(
         _handle_service_error(exc)
 
 
+@router.patch("/payments/incoming/{payment_id}/forward-to-group")
+def forward_incoming_to_group(
+    payment_id: int,
+    payload: WhatsAppForwardToGroup,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    """Marca un pago entrante como contabilizado en un grupo (ZELLE_DIRECT). No crea saliente."""
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.mark_incoming_forwarded_to_group(payment_id, payload.group_jid, payload.group_uuid)
+    except QuoteServiceError as exc:
+        _handle_service_error(exc)
+
+
 @router.patch("/payments/outgoing/{payment_id}/personal-expense")
 def set_personal_expense(
     payment_id: int,
@@ -385,6 +403,30 @@ def set_irrelevant(
     service = WhatsAppPaymentService(db)
     try:
         return service.set_irrelevant(payment_id, payload.is_irrelevant, payload.irrelevant_description)
+    except QuoteServiceError as exc:
+        _handle_service_error(exc)
+
+
+# ---------- Depósitos pendientes (detectados por el bot en el grupo) ----------
+
+@router.post("/pending-deposits", status_code=status.HTTP_201_CREATED)
+def create_pending_deposit(
+    payload: WhatsAppPendingDepositCreate,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    """Un gestor subió un comprobante al grupo → crea un depósito PENDING (confirmable en /admin/funds)."""
+    service = FundPendingDepositService(db)
+    try:
+        return service.create_pending(
+            group_jid=payload.group_jid,
+            detected_phone=payload.detected_phone,
+            amount=payload.amount,
+            currency=payload.currency,
+            provider=payload.provider,
+            reference=payload.reference,
+            raw_text=payload.raw_text,
+        )
     except QuoteServiceError as exc:
         _handle_service_error(exc)
 

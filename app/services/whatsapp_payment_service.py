@@ -272,6 +272,32 @@ class WhatsAppPaymentService:
         self.db.refresh(row)
         return self._with_name(row)
 
+    def mark_incoming_forwarded_to_group(
+        self,
+        payment_id: int,
+        group_jid: Optional[str] = None,
+        group_uuid: Optional[UUID] = None,
+    ) -> dict:
+        """
+        Marca un pago ENTRANTE como contabilizado en un grupo (FundGroup), al reenviarlo
+        el operador al grupo (escenario ZELLE_DIRECT). Resuelve el grupo por su JID de
+        WhatsApp (`whatsapp_group_jid`) o por uuid. No crea ningún saliente.
+        """
+        row = self._get_or_404("incoming", payment_id)
+        group = None
+        if group_uuid is not None:
+            group = self.db.query(FundGroup).filter(FundGroup.uuid == str(group_uuid)).first()
+        elif group_jid:
+            group = self.db.query(FundGroup).filter(FundGroup.whatsapp_group_jid == group_jid).first()
+        if group is None:
+            raise QuoteServiceError(
+                "fund_group_not_found", f"Fondo para grupo {group_uuid or group_jid} no encontrado", 404
+            )
+        row.fund_group_id = group.id
+        self.db.commit()
+        self.db.refresh(row)
+        return self._with_name(row)
+
     # ---------- Depósito a fondo desde pago entrante ----------
 
     def create_deposit_from_payment(

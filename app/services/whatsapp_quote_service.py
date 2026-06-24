@@ -455,6 +455,19 @@ class WhatsAppQuoteService:
                 raise QuoteServiceError("user_not_found", "Usuario receptor no encontrado", 404)
             op.received_by_user_id = user.id
 
+        # Cliente anónimo: en VIA_PARTNER el "cliente" no debe ser el socio/gestor que reportó
+        # el cambio. Se reasigna la op a un cliente anónimo dedicado y determinístico por
+        # receptor del entrante (o grupo), para no atribuirle operaciones al número del socio.
+        if payload.anonymize_client:
+            key = op.received_by_user_id or op.fund_group_id or 0
+            label = "socio"
+            if op.received_by_user_id:
+                ru = self.db.query(User).filter(User.id == op.received_by_user_id).first()
+                if ru and ru.username:
+                    label = ru.username
+            anon = self.upsert_client(f"anon:partner:{key}", f"Anónimo (vía {label})")
+            op.client_id = anon.id
+
         self.db.commit()
         self.db.refresh(op)
         return op
@@ -496,6 +509,7 @@ class WhatsAppQuoteService:
                 "group_uuid": group.uuid if group else None,
                 "group_name": group.name if group else None,
                 "group_jid": group.whatsapp_group_jid if group else None,
+                "is_fund_manager": bool(m.is_fund_manager),
             })
         return result
 

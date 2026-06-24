@@ -215,3 +215,67 @@ class FundMovement(UUIDMixin, Base):
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+
+
+class FundPendingDepositStatus(enum.Enum):
+    PENDING   = "PENDING"
+    CONFIRMED = "CONFIRMED"
+    REJECTED  = "REJECTED"
+
+
+class FundPendingDeposit(UUIDMixin, Base):
+    """
+    Depósito DETECTADO por el bot cuando un gestor (FundGroupMember.is_fund_manager) sube un
+    comprobante al grupo. Queda PENDING hasta que un operador lo confirma/rechaza desde
+    `/admin/funds`. Al confirmar se crea un FundMovement DEPOSIT (`confirmed_movement_id`).
+    Tabla separada para no ensuciar el ledger (el balance solo cuenta FundMovement).
+    """
+    __tablename__ = "fund_pending_deposits"
+
+    uuid = Column(String(36), unique=True, nullable=False, default=lambda: str(_uuid.uuid4()), index=True)
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(Integer, ForeignKey("fund_groups.id", ondelete="CASCADE"), nullable=False, index=True)
+    # Gestor que subió el comprobante (autor del mensaje en el grupo). NULL si no se resolvió.
+    detected_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+
+    amount = Column(Float, nullable=True)
+    currency = Column(String(10), nullable=True)
+    provider = Column(String(60), nullable=True)
+    reference = Column(String(120), nullable=True)
+    raw_text = Column(Text, nullable=True)
+
+    status = Column(
+        SQLEnum(FundPendingDepositStatus),
+        nullable=False,
+        server_default=FundPendingDepositStatus.PENDING.value,
+        index=True,
+    )
+    confirmed_movement_id = Column(
+        Integer, ForeignKey("fund_movements.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    resolved_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    group = relationship("FundGroup", foreign_keys=[group_id])
+    detected_user = relationship("User", foreign_keys=[detected_user_id])
+    confirmed_movement = relationship("FundMovement", foreign_keys=[confirmed_movement_id])
+
+    def dict(self):
+        return {
+            "uuid": self.uuid,
+            "group_uuid": self.group.uuid if self.group else None,
+            "group_name": self.group.name if self.group else None,
+            "detected_user_uuid": self.detected_user.uuid if self.detected_user else None,
+            "detected_username": self.detected_user.username if self.detected_user else None,
+            "amount": self.amount,
+            "currency": self.currency,
+            "provider": self.provider,
+            "reference": self.reference,
+            "raw_text": self.raw_text,
+            "status": self.status.value if self.status else None,
+            "confirmed_movement_uuid": self.confirmed_movement.uuid if self.confirmed_movement else None,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }

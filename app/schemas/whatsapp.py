@@ -140,6 +140,8 @@ class WhatsAppOperationScenarioUpdate(BaseModel):
     # Permite explícitamente limpiar el grupo / receptor (poner a NULL) cuando True.
     clear_fund_group: bool = False
     clear_received_by: bool = False
+    # Reasigna la op a un cliente anónimo dedicado (VIA_PARTNER: el socio no es el cliente).
+    anonymize_client: bool = False
 
 
 class WhatsAppPartnerResponse(BaseModel):
@@ -150,11 +152,23 @@ class WhatsAppPartnerResponse(BaseModel):
     group_uuid: UUID
     group_name: str
     group_jid: Optional[str] = None
+    is_fund_manager: bool = False
 
 
 class WhatsAppPartnerList(BaseModel):
     partners: List[WhatsAppPartnerResponse]
     total: int
+
+
+class WhatsAppPendingDepositCreate(BaseModel):
+    """El bot reporta un comprobante subido al grupo por un gestor → depósito PENDING."""
+    group_jid: str
+    detected_phone: Optional[str] = None     # autor del mensaje en el grupo (gestor)
+    amount: Optional[float] = None
+    currency: Optional[str] = None
+    provider: Optional[str] = None
+    reference: Optional[str] = None
+    raw_text: Optional[str] = None
 
 
 class WhatsAppOperationList(BaseModel):
@@ -214,6 +228,12 @@ class WhatsAppPersonalExpense(BaseModel):
 class WhatsAppIrrelevant(BaseModel):
     is_irrelevant: bool
     irrelevant_description: Optional[str] = None
+
+
+class WhatsAppForwardToGroup(BaseModel):
+    """Marcar un pago entrante como contabilizado en un grupo (escenario ZELLE_DIRECT)."""
+    group_jid: Optional[str] = None
+    group_uuid: Optional[UUID] = None
 
 
 class WhatsAppPaymentDeposit(BaseModel):

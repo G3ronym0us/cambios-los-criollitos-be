@@ -307,6 +307,54 @@ class WhatsAppPaymentService:
         self.db.refresh(row)
         return self._with_name(row)
 
+    def convert_outgoing_to_group_incoming(
+        self,
+        payment_id: int,
+        group_jid: Optional[str] = None,
+        group_uuid: Optional[UUID] = None,
+    ) -> dict:
+        """
+        Convierte un pago SALIENTE (típicamente un Zelle reenviado al grupo que el bot no
+        detectó como tal) en un pago ENTRANTE marcado 'contabilizado en el grupo'. Copia los
+        datos del comprobante al lado entrante y elimina el saliente, para que el Zelle deje de
+        ocupar el lado saliente de la operación y se pueda anexar el pago en Bs.
+        """
+        out = self._get_or_404("outgoing", payment_id)
+
+        # Grupo: explícito (uuid), o por JID del grupo (parámetro o el client_phone si es @g.us).
+        group = None
+        if group_uuid is not None:
+            group = self.db.query(FundGroup).filter(FundGroup.uuid == str(group_uuid)).first()
+        else:
+            jid = group_jid or (out.client_phone if (out.client_phone or "").endswith("@g.us") else None)
+            if jid:
+                group = self.db.query(FundGroup).filter(FundGroup.whatsapp_group_jid == jid).first()
+        if group is None:
+            raise QuoteServiceError(
+                "fund_group_not_found", "No se pudo resolver el fondo del grupo", 404
+            )
+
+        incoming = WhatsAppIncomingPayment(
+            client_phone=out.client_phone,
+            provider=out.provider,
+            amount=out.amount,
+            currency=out.currency,
+            bank_from=out.bank_from,
+            bank_to=out.bank_to,
+            account_number=out.account_number,
+            identification=out.identification,
+            phone_to=out.phone_to,
+            reference=out.reference,
+            raw_text=out.raw_text,
+            whatsapp_operation_id=out.whatsapp_operation_id,
+            fund_group_id=group.id,
+        )
+        self.db.add(incoming)
+        self.db.delete(out)
+        self.db.commit()
+        self.db.refresh(incoming)
+        return self._with_name(incoming)
+
     # ---------- Depósito a fondo desde pago entrante ----------
 
     def create_deposit_from_payment(

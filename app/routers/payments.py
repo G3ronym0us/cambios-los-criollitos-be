@@ -21,6 +21,7 @@ from app.database.connection import get_db
 from app.models.user import User
 from app.schemas.whatsapp import (
     WhatsAppCreateOpManual,
+    WhatsAppForwardToGroup,
     WhatsAppIrrelevant,
     WhatsAppPaymentDeposit,
     WhatsAppPaymentLink,
@@ -96,6 +97,21 @@ async def mark_irrelevant(
         return service.set_irrelevant(
             payment_id, payload.is_irrelevant, payload.irrelevant_description
         )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.post("/outgoing/{payment_id}/to-group-incoming")
+async def convert_outgoing_to_group_incoming(
+    payment_id: int,
+    payload: WhatsAppForwardToGroup,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Convierte un saliente (Zelle reenviado al grupo) en un entrante contabilizado en el grupo. Operador JWT."""
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.convert_outgoing_to_group_incoming(payment_id, payload.group_jid, payload.group_uuid)
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 

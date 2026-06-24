@@ -33,6 +33,15 @@ from app.services.whatsapp_quote_service import QuoteServiceError, WhatsAppQuote
 EDITABLE_FIELDS = ["provider", "amount", "currency", "bank_from", "bank_to", "identification", "phone_to", "reference"]
 QUOTE_TTL_MINUTES = 30
 
+# ZELLE y PAYPAL son métodos de pago en dólares, no monedas propias: para la contabilidad de
+# fondos se liquidan como USD (un fondo en USD debe matchear un lado ZELLE/PAYPAL de la op).
+_SETTLEMENT_CURRENCY = {"ZELLE": "USD", "PAYPAL": "USD"}
+
+
+def settlement_currency(symbol: Optional[str]) -> str:
+    up = (symbol or "").upper()
+    return _SETTLEMENT_CURRENCY.get(up, up)
+
 
 class WhatsAppPaymentService:
     def __init__(self, db: Session):
@@ -414,18 +423,26 @@ class WhatsAppPaymentService:
             if exchange_user_id is None:
                 raise QuoteServiceError("exchange_user_required", "Falta el gestor del movimiento EXCHANGE", 400)
 
-            base = (group.currency or "").upper()
-            if base == from_currency.upper():
-                mv_amount, mv_currency = from_amount, from_currency
+            # Match por moneda de liquidación: ZELLE/PAYPAL cuentan como USD. El movimiento se
+            # registra en la moneda base del fondo (ej. un Zelle en un fondo USD → movimiento USD).
+            base = settlement_currency(group.currency)
+            if base == settlement_currency(from_currency):
+                mv_amount = from_amount
+            elif base == settlement_currency(to_currency):
+                mv_amount = to_amount
             else:
-                mv_amount, mv_currency = to_amount, to_currency
+                raise QuoteServiceError(
+                    "fund_currency_mismatch",
+                    f"El fondo está en {group.currency} y la operación es {from_currency}/{to_currency}",
+                    400,
+                )
 
             FundRepository(self.db).create_movement(
                 group_id=group.id,
                 user_id=exchange_user_id,
                 movement_type=FundMovementType.EXCHANGE,
                 amount=mv_amount,
-                currency=mv_currency,
+                currency=base,
                 movement_date=now,
                 recorded_by_user_id=recorded_by_user_id,
             )

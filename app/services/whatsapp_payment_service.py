@@ -216,6 +216,29 @@ class WhatsAppPaymentService:
         for it in items:
             it["deposit"] = by_payment.get(it["id"])
 
+    def list_payments_for_operation(self, op_uuid: UUID) -> dict:
+        """Pagos entrantes + salientes vinculados a una operación (para el detalle de la op)."""
+        op = self.db.query(WhatsAppOperation).filter(WhatsAppOperation.uuid == op_uuid).first()
+        if op is None:
+            raise QuoteServiceError("op_not_found", f"Operation {op_uuid} no encontrada", 404)
+        inc_rows = (
+            self.db.query(WhatsAppIncomingPayment)
+            .filter(WhatsAppIncomingPayment.whatsapp_operation_id == op.id)
+            .order_by(WhatsAppIncomingPayment.created_at.asc())
+            .all()
+        )
+        out_rows = (
+            self.db.query(WhatsAppOutgoingPayment)
+            .filter(WhatsAppOutgoingPayment.whatsapp_operation_id == op.id)
+            .order_by(WhatsAppOutgoingPayment.created_at.asc())
+            .all()
+        )
+        incoming = [self._with_name(p) for p in inc_rows]
+        outgoing = [self._with_name(p) for p in out_rows]
+        if incoming:
+            self._attach_deposits(incoming)
+        return {"incoming": incoming, "outgoing": outgoing}
+
     # ---------- Editar (correction tracking) ----------
 
     def update_payment(self, table: str, payment_id: int, fields: dict) -> dict:

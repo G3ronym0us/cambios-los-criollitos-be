@@ -27,6 +27,7 @@ from app.schemas.whatsapp import (
     WhatsAppOperationScenarioUpdate,
     WhatsAppStatsResponse,
 )
+from app.services.whatsapp_payment_service import WhatsAppPaymentService
 from app.services.whatsapp_quote_service import QuoteServiceError, WhatsAppQuoteService
 
 router = APIRouter(prefix="/operations", tags=["Operations"])
@@ -99,6 +100,20 @@ async def get_operation(
     if op is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Operación no encontrada")
     return WhatsAppOperationResponse.model_validate(op.dict())
+
+
+@router.get("/{op_uuid}/payments")
+async def get_operation_payments(
+    op_uuid: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Pagos entrantes y salientes vinculados a la operación (para el detalle)."""
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.list_payments_for_operation(op_uuid)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
 
 @router.patch("/{op_uuid}/scenario", response_model=WhatsAppOperationResponse)

@@ -162,11 +162,17 @@ class BinanceP2PScraper(BaseScraper):
                     currency_pair = self.currency_pair_repo.get_by_symbol(pair_symbol)
 
                     if currency_pair:
+                        # El precio P2P siempre viene como FIAT por USDT. En un BUY
+                        # (from=FIAT, to=USDT) la conversión from->to debe DIVIDIR por
+                        # la tasa, así que marcamos inverse_percentage para que los
+                        # consumidores (front/bot) usen amount/rate en vez de amount*rate.
+                        is_fiat_to_crypto = result.get('type') == 'BUY'
                         rate = ExchangeRate.create_safe(
                             currency_pair_id=currency_pair.id,
                             from_currency=from_currency,
                             to_currency=to_currency,
-                            rate=rate_value
+                            rate=rate_value,
+                            inverse_percentage=is_fiat_to_crypto
                         )
                         if rate:
                             rates.append(rate)

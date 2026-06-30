@@ -281,7 +281,16 @@ async def update_currency_pair(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update currency pair"
         )
-    
+
+    # Disparar scraping para recalcular la tasa de este par y las que dependan
+    # de él (porcentaje/inverso/base_pair pueden haber cambiado). Mismo patrón
+    # que PATCH /{uuid}/percentage y /rates/manual.
+    try:
+        from app.tasks.scraping_tasks import manual_scrape
+        manual_scrape.delay()
+    except Exception:
+        pass
+
     return CurrencyPairResponse(**updated_pair.dict())
 
 @router.patch("/{pair_uuid}/status", response_model=CurrencyPairResponse)

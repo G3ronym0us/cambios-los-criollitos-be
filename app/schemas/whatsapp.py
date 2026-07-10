@@ -144,6 +144,35 @@ class WhatsAppOperationScenarioUpdate(BaseModel):
     anonymize_client: bool = False
 
 
+def _normalize_client_phone(value: str) -> str:
+    """Acepta separadores de presentación, pero persiste únicamente dígitos ASCII."""
+    cleaned = value.strip()
+    for char in ' +-().':
+        cleaned = cleaned.replace(char, '')
+    if not cleaned.isascii() or not cleaned.isdigit():
+        raise ValueError('El teléfono solo puede contener dígitos')
+    if len(cleaned) < 4:
+        raise ValueError('Teléfono demasiado corto')
+    return cleaned
+
+
+class WhatsAppOperationUpdate(WhatsAppOperationScenarioUpdate):
+    """Edición atómica de los datos administrativos de una operación."""
+
+    client_phone: Optional[str] = Field(None, min_length=4, max_length=32)
+    client_display_name: Optional[str] = Field(None, max_length=120)
+
+    @validator('client_phone', pre=True)
+    def normalize_phone(cls, v: Optional[str]) -> Optional[str]:
+        return _normalize_client_phone(v) if v is not None else None
+
+    @validator('client_display_name')
+    def normalize_display_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        return v.strip() or None
+
+
 class WhatsAppPartnerResponse(BaseModel):
     """Socio (FundGroupMember con whatsapp_phone) que reporta entrantes desde su número."""
     whatsapp_phone: str

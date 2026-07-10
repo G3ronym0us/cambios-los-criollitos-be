@@ -2,9 +2,9 @@
 Router "Operaciones" de cara al operador (front), autenticado con JWT humano.
 
 Expone las operaciones del bot (`whatsapp_operations`) bajo `/operations` — sin
-el prefijo `whatsapp`. Es de solo lectura (lista/detalle/stats): el ciclo de vida
-(cotizar/aprobar/completar/entregar) lo maneja el bot vía `/whatsapp/*`
-(X-Bot-Token). Reusa WhatsAppQuoteService y los schemas del bot.
+el prefijo `whatsapp`. El operador puede consultar y corregir sus datos administrativos;
+el ciclo de vida (cotizar/aprobar/completar/entregar) lo maneja el bot vía
+`/whatsapp/*` (X-Bot-Token). Reusa WhatsAppQuoteService y los schemas del bot.
 
 No confundir con `transactions` (registro contable con profit splits): una
 operación COMPLETED genera una Transaction, pero son etapas distintas.
@@ -25,6 +25,7 @@ from app.schemas.whatsapp import (
     WhatsAppOperationList,
     WhatsAppOperationResponse,
     WhatsAppOperationScenarioUpdate,
+    WhatsAppOperationUpdate,
     WhatsAppStatsResponse,
 )
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
@@ -114,6 +115,22 @@ async def get_operation_payments(
         return service.list_payments_for_operation(op_uuid)
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.patch("/{op_uuid}", response_model=WhatsAppOperationResponse)
+async def update_operation(
+    op_uuid: UUID,
+    payload: WhatsAppOperationUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Edita cliente, escenario, grupo y receptor como una sola operación atómica."""
+    service = WhatsAppQuoteService(db)
+    try:
+        op = service.update_operation(op_uuid, payload)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+    return WhatsAppOperationResponse.model_validate(op.dict())
 
 
 @router.patch("/{op_uuid}/scenario", response_model=WhatsAppOperationResponse)

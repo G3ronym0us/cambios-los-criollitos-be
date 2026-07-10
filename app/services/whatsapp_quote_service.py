@@ -22,6 +22,7 @@ from app.models.fund import FundGroup, FundGroupMember
 from app.models.transaction import Transaction, TransactionStatus
 from app.models.user import User
 from app.models.whatsapp_client import WhatsAppClient
+from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from app.models.whatsapp_operation import (
     WhatsAppAmountSide,
     WhatsAppDeliveryStatus,
@@ -39,6 +40,7 @@ from app.schemas.whatsapp import (
     WhatsAppOperationComplete,
     WhatsAppOperationCreate,
     WhatsAppOperationScenarioUpdate,
+    WhatsAppOperationUpdate,
 )
 from app.services.bcv_service import get_cached_bcv_rate
 from app.services.whatsapp_rate_resolver import WhatsAppRateResolver
@@ -448,14 +450,11 @@ class WhatsAppQuoteService:
 
     # ---------- Escenario / grupo / receptor del entrante ----------
 
-    def set_scenario(self, op_uuid: UUID, payload: WhatsAppOperationScenarioUpdate) -> WhatsAppOperation:
-        """
-        Setea/edita el escenario, el FundGroup y el receptor del pago entrante de una op.
-        Usado tanto por el bot (clasificación automática, resuelve el grupo por `group_jid`)
-        como por el front (edición manual, resuelve por `fund_group_uuid`/`received_by_user_uuid`).
-        """
-        op = self._get_op_or_404(op_uuid)
-
+    def _apply_scenario(
+        self,
+        op: WhatsAppOperation,
+        payload: WhatsAppOperationScenarioUpdate,
+    ) -> None:
         if payload.scenario is not None:
             op.scenario = WhatsAppOperationScenario(payload.scenario)
 
@@ -499,6 +498,57 @@ class WhatsAppQuoteService:
             anon = self.upsert_client(f"anon:partner:{key}", f"Anónimo (vía {label})")
             op.client_id = anon.id
 
+    def set_scenario(self, op_uuid: UUID, payload: WhatsAppOperationScenarioUpdate) -> WhatsAppOperation:
+        """
+        Setea/edita el escenario, el FundGroup y el receptor del pago entrante de una op.
+        Usado tanto por el bot (clasificación automática, resuelve el grupo por `group_jid`)
+        como por el front (edición manual, resuelve por `fund_group_uuid`/`received_by_user_uuid`).
+        """
+        op = self._get_op_or_404(op_uuid)
+        self._apply_scenario(op, payload)
+        self.db.commit()
+        self.db.refresh(op)
+        return op
+
+    def _assign_client(
+        self,
+        op: WhatsAppOperation,
+        phone: str,
+        display_name: Optional[str],
+        update_display_name: bool,
+    ) -> None:
+        client = self.upsert_client(phone)
+        if update_display_name:
+            client.display_name = display_name
+        op.client_id = client.id
+
+        # El operador afirma "esta operación es de este cliente": los comprobantes ya
+        # vinculados heredan el teléfono (mismo criterio que set_operation en pagos).
+        for Model in (WhatsAppIncomingPayment, WhatsAppOutgoingPayment):
+            self.db.query(Model).filter(Model.whatsapp_operation_id == op.id).update(
+                {"client_phone": client.phone}, synchronize_session=False
+            )
+
+    def update_operation(self, op_uuid: UUID, payload: WhatsAppOperationUpdate) -> WhatsAppOperation:
+        """Actualiza cliente y escenario en una sola transacción."""
+        op = self._get_op_or_404(op_uuid)
+        fields_set = payload.model_fields_set
+
+        if "client_display_name" in fields_set and payload.client_phone is None:
+            raise QuoteServiceError(
+                "client_phone_required",
+                "El teléfono es requerido para actualizar el cliente",
+                422,
+            )
+        if payload.client_phone is not None:
+            self._assign_client(
+                op,
+                payload.client_phone,
+                payload.client_display_name,
+                "client_display_name" in fields_set,
+            )
+
+        self._apply_scenario(op, payload)
         self.db.commit()
         self.db.refresh(op)
         return op

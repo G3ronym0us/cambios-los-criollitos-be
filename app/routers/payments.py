@@ -20,6 +20,7 @@ from app.core.dependencies import get_current_user
 from app.database.connection import get_db
 from app.models.user import User
 from app.schemas.whatsapp import (
+    WhatsAppBalanceCredit,
     WhatsAppCreateOpManual,
     WhatsAppForwardToGroup,
     WhatsAppIrrelevant,
@@ -27,6 +28,7 @@ from app.schemas.whatsapp import (
     WhatsAppPaymentLink,
     WhatsAppPersonalExpense,
 )
+from app.services.whatsapp_balance_service import WhatsAppBalanceService
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
 from app.services.whatsapp_quote_service import QuoteServiceError
 
@@ -138,6 +140,22 @@ async def create_operation_from_payment(
             fund_group_uuid=payload.fund_group_uuid,
             exchange_user_uuid=payload.exchange_user_uuid,
             recorded_by_user_id=current_user.id,
+        )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.post("/incoming/{payment_id}/credit-balance", status_code=201)
+async def credit_balance_from_incoming(
+    payment_id: int,
+    payload: WhatsAppBalanceCredit,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Acredita un pago entrante (Zelle/PayPal/USD) como saldo a favor del cliente. Operador JWT."""
+    try:
+        return WhatsAppBalanceService(db).credit_from_incoming(
+            payment_id, payload.amount, payload.notes, created_by_user_id=current_user.id
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)

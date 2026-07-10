@@ -14,6 +14,7 @@ from app.schemas.transaction import (
 from app.repositories.transaction_repository import TransactionRepository
 from app.models.transaction import TransactionStatus
 from app.models.user import User
+from app.models.whatsapp_operation import WhatsAppOperation
 from app.core.dependencies import get_current_user, get_moderator_user
 
 router = APIRouter(prefix="/transactions", tags=["Transactions"])
@@ -236,7 +237,7 @@ async def create_transaction(
 async def get_transactions(
     page: int = Query(1, ge=1, description="Número de página"),
     per_page: int = Query(20, ge=1, le=100, description="Transacciones por página"),
-    status_filter: Optional[str] = Query(None, description="Filtrar por status: pending, completed, cancelled, failed"),
+    status_filter: Optional[str] = Query(None, description="Filtrar por status: quoted, pending, completed, cancelled, failed"),
     currency_pair_uuid: Optional[UUID] = Query(None, description="Filtrar por par de monedas (UUID)"),
     user_id: Optional[int] = Query(None, description="Filtrar por usuario"),
     start_date: Optional[datetime] = Query(None, description="Fecha inicio (ISO format)"),
@@ -255,7 +256,7 @@ async def get_transactions(
         except ValueError:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid status: {status_filter}. Valid options: pending, completed, cancelled, failed"
+                detail=f"Invalid status: {status_filter}. Valid options: quoted, pending, completed, cancelled, failed"
             )
 
     # Resolver currency_pair_uuid a currency_pair_id
@@ -348,6 +349,17 @@ async def update_transaction(
             detail=f"Transaction with UUID {transaction_uuid} not found"
         )
 
+    linked_operation = (
+        db.query(WhatsAppOperation)
+        .filter(WhatsAppOperation.transaction_id == transaction.id)
+        .first()
+    )
+    if linked_operation is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Esta transacción es administrada por su operación vinculada; edita la operación",
+        )
+
     # Si se actualiza currency_pair_uuid, resolver el par
     new_currency_pair_id = None
     if transaction_data.currency_pair_uuid:
@@ -383,12 +395,22 @@ async def delete_transaction(
 ):
     """Eliminar transacción (requiere permisos de moderador)"""
     transaction_repo = TransactionRepository(db)
-
     transaction = transaction_repo.get_by_uuid(transaction_uuid)
     if not transaction:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Transaction with UUID {transaction_uuid} not found"
+        )
+
+    linked_operation = (
+        db.query(WhatsAppOperation)
+        .filter(WhatsAppOperation.transaction_id == transaction.id)
+        .first()
+    )
+    if linked_operation is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No se puede eliminar una transacción vinculada a una operación",
         )
 
     success = transaction_repo.delete_transaction(transaction.id)

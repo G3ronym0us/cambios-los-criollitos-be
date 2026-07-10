@@ -77,6 +77,7 @@ class TransactionCreate(TransactionBase):
     usdt_rate: Optional[float] = None  # Tasa USDT/moneda_origen al momento de la transacción
     fund_group_uuid: Optional[UUID] = Field(None, description="UUID del fondo al que aplica esta transacción. Overridea el fondo de la config si se especifica. Para splits manuales, permite vincular al fondo")
     skip_fund: bool = Field(False, description="Si True, no crea movimiento de fondo aunque la config tenga uno configurado")
+    status: str = Field("completed", pattern="^(quoted|pending|completed|cancelled|failed)$")
 
     @validator('profit_splits')
     def validate_profit_splits(cls, v, values):

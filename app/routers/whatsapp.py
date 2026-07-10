@@ -16,6 +16,8 @@ from app.models.whatsapp_client import WhatsAppClient
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.schemas.whatsapp import (
     BcvRateResponse,
+    WhatsAppBalanceCredit,
+    WhatsAppBalanceDebit,
     WhatsAppClientResponse,
     WhatsAppClientUpsert,
     WhatsAppCreateOpFromPayment,
@@ -39,6 +41,7 @@ from app.schemas.whatsapp import (
     WhatsAppStatsResponse,
 )
 from app.services.bcv_service import fetch_bcv_rate, get_cached_bcv_rate
+from app.services.whatsapp_balance_service import WhatsAppBalanceService
 from app.services.fund_pending_deposit_service import FundPendingDepositService
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
 from app.services.whatsapp_quote_service import QuoteServiceError, WhatsAppQuoteService
@@ -177,7 +180,7 @@ def set_operation_scenario(
     """Clasifica/edita el escenario, grupo (por uuid o group_jid) y receptor del entrante."""
     service = WhatsAppQuoteService(db)
     try:
-        op = service.set_scenario(op_uuid, payload)
+        op = service.set_scenario(op_uuid, payload, principal.service_user)
     except QuoteServiceError as exc:
         _handle_service_error(exc)
     return WhatsAppOperationResponse.model_validate(op.dict())
@@ -294,6 +297,55 @@ def upsert_client(
     return WhatsAppClientResponse.model_validate(client.dict())
 
 
+# ---------- Saldo a favor (ledger) ----------
+
+@router.get("/clients/{phone}/balance")
+def get_client_balance(
+    phone: str,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    """Saldo a favor + movimientos del cliente (por teléfono). {balance, currency, entries}."""
+    try:
+        return WhatsAppBalanceService(db).summary_by_phone(phone)
+    except QuoteServiceError as exc:
+        _handle_service_error(exc)
+
+
+@router.post("/payments/incoming/{payment_id}/credit-balance", status_code=status.HTTP_201_CREATED)
+def credit_balance_from_incoming(
+    payment_id: int,
+    payload: WhatsAppBalanceCredit,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    """Acredita un pago entrante (Zelle/PayPal/USD) como saldo a favor del cliente."""
+    try:
+        return WhatsAppBalanceService(db).credit_from_incoming(
+            payment_id, payload.amount, payload.notes,
+            created_by_user_id=principal.service_user.id,
+        )
+    except QuoteServiceError as exc:
+        _handle_service_error(exc)
+
+
+@router.post("/operations/{op_uuid}/debit-balance", status_code=status.HTTP_201_CREATED)
+def debit_balance_for_operation(
+    op_uuid: UUID,
+    payload: WhatsAppBalanceDebit,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    """Debita saldo del cliente por una operación de abono (default: from_amount USD)."""
+    try:
+        return WhatsAppBalanceService(db).debit_for_operation(
+            op_uuid, payload.amount, payload.notes,
+            created_by_user_id=principal.service_user.id,
+        )
+    except QuoteServiceError as exc:
+        _handle_service_error(exc)
+
+
 # ---------- Payments (comprobantes OCR) ----------
 
 @router.get("/payments/corrected")
@@ -375,6 +427,7 @@ def create_operation_from_payment(
         return service.create_operation_from_payment(
             table, payment_id, payload.from_currency, payload.to_currency,
             payload.from_amount, payload.to_amount,
+            recorded_by_user_id=principal.service_user.id,
         )
     except QuoteServiceError as exc:
         _handle_service_error(exc)

@@ -519,6 +519,16 @@ class WhatsAppPaymentService:
                 recorded_by_user_id=recorded_by_user_id,
             )
 
+            transaction_user = self.db.query(User).filter(User.id == exchange_user_id).first()
+            if transaction_user is None:
+                raise QuoteServiceError("transaction_user_required", "Falta el usuario de la transacción", 400)
+            tx = quote_svc._create_transaction_for_op(
+                op,
+                WhatsAppOperationComplete(),
+                transaction_user,
+            )
+            op.transaction_id = tx.id
+
         # Completar directo salvo entrega física de USD: en una venta de USD físico (from=USD)
         # el cliente queda pendiente de entregar el efectivo, así que la op se queda en PENDING
         # (delivery). El resto (ZELLE-VES, PayPal, etc.) se completa al instante y genera su
@@ -534,9 +544,9 @@ class WhatsAppPaymentService:
                 raise QuoteServiceError(
                     "complete_user_required", "Falta el usuario que completa la operación", 400
                 )
-            tx = quote_svc._create_transaction_for_op(op, WhatsAppOperationComplete(), completing_user)
             op.status = WhatsAppOperationStatus.COMPLETED
             op.completed_at = now
+            tx = quote_svc._create_transaction_for_op(op, WhatsAppOperationComplete(), completing_user)
             op.transaction_id = tx.id
 
         self.db.commit()

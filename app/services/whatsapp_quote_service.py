@@ -2,10 +2,10 @@
 Servicio orquestador del ciclo de vida de una operación de WhatsApp.
 
 Flujo:
-  create_quote   -> WhatsAppOperation(status=QUOTED, expires_at=now+30min)
+  create_quote   -> QUOTED sin datos / PENDING con datos de pago
   approve_quote  -> QUOTED -> PENDING
   cancel_op      -> ... -> CANCELLED
-  complete_op    -> PENDING -> COMPLETED + crea Transaction (con profit splits si aplica)
+  complete_op    -> PENDING -> COMPLETED y sincroniza su Transaction
 
 El servicio nunca habla con HTTP; recibe Sessions y devuelve modelos.
 La capa router lo expone vía /whatsapp/...
@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.models.currency_pair import CurrencyPair
 from app.models.fund import FundGroup, FundGroupMember
-from app.models.transaction import Transaction, TransactionStatus
+from app.models.transaction import Transaction, TransactionProfitSplit, TransactionStatus
 from app.models.user import User
 from app.models.whatsapp_client import WhatsAppClient
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
@@ -159,10 +159,8 @@ class WhatsAppQuoteService:
             from_amount = self.resolver.apply_rate(payload.amount, rate, not inverse_percentage)
             side_enum = WhatsAppAmountSide.RECEIVE
 
-        # Cancelar cualquier cotización previa QUOTED del mismo cliente
-        self._cancel_previous_quoted(client.id)
-
         now = datetime.now(timezone.utc)
+        has_payment_data = bool(payload.notes and payload.notes.strip())
         op = WhatsAppOperation(
             client_id=client.id,
             currency_pair_id=currency_pair.id,
@@ -174,36 +172,22 @@ class WhatsAppQuoteService:
             default_percentage=default_percentage,
             amount_side=side_enum,
             bcv_usd=bcv_usd,
-            status=WhatsAppOperationStatus.QUOTED,
+            # Monto + datos de pago ya constituye una operación interna en curso.
+            # Una cotización sin datos permanece QUOTED hasta recibirlos.
+            status=(
+                WhatsAppOperationStatus.PENDING
+                if has_payment_data
+                else WhatsAppOperationStatus.QUOTED
+            ),
             notes=payload.notes,
             quoted_at=now,
+            approved_at=now if has_payment_data else None,
             expires_at=now + timedelta(minutes=QUOTE_TTL_MINUTES),
         )
         self.db.add(op)
         self.db.commit()
         self.db.refresh(op)
         return op
-
-    def _cancel_previous_quoted(self, client_id: int) -> None:
-        # Solo se cancelan cotizaciones QUOTED SIN datos de pago (notes vacío):
-        # son cotizaciones "sueltas" que la nueva reemplaza. Una QUOTED que YA
-        # tiene destinatario (notes) es una operación distinta en curso (caso
-        # multi-operación en la misma conversación) y no debe cancelarse.
-        # Paridad con el bot local (cancelPreviousQuoted filtra notes IS NULL).
-        previous = (
-            self.db.query(WhatsAppOperation)
-            .filter(
-                WhatsAppOperation.client_id == client_id,
-                WhatsAppOperation.status == WhatsAppOperationStatus.QUOTED,
-            )
-            .all()
-        )
-        now = datetime.now(timezone.utc)
-        for op in previous:
-            if op.notes is not None and op.notes.strip() != "":
-                continue
-            op.status = WhatsAppOperationStatus.CANCELLED
-            op.cancelled_at = now
 
     # ---------- Aprobar / Cancelar ----------
 
@@ -220,6 +204,7 @@ class WhatsAppQuoteService:
 
         op.status = WhatsAppOperationStatus.PENDING
         op.approved_at = datetime.now(timezone.utc)
+        self._sync_linked_transaction(op)
         if payload.notes:
             op.notes = (op.notes + "\n" if op.notes else "") + payload.notes
         self.db.commit()
@@ -236,6 +221,7 @@ class WhatsAppQuoteService:
             )
         op.status = WhatsAppOperationStatus.CANCELLED
         op.cancelled_at = datetime.now(timezone.utc)
+        self._sync_linked_transaction(op)
         if payload.reason:
             op.notes = (op.notes + "\n" if op.notes else "") + f"[cancel] {payload.reason}"
         self.db.commit()
@@ -262,6 +248,7 @@ class WhatsAppQuoteService:
         op.status = WhatsAppOperationStatus.QUOTED
         op.cancelled_at = None
         op.expires_at = now + timedelta(minutes=QUOTE_TTL_MINUTES)
+        self._sync_linked_transaction(op)
         self.db.commit()
         self.db.refresh(op)
         return op
@@ -288,6 +275,7 @@ class WhatsAppQuoteService:
                 raise QuoteServiceError("quote_expired", "La cotización expiró", 409)
             op.status = WhatsAppOperationStatus.PENDING
             op.approved_at = datetime.now(timezone.utc)
+            self._sync_linked_transaction(op)
 
         self.db.commit()
         self.db.refresh(op)
@@ -317,11 +305,10 @@ class WhatsAppQuoteService:
                 raise QuoteServiceError("quote_expired", "La cotización expiró", 409)
             op.approved_at = datetime.now(timezone.utc)
 
-        # Crear Transaction reusando el repo existente (que dispara profit splits)
-        tx = self._create_transaction_for_op(op, payload, bot_service_user)
-
         op.status = WhatsAppOperationStatus.COMPLETED
         op.completed_at = datetime.now(timezone.utc)
+        # Crea la transacción si aún no existe o actualiza la que nació con el fondo.
+        tx = self._create_transaction_for_op(op, payload, bot_service_user)
         op.transaction_id = tx.id
 
         # Delivery tracking: si la op es venta de USD efectivo y el operador todavía
@@ -351,9 +338,13 @@ class WhatsAppQuoteService:
 
         config_repo = CommissionConfigRepository(self.db)
 
-        total_pct = 0.0
+        # El margen aplicado en la cotización es la ganancia total real de esta
+        # operación. La configuración opcional define cómo se reparte, no sustituye
+        # el margen que se le cotizó al cliente.
+        total_pct = float(op.applied_percentage or 0.0)
         profit_splits: Optional[list[ProfitSplitCreate]] = None
         commission_config_uuid = payload.commission_config_uuid
+        config = None
 
         if commission_config_uuid:
             config = config_repo.get_by_uuid(commission_config_uuid)
@@ -361,11 +352,46 @@ class WhatsAppQuoteService:
                 raise QuoteServiceError("config_not_found", "Commission config no existe", 404)
             if not config.is_active:
                 raise QuoteServiceError("config_inactive", f"Commission config '{config.name}' no activa", 400)
-            total_pct = float(config.total_percentage)
-            profit_splits = [
-                ProfitSplitCreate(user_uuid=split.user.uuid, profit_percentage=float(split.percentage))
-                for split in config.splits
-            ]
+            config_total = float(config.total_percentage)
+            if op.applied_percentage is None:
+                total_pct = config_total
+                op.applied_percentage = total_pct
+
+            # Mantiene las proporciones del reparto configurado, ajustadas al margen
+            # efectivo de la operación. Con ganancia 0 no se crean splits para evitar
+            # una división por cero al calcular sus montos.
+            if total_pct > 0 and config_total > 0:
+                profit_splits = [
+                    ProfitSplitCreate(
+                        user_uuid=split.user.uuid,
+                        profit_percentage=(float(split.percentage) / config_total) * total_pct,
+                    )
+                    for split in config.splits
+                ]
+
+        if op.transaction_id is not None:
+            tx = self.db.query(Transaction).filter(Transaction.id == op.transaction_id).first()
+            if tx is None:
+                raise QuoteServiceError("transaction_not_found", "Transaction vinculada no encontrada", 409)
+
+            self._sync_linked_transaction(op)
+            if config is not None:
+                self.db.query(TransactionProfitSplit).filter(
+                    TransactionProfitSplit.transaction_id == tx.id
+                ).delete(synchronize_session=False)
+                profit_amount = float(op.to_amount) * total_pct / 100
+                for split_data, config_split in zip(profit_splits or [], config.splits):
+                    ratio = split_data.profit_percentage / total_pct if total_pct else 0
+                    self.db.add(
+                        TransactionProfitSplit(
+                            transaction_id=tx.id,
+                            user_id=config_split.user.id,
+                            profit_percentage=split_data.profit_percentage,
+                            profit_amount=profit_amount * ratio,
+                            settlement_currency=config_split.user.preferred_settlement_currency,
+                        )
+                    )
+            return tx
 
         tx_create = TransactionCreate(
             currency_pair_uuid=cp.uuid,
@@ -377,6 +403,7 @@ class WhatsAppQuoteService:
             total_profit_percentage=total_pct,
             profit_splits=profit_splits,
             skip_fund=payload.skip_fund,
+            status=op.status.value.lower(),
         )
 
         tx_repo = TransactionRepository(self.db)
@@ -386,6 +413,46 @@ class WhatsAppQuoteService:
             currency_pair_id=cp.id,
         )
         return tx
+
+    def _sync_linked_transaction(self, op: WhatsAppOperation) -> None:
+        """Mantiene la transacción derivada como espejo contable de la operación."""
+        if op.transaction_id is None:
+            return
+
+        tx = self.db.query(Transaction).filter(Transaction.id == op.transaction_id).first()
+        if tx is None:
+            raise QuoteServiceError("transaction_not_found", "Transaction vinculada no encontrada", 409)
+
+        previous_profit = float(tx.profit_amount or 0)
+        previous_total = float(tx.total_profit_percentage or 0)
+        total_pct = float(op.applied_percentage or 0)
+        profit_amount = float(op.to_amount) * total_pct / 100
+
+        tx.currency_pair_id = op.currency_pair_id
+        tx.from_amount = op.from_amount
+        tx.to_amount = op.to_amount
+        tx.exchange_rate = op.rate_used
+        tx.total_profit_percentage = total_pct
+        tx.profit_amount = profit_amount
+        tx.status = TransactionStatus[op.status.name]
+        tx.completed_at = op.completed_at if op.status == WhatsAppOperationStatus.COMPLETED else None
+
+        if tx.profit_splits and previous_total > 0:
+            profit_scale = profit_amount / previous_profit if previous_profit else None
+            all_splits_have_usdt = True
+            total_profit_usdt = 0.0
+            for split in tx.profit_splits:
+                ratio = float(split.profit_percentage) / previous_total
+                split.profit_percentage = total_pct * ratio
+                split.profit_amount = profit_amount * ratio
+                if split.profit_amount_usdt is not None and profit_scale is not None:
+                    split.profit_amount_usdt *= profit_scale
+                    if split.settlement_currency and split.settlement_currency.upper() in ("USD", "USDT"):
+                        split.settlement_amount = split.profit_amount_usdt
+                    total_profit_usdt += split.profit_amount_usdt
+                else:
+                    all_splits_have_usdt = False
+            tx.profit_amount_usdt = total_profit_usdt if all_splits_have_usdt else None
 
     # ---------- Lookup ----------
 
@@ -462,7 +529,11 @@ class WhatsAppQuoteService:
         if payload.clear_fund_group:
             op.fund_group_id = None
         elif payload.fund_group_uuid is not None:
-            group = self.db.query(FundGroup).filter(FundGroup.uuid == str(payload.fund_group_uuid)).first()
+            group = (
+                self.db.query(FundGroup)
+                .filter(FundGroup.uuid == str(payload.fund_group_uuid))
+                .first()
+            )
             if group is None:
                 raise QuoteServiceError("fund_group_not_found", "FundGroup no encontrado", 404)
             op.fund_group_id = group.id
@@ -498,7 +569,12 @@ class WhatsAppQuoteService:
             anon = self.upsert_client(f"anon:partner:{key}", f"Anónimo (vía {label})")
             op.client_id = anon.id
 
-    def set_scenario(self, op_uuid: UUID, payload: WhatsAppOperationScenarioUpdate) -> WhatsAppOperation:
+    def set_scenario(
+        self,
+        op_uuid: UUID,
+        payload: WhatsAppOperationScenarioUpdate,
+        operator: User,
+    ) -> WhatsAppOperation:
         """
         Setea/edita el escenario, el FundGroup y el receptor del pago entrante de una op.
         Usado tanto por el bot (clasificación automática, resuelve el grupo por `group_jid`)
@@ -506,6 +582,11 @@ class WhatsAppQuoteService:
         """
         op = self._get_op_or_404(op_uuid)
         self._apply_scenario(op, payload)
+        if op.fund_group_id is not None and op.transaction_id is None:
+            tx = self._create_transaction_for_op(op, WhatsAppOperationComplete(), operator)
+            op.transaction_id = tx.id
+        else:
+            self._sync_linked_transaction(op)
         self.db.commit()
         self.db.refresh(op)
         return op
@@ -529,10 +610,77 @@ class WhatsAppQuoteService:
                 {"client_phone": client.phone}, synchronize_session=False
             )
 
-    def update_operation(self, op_uuid: UUID, payload: WhatsAppOperationUpdate) -> WhatsAppOperation:
-        """Actualiza cliente y escenario en una sola transacción."""
+    def update_operation(
+        self,
+        op_uuid: UUID,
+        payload: WhatsAppOperationUpdate,
+        operator: User,
+    ) -> WhatsAppOperation:
+        """Actualiza par, cliente y escenario en una sola transacción."""
         op = self._get_op_or_404(op_uuid)
         fields_set = payload.model_fields_set
+
+        if payload.currency_pair_uuid is not None:
+            pair = (
+                self.db.query(CurrencyPair)
+                .filter(CurrencyPair.uuid == payload.currency_pair_uuid)
+                .first()
+            )
+            if pair is None:
+                raise QuoteServiceError(
+                    "currency_pair_not_found",
+                    "Par de monedas no encontrado",
+                    404,
+                )
+            # Corrección administrativa: conserva montos y tasa históricos.
+            op.currency_pair_id = pair.id
+            op.currency_pair = pair
+
+        if "applied_percentage" in fields_set and payload.applied_percentage is not None:
+            if op.status == WhatsAppOperationStatus.COMPLETED:
+                raise QuoteServiceError(
+                    "completed_margin_is_locked",
+                    "No se puede cambiar el margen de una operación completada porque su transacción ya fue generada",
+                    409,
+                )
+
+            previous_percentage = op.applied_percentage or 0.0
+            previous_factor = 1 - previous_percentage / 100
+            if previous_factor <= 0:
+                raise QuoteServiceError(
+                    "invalid_previous_margin",
+                    "No se pudo reconstruir la tasa base desde el margen anterior",
+                    409,
+                )
+
+            # Reconstruye la tasa cruda histórica y aplica el margen corregido.
+            base_rate = (
+                op.rate_used * previous_factor
+                if op.inverse_percentage
+                else op.rate_used / previous_factor
+            )
+            new_rate = self.resolver.rate_with_margin(
+                base_rate,
+                payload.applied_percentage,
+                op.inverse_percentage,
+            )
+            if new_rate is None:
+                raise QuoteServiceError("invalid_margin", "Margen inválido", 422)
+
+            op.rate_used = new_rate
+            op.applied_percentage = payload.applied_percentage
+            if op.amount_side == WhatsAppAmountSide.SEND:
+                op.to_amount = self.resolver.apply_rate(
+                    op.from_amount,
+                    new_rate,
+                    op.inverse_percentage,
+                )
+            else:
+                op.from_amount = self.resolver.apply_rate(
+                    op.to_amount,
+                    new_rate,
+                    not op.inverse_percentage,
+                )
 
         if "client_display_name" in fields_set and payload.client_phone is None:
             raise QuoteServiceError(
@@ -549,6 +697,64 @@ class WhatsAppQuoteService:
             )
 
         self._apply_scenario(op, payload)
+        if op.fund_group_id is not None and op.transaction_id is None:
+            tx = self._create_transaction_for_op(op, WhatsAppOperationComplete(), operator)
+            op.transaction_id = tx.id
+        else:
+            self._sync_linked_transaction(op)
+        self.db.commit()
+        self.db.refresh(op)
+        return op
+
+    def update_status(
+        self,
+        op_uuid: UUID,
+        requested_status: str,
+        operator: User,
+    ) -> WhatsAppOperation:
+        """Cambio administrativo de estado preservando invariantes contables."""
+        op = self._get_op_or_404(op_uuid)
+        target = WhatsAppOperationStatus(requested_status)
+
+        if op.status == target:
+            return op
+        if op.status == WhatsAppOperationStatus.COMPLETED:
+            raise QuoteServiceError(
+                "completed_status_is_terminal",
+                "Una operación completada no puede volver a otro estado porque ya tiene una transacción contable",
+                409,
+            )
+
+        now = datetime.now(timezone.utc)
+        if target == WhatsAppOperationStatus.COMPLETED:
+            if op.transaction_id is None:
+                tx = self._create_transaction_for_op(
+                    op,
+                    WhatsAppOperationComplete(),
+                    operator,
+                )
+                op.transaction_id = tx.id
+            op.status = target
+            op.completed_at = now
+            op.cancelled_at = None
+        elif target == WhatsAppOperationStatus.CANCELLED:
+            op.status = target
+            op.cancelled_at = now
+            op.completed_at = None
+        elif target == WhatsAppOperationStatus.PENDING:
+            op.status = target
+            op.approved_at = op.approved_at or now
+            op.cancelled_at = None
+            op.completed_at = None
+        else:
+            op.status = WhatsAppOperationStatus.QUOTED
+            op.approved_at = None
+            op.cancelled_at = None
+            op.completed_at = None
+            op.expires_at = now + timedelta(minutes=QUOTE_TTL_MINUTES)
+
+        self._sync_linked_transaction(op)
+
         self.db.commit()
         self.db.refresh(op)
         return op

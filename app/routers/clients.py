@@ -18,6 +18,9 @@ from app.models.user import User
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.repositories.whatsapp_client_repository import WhatsAppClientRepository
 from app.schemas.client import ClientList, ClientResponse, ClientUpdate
+from app.schemas.whatsapp import WhatsAppBalanceAdjust
+from app.services.whatsapp_balance_service import WhatsAppBalanceService
+from app.services.whatsapp_quote_service import QuoteServiceError
 
 router = APIRouter(prefix="/clients", tags=["Clients"])
 
@@ -38,8 +41,9 @@ async def list_clients(
         skip=skip, limit=limit, search=search,
         is_blocked=is_blocked, is_tracked=is_tracked,
     )
+    balances = WhatsAppBalanceService(db).balances_by_client_ids([c.id for c in items])
     return ClientList(
-        items=[ClientResponse(**c.dict()) for c in items],
+        items=[ClientResponse(**c.dict(), balance=balances.get(c.id, 0.0)) for c in items],
         total=total, skip=skip, limit=limit,
     )
 
@@ -53,7 +57,38 @@ async def get_client(
     client = WhatsAppClientRepository(db).get_by_uuid(client_uuid)
     if client is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cliente no encontrado")
-    return ClientResponse(**client.dict())
+    balance = WhatsAppBalanceService(db).get_balance(client.id)
+    return ClientResponse(**client.dict(), balance=balance)
+
+
+@router.get("/{client_uuid}/balance")
+async def get_client_balance(
+    client_uuid: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Saldo a favor + movimientos del cliente. {balance, currency, entries}."""
+    try:
+        return WhatsAppBalanceService(db).summary_by_uuid(client_uuid)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.post("/{client_uuid}/balance/adjust", status_code=status.HTTP_201_CREATED)
+async def adjust_client_balance(
+    client_uuid: UUID,
+    payload: WhatsAppBalanceAdjust,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),  # mutación: moderador+
+):
+    """Ajuste manual del saldo (CREDIT/DEBIT) con nota. Devuelve el movimiento + balance_after."""
+    try:
+        return WhatsAppBalanceService(db).adjust(
+            client_uuid, payload.entry_type, payload.amount, payload.notes,
+            created_by_user_id=current_user.id,
+        )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
 
 @router.patch("/{client_uuid}", response_model=ClientResponse)

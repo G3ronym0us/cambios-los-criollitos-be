@@ -22,12 +22,15 @@ from app.database.connection import get_db
 from app.models.user import User
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from app.schemas.whatsapp import (
+    WhatsAppBalanceDebit,
     WhatsAppOperationList,
     WhatsAppOperationResponse,
     WhatsAppOperationScenarioUpdate,
+    WhatsAppOperationStatusUpdate,
     WhatsAppOperationUpdate,
     WhatsAppStatsResponse,
 )
+from app.services.whatsapp_balance_service import WhatsAppBalanceService
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
 from app.services.whatsapp_quote_service import QuoteServiceError, WhatsAppQuoteService
 
@@ -117,6 +120,22 @@ async def get_operation_payments(
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
 
+@router.post("/{op_uuid}/debit-balance", status_code=status.HTTP_201_CREATED)
+async def debit_balance_for_operation(
+    op_uuid: UUID,
+    payload: WhatsAppBalanceDebit,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Debita saldo a favor del cliente por esta operación de abono (default: from_amount USD)."""
+    try:
+        return WhatsAppBalanceService(db).debit_for_operation(
+            op_uuid, payload.amount, payload.notes, created_by_user_id=current_user.id
+        )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
 @router.patch("/{op_uuid}", response_model=WhatsAppOperationResponse)
 async def update_operation(
     op_uuid: UUID,
@@ -127,7 +146,23 @@ async def update_operation(
     """Edita cliente, escenario, grupo y receptor como una sola operación atómica."""
     service = WhatsAppQuoteService(db)
     try:
-        op = service.update_operation(op_uuid, payload)
+        op = service.update_operation(op_uuid, payload, current_user)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+    return WhatsAppOperationResponse.model_validate(op.dict())
+
+
+@router.patch("/{op_uuid}/status", response_model=WhatsAppOperationResponse)
+async def update_operation_status(
+    op_uuid: UUID,
+    payload: WhatsAppOperationStatusUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cambia manualmente el estado; COMPLETED crea la transacción contable."""
+    service = WhatsAppQuoteService(db)
+    try:
+        op = service.update_status(op_uuid, payload.status, current_user)
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
     return WhatsAppOperationResponse.model_validate(op.dict())
@@ -143,7 +178,7 @@ async def update_operation_scenario(
     """Edición manual del escenario/grupo/receptor del entrante desde el dashboard."""
     service = WhatsAppQuoteService(db)
     try:
-        op = service.set_scenario(op_uuid, payload)
+        op = service.set_scenario(op_uuid, payload, current_user)
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
     return WhatsAppOperationResponse.model_validate(op.dict())

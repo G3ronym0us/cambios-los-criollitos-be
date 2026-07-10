@@ -45,6 +45,8 @@ class TransactionRepository:
         # Calcular profit_amount basado en el porcentaje y el monto
         profit_amount = (transaction_data.to_amount * transaction_data.total_profit_percentage) / 100
 
+        transaction_status = TransactionStatus(transaction_data.status.lower())
+
         # Crear transacción
         db_transaction = Transaction(
             user_id=user_id,
@@ -56,8 +58,8 @@ class TransactionRepository:
             transaction_type=transaction_data.transaction_type,
             total_profit_percentage=transaction_data.total_profit_percentage,
             profit_amount=profit_amount,
-            status=TransactionStatus.COMPLETED,
-            completed_at=datetime.utcnow()
+            status=transaction_status,
+            completed_at=datetime.utcnow() if transaction_status == TransactionStatus.COMPLETED else None,
         )
 
         self.db.add(db_transaction)

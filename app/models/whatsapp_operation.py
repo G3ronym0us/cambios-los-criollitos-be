@@ -42,7 +42,7 @@ class WhatsAppOperationScenario(enum.Enum):
 class WhatsAppOperation(UUIDMixin, Base):
     """
     Operación originada en WhatsApp. Ciclo: QUOTED -> PENDING -> COMPLETED.
-    Al COMPLETED se crea/vincula un Transaction (profit splits, fondos).
+    Si tiene una Transaction vinculada, esta refleja su estado y datos contables.
     """
     __tablename__ = "whatsapp_operations"
 
@@ -84,7 +84,7 @@ class WhatsAppOperation(UUIDMixin, Base):
     # Notas: payment_info extraída por el bot (cédula, banco, teléfono, etc.)
     notes = Column(Text, nullable=True)
 
-    # Vínculo con la Transaction generada al completar (None mientras QUOTED/PENDING)
+    # Vínculo con la Transaction derivada. Puede existir desde QUOTED/PENDING si hay fondo.
     transaction_id = Column(Integer, ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True, index=True)
 
     # UUID original de la operación cuando vivía en SQLite del bot. Permite reconciliar

@@ -1,10 +1,16 @@
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
 
 from app.schemas.whatsapp import WhatsAppOperationUpdate
 from app.services.whatsapp_quote_service import QuoteServiceError, WhatsAppQuoteService
+
+
+def _operator():
+    """Stub del operador (User) que update_operation exige para sincronizar transacciones."""
+    return SimpleNamespace(id=1, username="operator")
 
 
 @pytest.mark.parametrize(
@@ -88,13 +94,14 @@ def test_assign_client_clears_name_and_syncs_both_payment_types():
 
 def test_operation_update_commits_once_after_all_changes_succeed():
     db = _TrackingDB()
-    op = SimpleNamespace()
+    op = SimpleNamespace(fund_group_id=None, transaction_id=None)
     calls = []
     service = SimpleNamespace(
         db=db,
         _get_op_or_404=lambda _uuid: op,
         _assign_client=lambda *args: calls.append(("client", args)),
         _apply_scenario=lambda *args: calls.append(("scenario", args)),
+        _sync_linked_transaction=lambda _op: None,
     )
     payload = WhatsAppOperationUpdate(
         client_phone="584121234567",
@@ -102,7 +109,7 @@ def test_operation_update_commits_once_after_all_changes_succeed():
         scenario="NORMAL",
     )
 
-    result = WhatsAppQuoteService.update_operation(service, None, payload)
+    result = WhatsAppQuoteService.update_operation(service, None, payload, _operator())
 
     assert result is op
     assert [call[0] for call in calls] == ["client", "scenario"]
@@ -129,7 +136,79 @@ def test_operation_update_does_not_commit_when_scenario_fails():
     )
 
     with pytest.raises(QuoteServiceError):
-        WhatsAppQuoteService.update_operation(service, None, payload)
+        WhatsAppQuoteService.update_operation(service, None, payload, _operator())
 
     assert db.commits == 0
     assert db.refreshed == []
+
+
+class _PairQuery:
+    def __init__(self, pair):
+        self.pair = pair
+
+    def filter(self, *_args, **_kwargs):
+        return self
+
+    def first(self):
+        return self.pair
+
+
+class _PairTrackingDB(_TrackingDB):
+    def __init__(self, pair):
+        super().__init__()
+        self.pair = pair
+
+    def query(self, _model):
+        return _PairQuery(self.pair)
+
+
+def test_operation_update_reassigns_currency_pair_without_changing_amounts():
+    pair_uuid = uuid4()
+    pair = SimpleNamespace(id=9, uuid=pair_uuid)
+    op = SimpleNamespace(
+        currency_pair_id=3,
+        currency_pair=SimpleNamespace(id=3),
+        from_amount=200,
+        to_amount=157440,
+        rate_used=787.2,
+        fund_group_id=None,
+        transaction_id=None,
+    )
+    db = _PairTrackingDB(pair)
+    service = SimpleNamespace(
+        db=db,
+        _get_op_or_404=lambda _uuid: op,
+        _apply_scenario=lambda *_args: None,
+        _sync_linked_transaction=lambda _op: None,
+    )
+
+    result = WhatsAppQuoteService.update_operation(
+        service,
+        None,
+        WhatsAppOperationUpdate(currency_pair_uuid=pair_uuid),
+        _operator(),
+    )
+
+    assert result.currency_pair_id == pair.id
+    assert result.currency_pair is pair
+    assert (result.from_amount, result.to_amount, result.rate_used) == (200, 157440, 787.2)
+    assert db.commits == 1
+
+
+def test_operation_update_rejects_unknown_currency_pair():
+    db = _PairTrackingDB(None)
+    service = SimpleNamespace(
+        db=db,
+        _get_op_or_404=lambda _uuid: SimpleNamespace(),
+    )
+
+    with pytest.raises(QuoteServiceError) as error:
+        WhatsAppQuoteService.update_operation(
+            service,
+            None,
+            WhatsAppOperationUpdate(currency_pair_uuid=uuid4()),
+            _operator(),
+        )
+
+    assert error.value.code == "currency_pair_not_found"
+    assert db.commits == 0

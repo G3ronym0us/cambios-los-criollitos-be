@@ -22,6 +22,8 @@ class ClientResponse(BaseModel):
     is_tracked: bool
     is_blocked: bool
     is_usdt_authorized: bool
+    # Saldo a favor en USD (ledger whatsapp_balance_entries); 0 si no tiene.
+    balance: float = 0.0
     last_seen_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None

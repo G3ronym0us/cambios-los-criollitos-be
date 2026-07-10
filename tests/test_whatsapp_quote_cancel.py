@@ -1,84 +1,71 @@
-"""
-Tests de _cancel_previous_quoted — al crear una cotización nueva, solo se
-cancelan las QUOTED SIN datos de pago (notes vacío). Las QUOTED que ya tienen
-destinatario (notes) son operaciones distintas en curso (multi-operación en la
-misma conversación) y deben sobrevivir.
-
-Paridad con el bot local: whatsapp-bot/src/operations.ts::cancelPreviousQuoted
-(filtra notes IS NULL).
-"""
+"""Pruebas de transiciones explícitas del ciclo de operaciones."""
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from app.models.whatsapp_operation import WhatsAppOperationStatus
+from app.schemas.whatsapp import WhatsAppOperationCreate
 from app.services.whatsapp_quote_service import WhatsAppQuoteService
 
 
-class _FakeQuery:
-    """Stub de self.db.query(...).filter(...).all() → lista fija de ops."""
+class _CreateDB:
+    def __init__(self):
+        self.added = []
+        self.commits = 0
 
-    def __init__(self, ops):
-        self._ops = ops
+    def add(self, value):
+        self.added.append(value)
 
-    def filter(self, *args, **kwargs):
-        return self
+    def commit(self):
+        self.commits += 1
 
-    def all(self):
-        return self._ops
-
-
-class _FakeDB:
-    def __init__(self, ops):
-        self._ops = ops
-
-    def query(self, *args, **kwargs):
-        return _FakeQuery(self._ops)
+    def refresh(self, _value):
+        pass
 
 
-def _op(notes):
-    return SimpleNamespace(
-        notes=notes,
-        status=WhatsAppOperationStatus.QUOTED,
-        cancelled_at=None,
+@pytest.mark.parametrize(
+    ("notes", "expected_status"),
+    [
+        (None, WhatsAppOperationStatus.QUOTED),
+        ("0102\nV18132409\n04241387346", WhatsAppOperationStatus.PENDING),
+    ],
+)
+def test_quote_initial_status_depends_on_payment_data(notes, expected_status):
+    db = _CreateDB()
+    client = SimpleNamespace(id=2, is_blocked=False, is_usdt_authorized=True)
+    pair = SimpleNamespace(id=3)
+    entry = SimpleNamespace(
+        rate=750.0,
+        inverse_percentage=False,
+        base_rate=800.0,
+        base_percentage=6.25,
+    )
+    service = SimpleNamespace(
+        db=db,
+        upsert_client=lambda *_args: client,
+        pair_repo=SimpleNamespace(get_by_symbol=lambda _symbol: pair),
+        resolver=SimpleNamespace(
+            get_rate_entry_for_pair=lambda *_args: entry,
+            apply_rate=lambda amount, rate, inverse: amount / rate if inverse else amount * rate,
+        ),
     )
 
+    op = WhatsAppQuoteService.create_quote(
+        service,
+        WhatsAppOperationCreate(
+            client_phone="584121234567",
+            from_currency="ZELLE",
+            to_currency="VES",
+            amount=100,
+            notes=notes,
+        ),
+    )
 
-def _run(ops):
-    service = SimpleNamespace(db=_FakeDB(ops))
-    # Llamamos al método sin instanciar el servicio (evita dependencias del __init__).
-    WhatsAppQuoteService._cancel_previous_quoted(service, client_id=1)
-    return ops
-
-
-def test_cancels_quoted_without_notes():
-    op = _op(None)
-    _run([op])
-    assert op.status == WhatsAppOperationStatus.CANCELLED
-    assert op.cancelled_at is not None
-
-
-def test_cancels_quoted_with_empty_notes():
-    op = _op("   ")
-    _run([op])
-    assert op.status == WhatsAppOperationStatus.CANCELLED
-
-
-def test_preserves_quoted_with_notes():
-    op = _op("0105\nV11725538\n04127706986")
-    _run([op])
-    assert op.status == WhatsAppOperationStatus.QUOTED
-    assert op.cancelled_at is None
-
-
-def test_multi_op_only_cancels_the_dangling_quote():
-    # Caso real: op1 (130, con banco 0105) + una cotización suelta sin datos.
-    # Al crear una tercera, solo la suelta debe caer; la de 130 sobrevive.
-    with_notes = _op("0105\nV11725538\n04127706986")
-    dangling = _op(None)
-    _run([with_notes, dangling])
-    assert with_notes.status == WhatsAppOperationStatus.QUOTED
-    assert dangling.status == WhatsAppOperationStatus.CANCELLED
+    assert op.status == expected_status
+    assert (op.approved_at is not None) == (expected_status == WhatsAppOperationStatus.PENDING)
+    assert db.commits == 1
 
 
 # ---------- restore_quote (reversión de corrección) ----------
@@ -101,6 +88,7 @@ def _restore(op):
     service = SimpleNamespace(
         db=_FakeDBSingle(op),
         _get_op_or_404=lambda _uuid: op,
+        _sync_linked_transaction=lambda _op: None,
     )
     return WhatsAppQuoteService.restore_quote(service, op_uuid=None)
 

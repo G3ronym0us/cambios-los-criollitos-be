@@ -7,6 +7,7 @@ import enum
 
 class TransactionStatus(enum.Enum):
     """Estados de una transacción"""
+    QUOTED = "quoted"
     PENDING = "pending"
     COMPLETED = "completed"
     CANCELLED = "cancelled"

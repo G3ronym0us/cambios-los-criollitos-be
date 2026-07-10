@@ -65,6 +65,10 @@ class WhatsAppOperationCancel(BaseModel):
     reason: Optional[str] = None
 
 
+class WhatsAppOperationStatusUpdate(BaseModel):
+    status: Literal["QUOTED", "PENDING", "COMPLETED", "CANCELLED"]
+
+
 class WhatsAppOperationNotes(BaseModel):
     """Adjuntar/actualizar las notas (datos de pago) de una op activa.
 
@@ -159,6 +163,8 @@ def _normalize_client_phone(value: str) -> str:
 class WhatsAppOperationUpdate(WhatsAppOperationScenarioUpdate):
     """Edición atómica de los datos administrativos de una operación."""
 
+    currency_pair_uuid: Optional[UUID] = None
+    applied_percentage: Optional[float] = Field(None, ge=0, le=99)
     client_phone: Optional[str] = Field(None, min_length=4, max_length=32)
     client_display_name: Optional[str] = Field(None, max_length=120)
 
@@ -281,6 +287,32 @@ class WhatsAppPaymentDeposit(BaseModel):
         v_up = v.upper()
         if v_up not in allowed:
             raise ValueError(f"deposit_method must be one of: {', '.join(sorted(allowed))}")
+        return v_up
+
+
+class WhatsAppBalanceCredit(BaseModel):
+    """Acreditar un pago entrante como saldo a favor. Sin amount → usa el del pago."""
+    amount: Optional[float] = Field(None, gt=0)
+    notes: Optional[str] = None
+
+
+class WhatsAppBalanceDebit(BaseModel):
+    """Debitar saldo por una operación de abono. Sin amount → from_amount de la op."""
+    amount: Optional[float] = Field(None, gt=0)
+    notes: Optional[str] = None
+
+
+class WhatsAppBalanceAdjust(BaseModel):
+    """Ajuste manual de saldo (crédito o débito) desde el front."""
+    entry_type: str = Field(..., description="CREDIT | DEBIT")
+    amount: float = Field(..., gt=0)
+    notes: Optional[str] = None
+
+    @validator('entry_type')
+    def validate_entry_type(cls, v: str) -> str:
+        v_up = v.upper()
+        if v_up not in {"CREDIT", "DEBIT"}:
+            raise ValueError("entry_type must be CREDIT or DEBIT")
         return v_up
 
 

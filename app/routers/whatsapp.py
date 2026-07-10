@@ -105,6 +105,22 @@ def cancel_operation(
     return WhatsAppOperationResponse.model_validate(op.dict())
 
 
+@router.patch("/operations/{op_uuid}/restore", response_model=WhatsAppOperationResponse)
+def restore_operation(
+    op_uuid: UUID,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    """Revierte una cancelación reciente (CANCELLED → QUOTED). Lo usa el bot al
+    detectar que una 'corrección de monto' era en realidad una operación aparte."""
+    service = WhatsAppQuoteService(db)
+    try:
+        op = service.restore_quote(op_uuid)
+    except QuoteServiceError as exc:
+        _handle_service_error(exc)
+    return WhatsAppOperationResponse.model_validate(op.dict())
+
+
 @router.patch("/operations/{op_uuid}/complete", response_model=WhatsAppOperationResponse)
 def complete_operation(
     op_uuid: UUID,

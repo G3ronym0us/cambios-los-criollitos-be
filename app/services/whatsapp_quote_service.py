@@ -183,6 +183,11 @@ class WhatsAppQuoteService:
         return op
 
     def _cancel_previous_quoted(self, client_id: int) -> None:
+        # Solo se cancelan cotizaciones QUOTED SIN datos de pago (notes vacío):
+        # son cotizaciones "sueltas" que la nueva reemplaza. Una QUOTED que YA
+        # tiene destinatario (notes) es una operación distinta en curso (caso
+        # multi-operación en la misma conversación) y no debe cancelarse.
+        # Paridad con el bot local (cancelPreviousQuoted filtra notes IS NULL).
         previous = (
             self.db.query(WhatsAppOperation)
             .filter(
@@ -193,6 +198,8 @@ class WhatsAppQuoteService:
         )
         now = datetime.now(timezone.utc)
         for op in previous:
+            if op.notes is not None and op.notes.strip() != "":
+                continue
             op.status = WhatsAppOperationStatus.CANCELLED
             op.cancelled_at = now
 
@@ -229,6 +236,30 @@ class WhatsAppQuoteService:
         op.cancelled_at = datetime.now(timezone.utc)
         if payload.reason:
             op.notes = (op.notes + "\n" if op.notes else "") + f"[cancel] {payload.reason}"
+        self.db.commit()
+        self.db.refresh(op)
+        return op
+
+    def restore_quote(self, op_uuid: UUID) -> WhatsAppOperation:
+        """Revierte una cancelación reciente: CANCELLED -> QUOTED (refresca expires_at).
+
+        Lo usa el bot cuando detecta que una "corrección de monto" era en realidad
+        una operación aparte: la op que se había cancelado al asumir la corrección
+        debe volver a estar activa. Idempotente si ya está QUOTED.
+        """
+        op = self._get_op_or_404(op_uuid)
+        if op.status == WhatsAppOperationStatus.QUOTED:
+            return op
+        if op.status != WhatsAppOperationStatus.CANCELLED:
+            raise QuoteServiceError(
+                "invalid_status",
+                f"Solo se puede restaurar una op CANCELLED, no {op.status.value}",
+                409,
+            )
+        now = datetime.now(timezone.utc)
+        op.status = WhatsAppOperationStatus.QUOTED
+        op.cancelled_at = None
+        op.expires_at = now + timedelta(minutes=QUOTE_TTL_MINUTES)
         self.db.commit()
         self.db.refresh(op)
         return op

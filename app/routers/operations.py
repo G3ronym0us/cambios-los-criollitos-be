@@ -137,6 +137,21 @@ async def debit_balance_for_operation(
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
 
+@router.patch("/{op_uuid}/delivered", response_model=WhatsAppOperationResponse)
+async def mark_operation_delivered(
+    op_uuid: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Marca como recibidos los USD efectivo (delivery_status PENDING→RECEIVED)."""
+    service = WhatsAppQuoteService(db)
+    try:
+        op = service.mark_delivered(op_uuid)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+    return WhatsAppOperationResponse.model_validate(op.dict())
+
+
 @router.post("/{op_uuid}/partial-settle")
 async def partial_settle_operation(
     op_uuid: UUID,

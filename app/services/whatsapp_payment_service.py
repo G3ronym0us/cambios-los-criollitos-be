@@ -153,10 +153,17 @@ class WhatsAppPaymentService:
         offset: int = 0,
         search: Optional[str] = None,
         out_class: str = "ALL",
+        unlinked_only: bool = False,
     ) -> dict:
         """Página de pagos para el front: búsqueda + clasificación server-side. Devuelve {items, total}."""
         Model = self._model(table)
         q = self._payments_base_query(Model)
+
+        # Los selectores de una operación solo deben recibir pagos disponibles.
+        # Aplicarlo en la consulta evita exponer pagos pertenecientes a otra
+        # operación y mantiene correcto el total paginado.
+        if unlinked_only:
+            q = q.filter(Model.whatsapp_operation_id.is_(None))
 
         search = (search or "").strip()
         if search:

@@ -42,13 +42,21 @@ async def list_payments(
     offset: int = Query(0, ge=0),
     search: str | None = Query(None),
     out_class: str = Query("ALL"),
+    unlinked_only: bool = Query(False),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Página de pagos (paginada + búsqueda/clasificación server-side). Devuelve {items, total}."""
     service = WhatsAppPaymentService(db)
     try:
-        return service.list_payments_page(table, limit, offset, search, out_class)
+        return service.list_payments_page(
+            table,
+            limit,
+            offset,
+            search,
+            out_class,
+            unlinked_only,
+        )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 

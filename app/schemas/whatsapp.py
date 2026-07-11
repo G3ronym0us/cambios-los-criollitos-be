@@ -254,8 +254,16 @@ class WhatsAppPaymentUpdate(BaseModel):
     reference: Optional[str] = None
 
 
+class WhatsAppPartialSettle(BaseModel):
+    """Corrección retroactiva de una op COMPLETED: monto USD realmente cambiado."""
+    settle_amount: float = Field(gt=0)
+
+
 class WhatsAppPaymentLink(BaseModel):
     operation_uuid: Optional[UUID] = None
+    # Liquidación parcial (solo salientes): monto USD realmente cambiado; el
+    # excedente de la op se acredita como saldo a favor al completar.
+    settle_amount: Optional[float] = Field(None, gt=0)
 
 
 class WhatsAppPersonalExpense(BaseModel):

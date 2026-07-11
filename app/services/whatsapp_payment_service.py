@@ -24,6 +24,7 @@ from app.models.whatsapp_operation import (
 )
 from app.models.fund import FundGroup, FundMovement, FundMovementType
 from app.models.user import User
+from app.models.whatsapp_balance import WhatsAppBalanceEntry, WhatsAppBalanceEntryType
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.repositories.fund_repository import FundRepository
@@ -272,21 +273,237 @@ class WhatsAppPaymentService:
 
     # ---------- Vincular / flags ----------
 
-    def set_operation(self, table: str, payment_id: int, operation_uuid: Optional[UUID]) -> dict:
+    def set_operation(
+        self,
+        table: str,
+        payment_id: int,
+        operation_uuid: Optional[UUID],
+        completing_user: Optional[User] = None,
+        complete_outgoing: bool = False,
+        settle_amount: Optional[float] = None,
+    ) -> dict:
         row = self._get_or_404(table, payment_id)
+        op = None
         if operation_uuid is not None:
             op = self.db.query(WhatsAppOperation).filter(WhatsAppOperation.uuid == operation_uuid).first()
             if op is None:
                 raise QuoteServiceError("op_not_found", f"Operation {operation_uuid} no encontrada", 404)
+            if (
+                complete_outgoing
+                and row.whatsapp_operation_id is not None
+                and row.whatsapp_operation_id != op.id
+            ):
+                raise QuoteServiceError(
+                    "payment_already_linked",
+                    "El pago ya pertenece a otra operación; desvincúlalo primero",
+                    409,
+                )
             row.whatsapp_operation_id = op.id
             # Sincroniza client_phone al de la op (el operador afirma "este pago es de este cliente").
             if op.client and op.client.phone:
                 row.client_phone = op.client.phone
         else:
             row.whatsapp_operation_id = None
-        self.db.commit()
+
+        # Liquidación parcial: el cliente envió el total de la op (ej. 200) pero solo pidió
+        # cambiar una parte (ej. 30). Se redimensiona la op al monto realmente cambiado
+        # (mismo ratio from→to de la cotización) y el excedente se ACREDITA como saldo a
+        # favor ANTES de completar, para que la transacción contable nazca con los montos
+        # reales. Solo aplica al vincular el saliente que completa la op.
+        if settle_amount is not None:
+            self._apply_partial_settle(table, op, settle_amount, complete_outgoing, completing_user)
+
+        # En el panel, vincular manualmente una captura saliente confirma que el
+        # dinero fue enviado. La operación y su transacción deben completarse en
+        # la misma acción. El endpoint del bot no activa esta rama porque ese
+        # flujo ya llama explícitamente a complete_operation después del match.
+        if (
+            complete_outgoing
+            and table == "outgoing"
+            and op is not None
+            and op.status in (WhatsAppOperationStatus.QUOTED, WhatsAppOperationStatus.PENDING)
+        ):
+            if completing_user is None:
+                raise QuoteServiceError(
+                    "complete_user_required",
+                    "Falta el usuario que completa la operación",
+                    400,
+                )
+            self.db.flush()
+            WhatsAppQuoteService(self.db).update_status(
+                op.uuid,
+                WhatsAppOperationStatus.COMPLETED.value,
+                completing_user,
+            )
+        else:
+            self.db.commit()
         self.db.refresh(row)
         return self._with_name(row)
+
+    def _apply_partial_settle(
+        self,
+        table: str,
+        op: Optional[WhatsAppOperation],
+        settle_amount: float,
+        complete_outgoing: bool,
+        completing_user: Optional[User],
+    ) -> None:
+        """
+        Redimensiona la op al monto USD realmente cambiado y acredita el excedente
+        como saldo a favor (ledger `whatsapp_balance_entries`). NO comitea: el
+        caller completa la op (y comitea) en la misma acción.
+        """
+        if not (complete_outgoing and table == "outgoing" and op is not None):
+            raise QuoteServiceError(
+                "partial_settle_invalid",
+                "El monto parcial solo aplica al vincular un saliente a una operación",
+                400,
+            )
+        if op.status not in (WhatsAppOperationStatus.QUOTED, WhatsAppOperationStatus.PENDING):
+            raise QuoteServiceError(
+                "partial_settle_invalid_status",
+                f"La operación está {op.status.value}; solo se liquida parcial una op activa",
+                409,
+            )
+        self._partial_settle_core(op, settle_amount, completing_user)
+
+    def partial_settle_completed(
+        self,
+        op_uuid: UUID,
+        settle_amount: float,
+        completing_user: Optional[User],
+    ) -> dict:
+        """
+        Corrección retroactiva: una op ya COMPLETED que se completó por el total
+        cuando el cliente solo cambió una parte. Redimensiona la op, sincroniza la
+        transacción contable (montos + ganancia + splits) y acredita el excedente
+        como saldo a favor.
+        """
+        op = (
+            self.db.query(WhatsAppOperation)
+            .filter(WhatsAppOperation.uuid == op_uuid)
+            .first()
+        )
+        if op is None:
+            raise QuoteServiceError("op_not_found", f"Operation {op_uuid} no encontrada", 404)
+        if op.status != WhatsAppOperationStatus.COMPLETED:
+            raise QuoteServiceError(
+                "partial_settle_invalid_status",
+                f"La operación está {op.status.value}; la corrección aplica a ops COMPLETED "
+                "(para una op activa usa el monto parcial al vincular el saliente)",
+                409,
+            )
+
+        surplus = self._partial_settle_core(op, settle_amount, completing_user)
+        # Espejo contable: la transacción (y sus profit splits) deben reflejar los
+        # montos corregidos, no los originales.
+        WhatsAppQuoteService(self.db)._sync_linked_transaction(op)
+        self.db.commit()
+        self.db.refresh(op)
+
+        from app.services.whatsapp_balance_service import WhatsAppBalanceService
+
+        return {
+            "operation": op.dict(),
+            "credited": surplus,
+            "balance_after": WhatsAppBalanceService(self.db).get_balance(op.client_id),
+        }
+
+    def _partial_settle_core(
+        self,
+        op: WhatsAppOperation,
+        settle_amount: float,
+        completing_user: Optional[User],
+    ) -> float:
+        """
+        Validaciones + redimensión + crédito del excedente, compartido entre la
+        liquidación parcial al vincular y la corrección retroactiva. NO comitea.
+        Devuelve el excedente acreditado.
+        """
+        cp = op.currency_pair
+        from_symbol = cp.from_currency.symbol if cp and cp.from_currency else None
+        if settlement_currency(from_symbol) != "USD":
+            raise QuoteServiceError(
+                "partial_settle_unsupported",
+                f"Solo ops con lado origen USD/ZELLE/PAYPAL acreditan excedente (origen: {from_symbol})",
+                400,
+            )
+        if op.client_id is None:
+            raise QuoteServiceError(
+                "partial_settle_no_client",
+                "La operación no tiene cliente al que acreditar el excedente",
+                400,
+            )
+        if settle_amount <= 0:
+            raise QuoteServiceError("invalid_amount", "El monto cambiado debe ser > 0", 400)
+
+        # Una sola corrección por op: si ya existe un crédito de excedente para esta
+        # operación, un segundo achicaría los montos otra vez y duplicaría saldo.
+        prior_credit = (
+            self.db.query(WhatsAppBalanceEntry)
+            .filter(
+                WhatsAppBalanceEntry.whatsapp_operation_id == op.id,
+                WhatsAppBalanceEntry.entry_type == WhatsAppBalanceEntryType.CREDIT,
+            )
+            .first()
+        )
+        if prior_credit is not None:
+            raise QuoteServiceError(
+                "partial_settle_already_applied",
+                f"Esta operación ya acreditó un excedente de {prior_credit.amount:.2f} USD",
+                409,
+            )
+
+        surplus = round(op.from_amount - settle_amount, 2)
+        if surplus <= 0.01:
+            raise QuoteServiceError(
+                "partial_settle_not_partial",
+                f"El monto cambiado ({settle_amount:.2f}) debe ser menor al total de la op ({op.from_amount:.2f})",
+                400,
+            )
+
+        original_from = op.from_amount
+        ratio = op.to_amount / op.from_amount
+        op.from_amount = round(settle_amount, 2)
+        op.to_amount = round(settle_amount * ratio, 2)
+
+        # Trazabilidad: si la op tiene un entrante vinculado que aún no fue acreditado,
+        # el crédito lo referencia (misma restricción de un-crédito-por-entrante que
+        # usa credit_from_incoming).
+        incoming_id = None
+        incoming = (
+            self.db.query(WhatsAppIncomingPayment)
+            .filter(WhatsAppIncomingPayment.whatsapp_operation_id == op.id)
+            .first()
+        )
+        if incoming is not None:
+            already = (
+                self.db.query(WhatsAppBalanceEntry)
+                .filter(
+                    WhatsAppBalanceEntry.incoming_payment_id == incoming.id,
+                    WhatsAppBalanceEntry.entry_type == WhatsAppBalanceEntryType.CREDIT,
+                )
+                .first()
+            )
+            if already is None:
+                incoming_id = incoming.id
+
+        self.db.add(
+            WhatsAppBalanceEntry(
+                client_id=op.client_id,
+                entry_type=WhatsAppBalanceEntryType.CREDIT,
+                amount=surplus,
+                currency="USD",
+                incoming_payment_id=incoming_id,
+                whatsapp_operation_id=op.id,
+                notes=(
+                    f"Excedente de op {str(op.uuid)[:8]}: cambió {settle_amount:.2f} "
+                    f"de {original_from:.2f} {from_symbol}"
+                ),
+                created_by_user_id=completing_user.id if completing_user else None,
+            )
+        )
+        return surplus
 
     def set_personal_expense(self, payment_id: int, is_personal: bool, description: Optional[str]) -> dict:
         row = self._get_or_404("outgoing", payment_id)

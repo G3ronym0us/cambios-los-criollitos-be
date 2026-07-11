@@ -69,10 +69,21 @@ async def link_payment_operation(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Vincula (o desvincula con operation_uuid=null) un pago a una operación. Operador JWT."""
+    """
+    Vincula un pago; si es saliente, completa la operación activa y su transacción.
+    Con `settle_amount` (solo salientes) la op se redimensiona al monto realmente
+    cambiado y el excedente se acredita como saldo a favor del cliente.
+    """
     service = WhatsAppPaymentService(db)
     try:
-        return service.set_operation(table, payment_id, payload.operation_uuid)
+        return service.set_operation(
+            table,
+            payment_id,
+            payload.operation_uuid,
+            completing_user=current_user,
+            complete_outgoing=True,
+            settle_amount=payload.settle_amount,
+        )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 

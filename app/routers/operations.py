@@ -28,6 +28,7 @@ from app.schemas.whatsapp import (
     WhatsAppOperationScenarioUpdate,
     WhatsAppOperationStatusUpdate,
     WhatsAppOperationUpdate,
+    WhatsAppPartialSettle,
     WhatsAppStatsResponse,
 )
 from app.services.whatsapp_balance_service import WhatsAppBalanceService
@@ -132,6 +133,25 @@ async def debit_balance_for_operation(
         return WhatsAppBalanceService(db).debit_for_operation(
             op_uuid, payload.amount, payload.notes, created_by_user_id=current_user.id
         )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.post("/{op_uuid}/partial-settle")
+async def partial_settle_operation(
+    op_uuid: UUID,
+    payload: WhatsAppPartialSettle,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Corrección retroactiva de una op COMPLETED que se completó por el total cuando
+    el cliente solo cambió una parte: redimensiona la op al monto realmente cambiado,
+    sincroniza la transacción contable y acredita el excedente como saldo a favor.
+    """
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.partial_settle_completed(op_uuid, payload.settle_amount, current_user)
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 

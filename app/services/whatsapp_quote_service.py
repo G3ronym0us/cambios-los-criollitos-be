@@ -103,34 +103,45 @@ class WhatsAppQuoteService:
                 404,
             )
 
-        # Path BCV: USDT no autorizado + par involucra USDT/VES → forzar tasa BCV
-        bcv_usd: Optional[float] = None
-        if not client.is_usdt_authorized and "USDT" in (payload.from_currency, payload.to_currency) and "VES" in (
-            payload.from_currency,
-            payload.to_currency,
+        # El bot puede enviar el monto USD original de una cotización anclada al
+        # BCV. El `amount` recibido ya es el monto efectivo convertido a VES;
+        # este campo se conserva como referencia y para mostrarlo en el panel.
+        bcv_usd: Optional[float] = payload.bcv_usd
+
+        # Compatibilidad del path backend USDT↔VES: si no vino una referencia
+        # explícita y el cliente no está autorizado, usar el BCV cacheado.
+        bcv_rate: Optional[float] = None
+        if (
+            bcv_usd is None
+            and not client.is_usdt_authorized
+            and "USDT" in (payload.from_currency, payload.to_currency)
+            and "VES" in (payload.from_currency, payload.to_currency)
         ):
-            bcv_usd = get_cached_bcv_rate(self.db)
+            bcv_rate = get_cached_bcv_rate(self.db)
+            # Compatibilidad con operaciones creadas por este path histórico,
+            # donde el campo guardaba la tasa BCV en vez del monto de referencia.
+            bcv_usd = bcv_rate
 
         entry = self.resolver.get_rate_entry_for_pair(payload.from_currency, payload.to_currency)
-        if entry is None and bcv_usd is None:
+        if entry is None and bcv_rate is None:
             raise QuoteServiceError(
                 "rate_not_available",
                 f"No hay tasa disponible para {payload.from_currency}/{payload.to_currency}",
                 422,
             )
 
-        # Cuando entramos por BCV path, sobreescribimos rate/inverse_percentage:
-        # bcv_usd es VES/USD; si pedido es USDT->VES usamos directo; si VES->USDT, inverso.
-        if bcv_usd is not None and entry is None:
+        # Cuando entramos por el path BCV legacy, sobreescribimos la tasa:
+        # si el pedido es USDT->VES usamos directo; si es VES->USDT, inverso.
+        if bcv_rate is not None and entry is None:
             if payload.from_currency == "USDT" and payload.to_currency == "VES":
-                rate = bcv_usd
+                rate = bcv_rate
                 inverse_percentage = False
-                base_rate = bcv_usd
+                base_rate = bcv_rate
                 base_percentage = None
             else:
-                rate = bcv_usd
+                rate = bcv_rate
                 inverse_percentage = True
-                base_rate = bcv_usd
+                base_rate = bcv_rate
                 base_percentage = None
             applied_percentage = None
             default_percentage = None

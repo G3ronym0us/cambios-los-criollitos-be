@@ -50,6 +50,9 @@ class WhatsAppOperationCreate(BaseModel):
     amount: float = Field(..., gt=0)
     amount_side: Literal["SEND", "RECEIVE"] = "SEND"
     margin_override: Optional[float] = Field(None, ge=0, le=99)
+    # Monto USD original cuando el bot ancla el monto a recibir a la tasa BCV.
+    # `amount` ya contiene el monto efectivo a cotizar (normalmente VES).
+    bcv_usd: Optional[float] = Field(None, gt=0)
     notes: Optional[str] = None  # payment_info del bot (cédula, banco, etc.)
 
     @validator('from_currency', 'to_currency')

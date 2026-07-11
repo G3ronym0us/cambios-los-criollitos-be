@@ -1,8 +1,8 @@
 """
-Migración one-shot de datos del bot WhatsApp (SQLite `bot.db`) al backend
-(Postgres). Es el paso de datos del cutover G3R-16: se corre UNA vez, con las
-tablas whatsapp_* recién creadas (vacías) por alembic y ANTES de encender
-USE_BACKEND_FOR_QUOTES=true en el bot.
+Migración de datos del bot WhatsApp (SQLite `bot.db`) al backend (Postgres).
+El modo completo es el paso one-shot del cutover G3R-16. El modo incremental
+`--operations-only` permite recuperar operaciones legacy posteriores sin
+duplicar las que ya tengan `legacy_sqlite_id` en PostgreSQL.
 
 Qué hace (inserción directa, NO usa WhatsAppQuoteService):
   - clients (+ tracked/blocked/flags/preferences) -> whatsapp_clients
@@ -30,6 +30,9 @@ Uso:
     python -m app.cli.migrate_bot_sqlite --sqlite-path /tmp/bot.db --commit
     # re-correr desde cero (borra whatsapp_* antes; sólo pre-cutover):
     python -m app.cli.migrate_bot_sqlite --sqlite-path /tmp/bot.db --wipe --commit
+    # backfill incremental de cotizaciones BCV posteriores al cutover:
+    python -m app.cli.migrate_bot_sqlite --sqlite-path /tmp/bot.db \
+        --operations-only --bcv-only --commit
 """
 
 import argparse
@@ -99,13 +102,26 @@ DELIVERY_MAP = {
 }
 
 
-def run(sqlite_path: str, commit: bool, wipe: bool) -> int:
+def run(
+    sqlite_path: str,
+    commit: bool,
+    wipe: bool,
+    operations_only: bool = False,
+    bcv_only: bool = False,
+) -> int:
+    if operations_only and wipe:
+        print("❌ --operations-only no se puede combinar con --wipe")
+        return 2
+    if bcv_only and not operations_only:
+        print("❌ --bcv-only requiere --operations-only")
+        return 2
+
     con = sqlite3.connect(sqlite_path)
     con.row_factory = sqlite3.Row
     db = SessionLocal()
 
     stats = {
-        "clients": 0, "ops": 0, "ops_skipped_no_pair": 0,
+        "clients": 0, "ops": 0, "ops_existing": 0, "ops_skipped_no_pair": 0,
         "incoming": 0, "outgoing": 0,
         "pay_op_unlinked": 0, "src_unlinked": 0,
     }
@@ -181,14 +197,17 @@ def run(sqlite_path: str, commit: bool, wipe: bool) -> int:
             else:
                 if names.get(phone) and not wc.display_name:
                     wc.display_name = names[phone]
-            wc.is_tracked = phone in tracked
-            wc.is_blocked = phone in blocked
-            wc.is_usdt_authorized = phone in usdt_auth
-            pref = prefs.get(phone)
-            if pref and pref[0] and pref[1]:
-                cp = resolve_pair(pref[0], pref[1])
-                if cp:
-                    wc.preferred_pair_id = cp.id
+            # Un backfill incremental de operaciones no debe pisar preferencias
+            # ni flags que ya fueron editados en el backend después del cutover.
+            if not operations_only:
+                wc.is_tracked = phone in tracked
+                wc.is_blocked = phone in blocked
+                wc.is_usdt_authorized = phone in usdt_auth
+                pref = prefs.get(phone)
+                if pref and pref[0] and pref[1]:
+                    cp = resolve_pair(pref[0], pref[1])
+                    if cp:
+                        wc.preferred_pair_id = cp.id
             db.flush()
             client_id_by_phone[phone] = wc.id
             stats["clients"] += 1
@@ -196,6 +215,21 @@ def run(sqlite_path: str, commit: bool, wipe: bool) -> int:
         # ---------- 2) operations ----------
         op_id_by_legacy: dict[str, int] = {}
         for r in con.execute("SELECT * FROM operations"):
+            if bcv_only and r["bcv_usd"] is None:
+                continue
+
+            # Idempotencia post-cutover: legacy_sqlite_id identifica de forma
+            # estable la operación que ya fue importada en una corrida anterior.
+            existing_op = (
+                db.query(WhatsAppOperation)
+                .filter(WhatsAppOperation.legacy_sqlite_id == r["id"])
+                .first()
+            )
+            if existing_op is not None:
+                op_id_by_legacy[r["id"]] = existing_op.id
+                stats["ops_existing"] += 1
+                continue
+
             frm = (r["from_currency"] or "").upper()
             to = (r["to_currency"] or "").upper()
             cp = resolve_pair(frm, to)
@@ -246,6 +280,24 @@ def run(sqlite_path: str, commit: bool, wipe: bool) -> int:
             db.flush()
             op_id_by_legacy[r["id"]] = op.id
             stats["ops"] += 1
+
+        if operations_only:
+            db.flush()
+            print("\n──────── RESUMEN ────────")
+            for k, v in stats.items():
+                print(f"  {k:22} {v}")
+            if unresolved_pairs:
+                print("  pares no resueltos (omitidos):")
+                for p, n in sorted(unresolved_pairs.items(), key=lambda x: -x[1]):
+                    print(f"     {p:14} {n}")
+
+            if commit:
+                db.commit()
+                print("\n✅ COMMIT aplicado.")
+            else:
+                db.rollback()
+                print("\n🟡 DRY-RUN: rollback (nada se escribió). Usa --commit para aplicar.")
+            return 0
 
         # ---------- 3) incoming_payments ----------
         incoming_id_map: dict[int, int] = {}
@@ -329,5 +381,25 @@ if __name__ == "__main__":
     ap.add_argument("--sqlite-path", required=True, help="Ruta al archivo bot.db")
     ap.add_argument("--commit", action="store_true", help="Aplica (default: dry-run)")
     ap.add_argument("--wipe", action="store_true", help="Borra whatsapp_* antes (sólo pre-cutover)")
+    ap.add_argument(
+        "--operations-only",
+        action="store_true",
+        help="Importa clientes/operaciones; no toca pagos (seguro post-cutover)",
+    )
+    ap.add_argument(
+        "--bcv-only",
+        action="store_true",
+        help="Filtra operaciones con bcv_usd; requiere --operations-only",
+    )
     args = ap.parse_args()
-    sys.exit(run(args.sqlite_path, commit=args.commit, wipe=args.wipe))
+    if args.operations_only and args.wipe:
+        ap.error("--operations-only no se puede combinar con --wipe")
+    if args.bcv_only and not args.operations_only:
+        ap.error("--bcv-only requiere --operations-only para no importar pagos huérfanos")
+    sys.exit(run(
+        args.sqlite_path,
+        commit=args.commit,
+        wipe=args.wipe,
+        operations_only=args.operations_only,
+        bcv_only=args.bcv_only,
+    ))

@@ -69,7 +69,7 @@ def create_operation(
     db: Session = Depends(get_db),
     principal: BotPrincipal = Depends(get_bot_principal),
 ):
-    """Crea una cotización (status=QUOTED). Cancela cotizaciones previas QUOTED del mismo cliente."""
+    """Crea una cotización normal o BCV en el backend."""
     service = WhatsAppQuoteService(db)
     try:
         op = service.create_quote(payload)

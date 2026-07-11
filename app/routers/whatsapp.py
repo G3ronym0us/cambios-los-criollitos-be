@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.core.bot_auth import BotPrincipal, get_bot_principal
 from app.database.connection import get_db
 from app.models.whatsapp_client import WhatsAppClient
+from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.schemas.whatsapp import (
     BcvRateResponse,
@@ -250,7 +251,29 @@ def list_operations(
         )
     except QuoteServiceError as exc:
         _handle_service_error(exc)
-    items = [WhatsAppOperationResponse.model_validate(op.dict()) for op in ops]
+
+    # Flags de pagos ya vinculados (mismo criterio que el endpoint del operador):
+    # el matcher del bot los usa para NO volver a matchear una op que ya tiene su
+    # saliente (evita que dos comprobantes del mismo monto caigan en la misma op).
+    op_ids = [op.id for op in ops]
+    inc_taken: set[int] = set()
+    out_taken: set[int] = set()
+    if op_ids:
+        inc_taken = {
+            r[0] for r in db.query(WhatsAppIncomingPayment.whatsapp_operation_id)
+            .filter(WhatsAppIncomingPayment.whatsapp_operation_id.in_(op_ids)).distinct().all()
+        }
+        out_taken = {
+            r[0] for r in db.query(WhatsAppOutgoingPayment.whatsapp_operation_id)
+            .filter(WhatsAppOutgoingPayment.whatsapp_operation_id.in_(op_ids)).distinct().all()
+        }
+
+    items = []
+    for op in ops:
+        d = op.dict()
+        d["has_incoming_payment"] = op.id in inc_taken
+        d["has_outgoing_payment"] = op.id in out_taken
+        items.append(WhatsAppOperationResponse.model_validate(d))
     return WhatsAppOperationList(operations=items, total=len(items))
 
 

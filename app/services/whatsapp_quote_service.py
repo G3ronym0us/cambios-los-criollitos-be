@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.models.currency_pair import CurrencyPair
@@ -508,10 +509,12 @@ class WhatsAppQuoteService:
             q = q.filter(WhatsAppOperation.created_at >= since)
         return q.order_by(WhatsAppOperation.created_at.desc()).limit(limit).all()
 
-    def mark_delivered(self, op_uuid: UUID) -> WhatsAppOperation:
-        """Marca como recibidos los USD efectivo de una op con entrega pendiente.
+    def mark_delivered(self, op_uuid: UUID, completed_by_user: User) -> WhatsAppOperation:
+        """Recibe los USD físicos y cierra contablemente la operación.
 
-        Espejo de `markDelivered(opId)` del bot: requiere delivery_status==PENDING.
+        Las operaciones USD→VES creadas desde el pago saliente permanecen PENDING
+        hasta que el cliente entrega el efectivo. Recibirlo debe completar la op y
+        crear (o sincronizar) su transacción dentro de la misma acción.
         """
         op = self._get_op_or_404(op_uuid)
         if op.delivery_status != WhatsAppDeliveryStatus.PENDING:
@@ -520,11 +523,67 @@ class WhatsAppQuoteService:
                 "La operación no tiene entrega de USD pendiente",
                 409,
             )
+        if op.status == WhatsAppOperationStatus.CANCELLED:
+            raise QuoteServiceError(
+                "invalid_operation_status",
+                f"No se puede completar una operación {op.status.value}",
+                409,
+            )
+
+        now = datetime.now(timezone.utc)
         op.delivery_status = WhatsAppDeliveryStatus.RECEIVED
-        op.delivered_at = datetime.now(timezone.utc)
+        op.delivered_at = now
+        if op.status != WhatsAppOperationStatus.COMPLETED:
+            op.status = WhatsAppOperationStatus.COMPLETED
+            op.completed_at = now
+
+        tx = self._create_transaction_for_op(
+            op,
+            WhatsAppOperationComplete(),
+            completed_by_user,
+        )
+        op.transaction_id = tx.id
+        tx.completed_at = op.completed_at
         self.db.commit()
         self.db.refresh(op)
         return op
+
+    def repair_received_deliveries(self, completed_by_user: User) -> list[str]:
+        """Repara entregas RECEIVED que quedaron PENDING por la lógica anterior."""
+        operations = (
+            self.db.query(WhatsAppOperation)
+            .filter(
+                WhatsAppOperation.delivery_status == WhatsAppDeliveryStatus.RECEIVED,
+                WhatsAppOperation.status.in_((
+                    WhatsAppOperationStatus.QUOTED,
+                    WhatsAppOperationStatus.PENDING,
+                    WhatsAppOperationStatus.COMPLETED,
+                )),
+                or_(
+                    WhatsAppOperation.status != WhatsAppOperationStatus.COMPLETED,
+                    WhatsAppOperation.transaction_id.is_(None),
+                ),
+            )
+            .order_by(WhatsAppOperation.delivered_at.asc())
+            .all()
+        )
+        repaired: list[str] = []
+        for op in operations:
+            if op.status != WhatsAppOperationStatus.COMPLETED:
+                op.status = WhatsAppOperationStatus.COMPLETED
+                op.completed_at = op.delivered_at or datetime.now(timezone.utc)
+            elif op.completed_at is None:
+                op.completed_at = op.delivered_at or datetime.now(timezone.utc)
+            tx = self._create_transaction_for_op(
+                op,
+                WhatsAppOperationComplete(),
+                completed_by_user,
+            )
+            op.transaction_id = tx.id
+            tx.completed_at = op.completed_at
+            self.db.commit()
+            repaired.append(str(op.uuid))
+        return repaired
 
     # ---------- Escenario / grupo / receptor del entrante ----------
 

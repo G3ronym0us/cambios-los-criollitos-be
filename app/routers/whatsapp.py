@@ -162,10 +162,10 @@ def mark_delivered(
     db: Session = Depends(get_db),
     principal: BotPrincipal = Depends(get_bot_principal),
 ):
-    """Marca como recibidos los USD efectivo (delivery_status PENDING→RECEIVED)."""
+    """Recibe los USD, completa la operación y asegura su transacción."""
     service = WhatsAppQuoteService(db)
     try:
-        op = service.mark_delivered(op_uuid)
+        op = service.mark_delivered(op_uuid, principal.service_user)
     except QuoteServiceError as exc:
         _handle_service_error(exc)
     return WhatsAppOperationResponse.model_validate(op.dict())

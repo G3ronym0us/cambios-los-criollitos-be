@@ -143,10 +143,10 @@ async def mark_operation_delivered(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Marca como recibidos los USD efectivo (delivery_status PENDING→RECEIVED)."""
+    """Recibe los USD, completa la operación y asegura su transacción."""
     service = WhatsAppQuoteService(db)
     try:
-        op = service.mark_delivered(op_uuid)
+        op = service.mark_delivered(op_uuid, current_user)
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
     return WhatsAppOperationResponse.model_validate(op.dict())

@@ -37,6 +37,20 @@ from app.services.whatsapp_quote_service import QuoteServiceError
 router = APIRouter(prefix="/payments", tags=["Payments"])
 
 
+@router.get("/outgoing/{payment_id}/loan-valuation")
+async def preview_client_loan_valuation(
+    payment_id: int,
+    fiat_currency: str | None = Query(None, min_length=2, max_length=10),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Equivalencias del pago usando las tasas registradas en la fecha del comprobante."""
+    try:
+        return ClientLoanService(db).preview_outgoing(payment_id, fiat_currency)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
 @router.post("/outgoing/{payment_id}/loan", status_code=201)
 async def create_client_loan(
     payment_id: int,
@@ -49,8 +63,10 @@ async def create_client_loan(
         return ClientLoanService(db).create_from_outgoing(
             payment_id=payment_id,
             preferred_value=payload.preferred_value,
-            preferred_amount=payload.preferred_amount,
             fiat_currency=payload.fiat_currency,
+            fiat_amount=payload.fiat_amount,
+            usdt_amount=payload.usdt_amount,
+            bcv_amount=payload.bcv_amount,
             notes=payload.notes,
             created_by_user_id=current_user.id,
         )

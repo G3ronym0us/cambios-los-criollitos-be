@@ -7,7 +7,7 @@ preferida define la unidad en la que se lleva el saldo pendiente.
 
 import enum
 
-from sqlalchemy import Column, DateTime, Enum as SQLEnum, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import Boolean, Column, DateTime, Enum as SQLEnum, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -49,6 +49,10 @@ class ClientLoan(UUIDMixin, Base):
     # Equivalente en USD BCV; solo existe para fiat VES.
     bcv_amount = Column(Numeric(24, 8), nullable=True)
     bcv_rate = Column(Numeric(24, 8), nullable=True)
+    # Momento del comprobante usado para buscar las tasas históricas.
+    valuation_at = Column(DateTime(timezone=True), nullable=False)
+    # True si el operador modificó al menos una de las equivalencias sugeridas.
+    manual_values = Column(Boolean, nullable=False, default=False, server_default="false")
 
     preferred_value = Column(SQLEnum(ClientLoanPreferredValue), nullable=False)
     status = Column(

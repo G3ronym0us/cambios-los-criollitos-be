@@ -279,8 +279,10 @@ class WhatsAppIrrelevant(BaseModel):
 class ClientLoanCreate(BaseModel):
     """Registra un pago saliente como préstamo conservando todas sus equivalencias."""
     preferred_value: str = Field(..., description="FIAT | USDT | BCV")
-    preferred_amount: float = Field(..., gt=0)
     fiat_currency: str = Field(..., min_length=2, max_length=10)
+    fiat_amount: Optional[float] = Field(None, gt=0)
+    usdt_amount: Optional[float] = Field(None, gt=0)
+    bcv_amount: Optional[float] = Field(None, gt=0)
     notes: Optional[str] = None
 
     @validator("preferred_value")

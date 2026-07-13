@@ -157,11 +157,22 @@ class ClientLoanService:
                 usdt_amount, "USDT", target_fiat, valuation_at
             )
         else:
-            target_fiat = detected_currency
-            fiat_amount = float(payment.amount)
-            usdt_amount, usdt_rate_at = self._historical_convert(
-                fiat_amount, target_fiat, "USDT", valuation_at
-            )
+            if target_fiat == detected_currency:
+                fiat_amount = float(payment.amount)
+            else:
+                fiat_amount, _ = self._historical_convert(
+                    float(payment.amount), detected_currency, target_fiat, valuation_at
+                )
+                if fiat_amount is None:
+                    warnings.append(
+                        f"No se encontró una tasa histórica {detected_currency}/{target_fiat}"
+                    )
+            if fiat_amount is not None:
+                usdt_amount, usdt_rate_at = self._historical_convert(
+                    fiat_amount, target_fiat, "USDT", valuation_at
+                )
+            else:
+                usdt_amount, usdt_rate_at = None, None
 
         usdt_rate = (
             float(fiat_amount) / float(usdt_amount)
@@ -288,7 +299,9 @@ class ClientLoanService:
                 return False
             if suggested is None:
                 return True
-            return abs(float(provided) - float(suggested)) > max(abs(float(suggested)) * 0.000001, 0.000001)
+            # El frontend trabaja con centavos; el redondeo automático a dos
+            # decimales no debe quedar auditado como una corrección manual.
+            return abs(float(provided) - float(suggested)) > 0.005000001
 
         manual_values = any(
             (

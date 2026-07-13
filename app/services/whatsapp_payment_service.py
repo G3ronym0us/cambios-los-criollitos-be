@@ -325,6 +325,22 @@ class WhatsAppPaymentService:
             op = self.db.query(WhatsAppOperation).filter(WhatsAppOperation.uuid == operation_uuid).first()
             if op is None:
                 raise QuoteServiceError("op_not_found", f"Operation {operation_uuid} no encontrada", 404)
+            Model = self._model(table)
+            same_side_payment = (
+                self.db.query(Model.id)
+                .filter(
+                    Model.whatsapp_operation_id == op.id,
+                    Model.id != row.id,
+                )
+                .first()
+            )
+            if same_side_payment is not None:
+                side_label = "entrante" if table == "incoming" else "saliente"
+                raise QuoteServiceError(
+                    "operation_payment_already_linked",
+                    f"La operación ya tiene un pago {side_label} vinculado",
+                    409,
+                )
             if (
                 complete_outgoing
                 and row.whatsapp_operation_id is not None
@@ -858,12 +874,11 @@ class WhatsAppPaymentService:
             )
             op.transaction_id = tx.id
 
-        # Completar directo salvo entrega física de USD: en una venta de USD físico (from=USD)
-        # el cliente queda pendiente de entregar el efectivo, así que la op se queda en PENDING
-        # (delivery). El resto (ZELLE-VES, PayPal, etc.) se completa al instante y genera su
-        # Transaction. El movimiento EXCHANGE del fondo ya se registró arriba; la Transaction es
-        # solo el registro contable/ganancia (no toca fondos), por eso no hay doble conteo.
-        if from_currency.upper() != "USD":
+        # Un entrante inicia la operación pero no confirma que el dinero haya sido entregado al
+        # cliente: siempre permanece PENDING hasta vincular el pago saliente. Si la operación se
+        # crea desde el propio saliente, sí puede completarse de inmediato, salvo la entrega física
+        # de USD. El movimiento EXCHANGE del fondo y la Transaction no duplican el fondo.
+        if table == "outgoing" and from_currency.upper() != "USD":
             completing_user = (
                 self.db.query(User).filter(User.id == recorded_by_user_id).first()
                 if recorded_by_user_id

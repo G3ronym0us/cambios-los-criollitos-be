@@ -1,11 +1,14 @@
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
 from app.models.fund import FundMovement
+from app.models.whatsapp_operation import WhatsAppOperationStatus
 from app.models.whatsapp_balance import WhatsAppBalanceEntry
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
+import app.services.whatsapp_payment_service as payment_service_module
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
 from app.services.whatsapp_quote_service import QuoteServiceError
 
@@ -123,4 +126,74 @@ def test_convert_incoming_rejects_already_accounted_payments(model, code):
         service.convert_incoming_to_outgoing(8)
 
     assert exc.value.code == code
+    assert db.commits == 0
+
+
+def test_create_operation_from_incoming_payment_stays_pending(monkeypatch):
+    incoming = _payment(whatsapp_operation_id=None)
+    pair = SimpleNamespace(id=9)
+
+    class _CreateDB(_DB):
+        def flush(self):
+            self.added[-1].id = 77
+
+    class _QuoteService:
+        def __init__(self, _db):
+            pass
+
+        def upsert_client(self, _phone):
+            return SimpleNamespace(id=13)
+
+        def _create_transaction_for_op(self, *_args, **_kwargs):
+            raise AssertionError("Un pago entrante no debe completar ni crear la transacción final")
+
+    db = _CreateDB()
+    service = _service(db, incoming)
+    service.pair_repo = SimpleNamespace(
+        get_by_symbol=lambda symbol: pair if symbol == "VES-USDT" else None
+    )
+    monkeypatch.setattr(payment_service_module, "WhatsAppQuoteService", _QuoteService)
+
+    result = service.create_operation_from_payment(
+        "incoming",
+        8,
+        "VES",
+        "USDT",
+        4000,
+        4,
+        recorded_by_user_id=1,
+    )
+
+    operation = db.added[0]
+    assert operation.status == WhatsAppOperationStatus.PENDING
+    assert operation.completed_at is None
+    assert incoming.whatsapp_operation_id == operation.id
+    assert result["status"] == WhatsAppOperationStatus.PENDING.value
+    assert db.commits == 1
+
+
+def test_link_outgoing_rejects_operation_with_another_outgoing_payment():
+    row = _payment(id=7, whatsapp_operation_id=None)
+    operation_uuid = uuid4()
+    operation = SimpleNamespace(id=42, uuid=operation_uuid)
+
+    class _LinkDB(_DB):
+        def query(self, entity):
+            if entity is payment_service_module.WhatsAppOperation:
+                return _Query(operation)
+            return _Query(SimpleNamespace(id=99))
+
+    db = _LinkDB()
+    service = _service(db, row)
+
+    with pytest.raises(QuoteServiceError) as exc:
+        service.set_operation(
+            "outgoing",
+            row.id,
+            operation_uuid,
+            completing_user=SimpleNamespace(id=1),
+            complete_outgoing=True,
+        )
+
+    assert exc.value.code == "operation_payment_already_linked"
     assert db.commits == 0

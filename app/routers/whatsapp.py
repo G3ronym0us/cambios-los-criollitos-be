@@ -301,12 +301,27 @@ def upsert_client(
     service = WhatsAppQuoteService(db)
     client = service.upsert_client(phone, payload.display_name)
 
-    if payload.preferred_pair_uuid is not None:
+    if payload.preferred_pair_symbol is not None:
         pair_repo = CurrencyPairRepository(db)
-        pair = pair_repo.get_by_uuid(payload.preferred_pair_uuid)
+        pair = pair_repo.get_by_symbol(payload.preferred_pair_symbol)
         if pair is None:
-            raise HTTPException(status_code=404, detail={"code": "pair_not_found", "message": "Currency pair no existe"})
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "pair_not_found", "message": f"Par {payload.preferred_pair_symbol} no existe"},
+            )
         client.preferred_pair_id = pair.id
+    elif "preferred_pair_uuid" in payload.model_fields_set:
+        if payload.preferred_pair_uuid is None:
+            client.preferred_pair_id = None
+        else:
+            pair_repo = CurrencyPairRepository(db)
+            pair = pair_repo.get_by_uuid(payload.preferred_pair_uuid)
+            if pair is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "pair_not_found", "message": "Currency pair no existe"},
+                )
+            client.preferred_pair_id = pair.id
 
     if payload.is_tracked is not None:
         client.is_tracked = payload.is_tracked

@@ -11,9 +11,14 @@ class WhatsAppClientUpsert(BaseModel):
     excepto que la ruta ya fija el `phone`."""
     display_name: Optional[str] = None
     preferred_pair_uuid: Optional[UUID] = None
+    preferred_pair_symbol: Optional[str] = Field(None, min_length=3, max_length=20)
     is_tracked: Optional[bool] = None
     is_blocked: Optional[bool] = None
     is_usdt_authorized: Optional[bool] = None
+
+    @validator("preferred_pair_symbol")
+    def normalize_preferred_pair_symbol(cls, value: Optional[str]) -> Optional[str]:
+        return value.strip().upper() if value else value
 
 
 class WhatsAppClientResponse(BaseModel):

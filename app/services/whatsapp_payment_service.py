@@ -596,17 +596,37 @@ class WhatsAppPaymentService:
         self.db.refresh(row)
         return self._with_name(row)
 
-    def convert_outgoing_to_group_incoming(
+    @staticmethod
+    def _payment_copy_kwargs(payment) -> dict:
+        """Campos comunes que deben sobrevivir al mover un comprobante entre bandejas."""
+        return {
+            "client_phone": payment.client_phone,
+            "provider": payment.provider,
+            "amount": payment.amount,
+            "currency": payment.currency,
+            "bank_from": payment.bank_from,
+            "bank_to": payment.bank_to,
+            "account_number": payment.account_number,
+            "identification": payment.identification,
+            "phone_to": payment.phone_to,
+            "reference": payment.reference,
+            "raw_text": payment.raw_text,
+            "whatsapp_operation_id": payment.whatsapp_operation_id,
+            "corrected_at": payment.corrected_at,
+            "correction_original": payment.correction_original,
+            "created_at": payment.created_at,
+        }
+
+    def convert_outgoing_to_incoming(
         self,
         payment_id: int,
         group_jid: Optional[str] = None,
         group_uuid: Optional[UUID] = None,
     ) -> dict:
         """
-        Convierte un pago SALIENTE (típicamente un Zelle reenviado al grupo que el bot no
-        detectó como tal) en un pago ENTRANTE marcado 'contabilizado en el grupo'. Copia los
-        datos del comprobante al lado entrante y elimina el saliente, para que el Zelle deje de
-        ocupar el lado saliente de la operación y se pueda anexar el pago en Bs.
+        Mueve un pago SALIENTE a ENTRANTE conservando comprobante, fecha y operación.
+        El grupo es opcional: se usa cuando conocemos el fondo del reenvío, pero no se exige
+        para corregir pagos de números no trackeados que llegaron al lado saliente.
         """
         out = self._get_or_404("outgoing", payment_id)
         self._assert_not_loan(payment_id)
@@ -619,31 +639,72 @@ class WhatsAppPaymentService:
             jid = group_jid or (out.client_phone if (out.client_phone or "").endswith("@g.us") else None)
             if jid:
                 group = self.db.query(FundGroup).filter(FundGroup.whatsapp_group_jid == jid).first()
-        if group is None:
+        if (group_uuid is not None or group_jid) and group is None:
             raise QuoteServiceError(
                 "fund_group_not_found", "No se pudo resolver el fondo del grupo", 404
             )
 
         incoming = WhatsAppIncomingPayment(
-            client_phone=out.client_phone,
-            provider=out.provider,
-            amount=out.amount,
-            currency=out.currency,
-            bank_from=out.bank_from,
-            bank_to=out.bank_to,
-            account_number=out.account_number,
-            identification=out.identification,
-            phone_to=out.phone_to,
-            reference=out.reference,
-            raw_text=out.raw_text,
-            whatsapp_operation_id=out.whatsapp_operation_id,
-            fund_group_id=group.id,
+            **self._payment_copy_kwargs(out),
+            fund_group_id=group.id if group else None,
         )
         self.db.add(incoming)
         self.db.delete(out)
         self.db.commit()
         self.db.refresh(incoming)
         return self._with_name(incoming)
+
+    # Nombre anterior conservado para el endpoint del bot y clientes antiguos.
+    def convert_outgoing_to_group_incoming(
+        self,
+        payment_id: int,
+        group_jid: Optional[str] = None,
+        group_uuid: Optional[UUID] = None,
+    ) -> dict:
+        return self.convert_outgoing_to_incoming(payment_id, group_jid, group_uuid)
+
+    def convert_incoming_to_outgoing(self, payment_id: int) -> dict:
+        """Revierte un entrante todavía no contabilizado y lo devuelve a salientes."""
+        incoming = self._get_or_404("incoming", payment_id)
+
+        deposit = self.db.query(FundMovement.id).filter(FundMovement.incoming_payment_id == payment_id).first()
+        if deposit is not None:
+            raise QuoteServiceError(
+                "incoming_has_deposit",
+                "Este pago ya generó un depósito a un fondo y no puede convertirse en saliente",
+                409,
+            )
+
+        balance_entry = (
+            self.db.query(WhatsAppBalanceEntry.id)
+            .filter(WhatsAppBalanceEntry.incoming_payment_id == payment_id)
+            .first()
+        )
+        if balance_entry is not None:
+            raise QuoteServiceError(
+                "incoming_has_balance_credit",
+                "Este pago ya fue acreditado como saldo y no puede convertirse en saliente",
+                409,
+            )
+
+        forwarded = (
+            self.db.query(WhatsAppOutgoingPayment.id)
+            .filter(WhatsAppOutgoingPayment.source_payment_id == payment_id)
+            .first()
+        )
+        if forwarded is not None:
+            raise QuoteServiceError(
+                "incoming_is_payment_source",
+                "Este pago está enlazado a otro comprobante saliente y no puede convertirse",
+                409,
+            )
+
+        outgoing = WhatsAppOutgoingPayment(**self._payment_copy_kwargs(incoming))
+        self.db.add(outgoing)
+        self.db.delete(incoming)
+        self.db.commit()
+        self.db.refresh(outgoing)
+        return self._with_name(outgoing)
 
     # ---------- Depósito a fondo desde pago entrante ----------
 

@@ -178,6 +178,32 @@ async def convert_outgoing_to_group_incoming(
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
 
+@router.post("/outgoing/{payment_id}/convert-to-incoming")
+async def convert_outgoing_to_incoming(
+    payment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Mueve un pago saliente a la bandeja de entrantes sin exigir un grupo."""
+    try:
+        return WhatsAppPaymentService(db).convert_outgoing_to_incoming(payment_id)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.post("/incoming/{payment_id}/convert-to-outgoing")
+async def convert_incoming_to_outgoing(
+    payment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Devuelve un pago entrante no contabilizado a la bandeja de salientes."""
+    try:
+        return WhatsAppPaymentService(db).convert_incoming_to_outgoing(payment_id)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
 @router.post("/{table}/{payment_id}/create-operation")
 async def create_operation_from_payment(
     table: Literal["incoming", "outgoing"],

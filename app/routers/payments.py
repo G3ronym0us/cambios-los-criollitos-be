@@ -27,12 +27,35 @@ from app.schemas.whatsapp import (
     WhatsAppPaymentDeposit,
     WhatsAppPaymentLink,
     WhatsAppPersonalExpense,
+    ClientLoanCreate,
 )
+from app.services.client_loan_service import ClientLoanService
 from app.services.whatsapp_balance_service import WhatsAppBalanceService
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
 from app.services.whatsapp_quote_service import QuoteServiceError
 
 router = APIRouter(prefix="/payments", tags=["Payments"])
+
+
+@router.post("/outgoing/{payment_id}/loan", status_code=201)
+async def create_client_loan(
+    payment_id: int,
+    payload: ClientLoanCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Registra un pago saliente como préstamo al cliente."""
+    try:
+        return ClientLoanService(db).create_from_outgoing(
+            payment_id=payment_id,
+            preferred_value=payload.preferred_value,
+            preferred_amount=payload.preferred_amount,
+            fiat_currency=payload.fiat_currency,
+            notes=payload.notes,
+            created_by_user_id=current_user.id,
+        )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
 
 @router.get("/{table}")

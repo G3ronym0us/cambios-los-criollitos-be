@@ -276,6 +276,31 @@ class WhatsAppIrrelevant(BaseModel):
     irrelevant_description: Optional[str] = None
 
 
+class ClientLoanCreate(BaseModel):
+    """Registra un pago saliente como préstamo conservando todas sus equivalencias."""
+    preferred_value: str = Field(..., description="FIAT | USDT | BCV")
+    preferred_amount: float = Field(..., gt=0)
+    fiat_currency: str = Field(..., min_length=2, max_length=10)
+    notes: Optional[str] = None
+
+    @validator("preferred_value")
+    def validate_preferred_value(cls, value: str) -> str:
+        value = value.upper()
+        if value not in {"FIAT", "USDT", "BCV"}:
+            raise ValueError("preferred_value must be FIAT, USDT or BCV")
+        return value
+
+    @validator("fiat_currency")
+    def normalize_fiat_currency(cls, value: str) -> str:
+        return value.strip().upper()
+
+
+class ClientLoanRepaymentCreate(BaseModel):
+    """Abono expresado en la referencia preferida del préstamo."""
+    preferred_amount: float = Field(..., gt=0)
+    notes: Optional[str] = None
+
+
 class WhatsAppForwardToGroup(BaseModel):
     """Marcar un pago entrante como contabilizado en un grupo (escenario ZELLE_DIRECT)."""
     group_jid: Optional[str] = None

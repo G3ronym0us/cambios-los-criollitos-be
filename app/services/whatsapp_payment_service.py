@@ -12,8 +12,8 @@ from datetime import datetime, timedelta
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import or_
-from sqlalchemy.orm import Session
+from sqlalchemy import exists, or_
+from sqlalchemy.orm import Session, joinedload
 
 from app.models.whatsapp_client import WhatsAppClient
 from app.models.whatsapp_operation import (
@@ -26,6 +26,7 @@ from app.models.fund import FundGroup, FundMovement, FundMovementType
 from app.models.user import User
 from app.models.whatsapp_balance import WhatsAppBalanceEntry, WhatsAppBalanceEntryType
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
+from app.models.client_loan import ClientLoan
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.repositories.fund_repository import FundRepository
 from app.schemas.whatsapp import WhatsAppOperationComplete
@@ -87,6 +88,15 @@ class WhatsAppPaymentService:
         d["client_name"] = name
         d["client_uuid"] = client_uuid
         return d
+
+    def _assert_not_loan(self, payment_id: int) -> None:
+        loan = self.db.query(ClientLoan.id).filter(ClientLoan.outgoing_payment_id == payment_id).first()
+        if loan is not None:
+            raise QuoteServiceError(
+                "payment_is_loan",
+                "Este pago está registrado como préstamo y no puede recibir otra clasificación",
+                409,
+            )
 
     # ---------- Crear / listar ----------
 
@@ -165,6 +175,10 @@ class WhatsAppPaymentService:
         # operación y mantiene correcto el total paginado.
         if unlinked_only:
             q = q.filter(Model.whatsapp_operation_id.is_(None))
+            if table == "outgoing":
+                q = q.filter(
+                    ~exists().where(ClientLoan.outgoing_payment_id == Model.id)
+                )
 
         search = (search or "").strip()
         if search:
@@ -187,20 +201,41 @@ class WhatsAppPaymentService:
             elif out_class == "IRRELEVANT":
                 q = q.filter(Model.is_irrelevant.is_(True))
             elif out_class == "OPERATIONAL":
-                q = q.filter(Model.is_personal_expense.is_(False), Model.is_irrelevant.is_(False))
+                q = q.filter(
+                    Model.is_personal_expense.is_(False),
+                    Model.is_irrelevant.is_(False),
+                    ~exists().where(ClientLoan.outgoing_payment_id == Model.id),
+                )
             elif out_class == "UNLINKED":
                 q = q.filter(
                     Model.is_personal_expense.is_(False),
                     Model.is_irrelevant.is_(False),
                     Model.whatsapp_operation_id.is_(None),
+                    ~exists().where(ClientLoan.outgoing_payment_id == Model.id),
                 )
+            elif out_class == "LOAN":
+                q = q.filter(exists().where(ClientLoan.outgoing_payment_id == Model.id))
 
         total = q.count()
         rows = q.order_by(Model.created_at.desc()).limit(limit).offset(offset).all()
         items = [self._row_to_dict(*r) for r in rows]
         if table == "incoming" and items:
             self._attach_deposits(items)
+        if table == "outgoing" and items:
+            self._attach_loans(items)
         return {"items": items, "total": total}
+
+    def _attach_loans(self, items: list[dict]) -> None:
+        ids = [item["id"] for item in items]
+        loans = (
+            self.db.query(ClientLoan)
+            .options(joinedload(ClientLoan.repayments))
+            .filter(ClientLoan.outgoing_payment_id.in_(ids))
+            .all()
+        )
+        by_payment = {loan.outgoing_payment_id: loan.payment_summary() for loan in loans}
+        for item in items:
+            item["loan"] = by_payment.get(item["id"])
 
     def _attach_deposits(self, items: list[dict]) -> None:
         """Agrega a cada pago entrante un bloque `deposit` (o None) si tiene un FundMovement asociado."""
@@ -283,6 +318,8 @@ class WhatsAppPaymentService:
         settle_amount: Optional[float] = None,
     ) -> dict:
         row = self._get_or_404(table, payment_id)
+        if table == "outgoing" and operation_uuid is not None:
+            self._assert_not_loan(payment_id)
         op = None
         if operation_uuid is not None:
             op = self.db.query(WhatsAppOperation).filter(WhatsAppOperation.uuid == operation_uuid).first()
@@ -507,6 +544,8 @@ class WhatsAppPaymentService:
 
     def set_personal_expense(self, payment_id: int, is_personal: bool, description: Optional[str]) -> dict:
         row = self._get_or_404("outgoing", payment_id)
+        if is_personal:
+            self._assert_not_loan(payment_id)
         row.is_personal_expense = is_personal
         if is_personal:
             row.personal_description = description
@@ -519,6 +558,8 @@ class WhatsAppPaymentService:
 
     def set_irrelevant(self, payment_id: int, is_irrelevant: bool, description: Optional[str] = None) -> dict:
         row = self._get_or_404("outgoing", payment_id)
+        if is_irrelevant:
+            self._assert_not_loan(payment_id)
         row.is_irrelevant = is_irrelevant
         if is_irrelevant:
             row.irrelevant_description = description
@@ -568,6 +609,7 @@ class WhatsAppPaymentService:
         ocupar el lado saliente de la operación y se pueda anexar el pago en Bs.
         """
         out = self._get_or_404("outgoing", payment_id)
+        self._assert_not_loan(payment_id)
 
         # Grupo: explícito (uuid), o por JID del grupo (parámetro o el client_phone si es @g.us).
         group = None
@@ -661,6 +703,8 @@ class WhatsAppPaymentService:
         recorded_by_user_id: Optional[int] = None,
     ) -> dict:
         row = self._get_or_404(table, payment_id)
+        if table == "outgoing":
+            self._assert_not_loan(payment_id)
         if from_amount <= 0 or to_amount <= 0:
             raise QuoteServiceError("invalid_amount", "Montos deben ser > 0", 400)
 

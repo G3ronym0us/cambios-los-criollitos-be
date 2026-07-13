@@ -15,6 +15,12 @@ from .whatsapp_operation import (
 from .bcv_rate import BcvRate
 from .whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from .whatsapp_balance import WhatsAppBalanceEntry, WhatsAppBalanceEntryType
+from .client_loan import (
+    ClientLoan,
+    ClientLoanPreferredValue,
+    ClientLoanRepayment,
+    ClientLoanStatus,
+)
 from .push_subscription import PushSubscription
 
 __all__ = ["User", "ExchangeRate", "Transaction", "Currency", "CurrencyPair",
@@ -22,4 +28,6 @@ __all__ = ["User", "ExchangeRate", "Transaction", "Currency", "CurrencyPair",
            "WhatsAppClient", "WhatsAppOperation", "WhatsAppOperationStatus",
            "WhatsAppAmountSide", "WhatsAppDeliveryStatus", "BcvRate",
            "WhatsAppIncomingPayment", "WhatsAppOutgoingPayment",
-           "WhatsAppBalanceEntry", "WhatsAppBalanceEntryType", "PushSubscription"]
+           "WhatsAppBalanceEntry", "WhatsAppBalanceEntryType", "ClientLoan",
+           "ClientLoanPreferredValue", "ClientLoanRepayment", "ClientLoanStatus",
+           "PushSubscription"]

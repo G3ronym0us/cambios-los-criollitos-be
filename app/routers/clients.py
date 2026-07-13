@@ -18,11 +18,47 @@ from app.models.user import User
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.repositories.whatsapp_client_repository import WhatsAppClientRepository
 from app.schemas.client import ClientList, ClientResponse, ClientUpdate
-from app.schemas.whatsapp import WhatsAppBalanceAdjust
+from app.schemas.whatsapp import ClientLoanRepaymentCreate, WhatsAppBalanceAdjust
+from app.services.client_loan_service import ClientLoanService
 from app.services.whatsapp_balance_service import WhatsAppBalanceService
 from app.services.whatsapp_quote_service import QuoteServiceError
 
 router = APIRouter(prefix="/clients", tags=["Clients"])
+
+
+@router.get("/{client_uuid}/loans")
+async def get_client_loans(
+    client_uuid: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        return ClientLoanService(db).list_for_client(client_uuid)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.post("/{client_uuid}/loans/{loan_uuid}/repayments", status_code=status.HTTP_201_CREATED)
+async def add_client_loan_repayment(
+    client_uuid: UUID,
+    loan_uuid: UUID,
+    payload: ClientLoanRepaymentCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    service = ClientLoanService(db)
+    try:
+        loan = service._loan_by_uuid(loan_uuid)
+        if str(loan.client.uuid) != str(client_uuid):
+            raise QuoteServiceError("loan_client_mismatch", "El préstamo no pertenece al cliente", 404)
+        return service.add_repayment(
+            loan_uuid,
+            payload.preferred_amount,
+            payload.notes,
+            created_by_user_id=current_user.id,
+        )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
 
 @router.get("", response_model=ClientList)

@@ -41,12 +41,13 @@ router = APIRouter(prefix="/payments", tags=["Payments"])
 async def preview_client_loan_valuation(
     payment_id: int,
     fiat_currency: str | None = Query(None, min_length=2, max_length=10),
+    payment_currency: str | None = Query(None, min_length=2, max_length=10),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Equivalencias del pago usando las tasas registradas en la fecha del comprobante."""
     try:
-        return ClientLoanService(db).preview_outgoing(payment_id, fiat_currency)
+        return ClientLoanService(db).preview_outgoing(payment_id, fiat_currency, payment_currency)
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
@@ -63,6 +64,7 @@ async def create_client_loan(
         return ClientLoanService(db).create_from_outgoing(
             payment_id=payment_id,
             preferred_value=payload.preferred_value,
+            payment_currency=payload.payment_currency,
             fiat_currency=payload.fiat_currency,
             fiat_amount=payload.fiat_amount,
             usdt_amount=payload.usdt_amount,

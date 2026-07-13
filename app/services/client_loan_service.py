@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from decimal import Decimal
+import re
 from typing import Optional
 from uuid import UUID
 
@@ -69,6 +70,15 @@ class ClientLoanService:
         value = (symbol or "").upper()
         return {"ZELLE": "USD", "PAYPAL": "USD"}.get(value, value)
 
+    @staticmethod
+    def _infer_payment_currency(raw_text: Optional[str]) -> Optional[str]:
+        text = raw_text or ""
+        if re.search(r"(?:\bbs\.?\s*[\d.,]+|\bves\b|bol[ií]vares?)", text, re.IGNORECASE):
+            return "VES"
+        if re.search(r"\busdt\b", text, re.IGNORECASE):
+            return "USDT"
+        return None
+
     def _historical_rate(
         self,
         from_currency: str,
@@ -135,7 +145,12 @@ class ClientLoanService:
             return None, None
         return float(row.rate), row.fetched_at
 
-    def preview_outgoing(self, payment_id: int, fiat_currency: Optional[str] = None) -> dict:
+    def preview_outgoing(
+        self,
+        payment_id: int,
+        fiat_currency: Optional[str] = None,
+        payment_currency: Optional[str] = None,
+    ) -> dict:
         payment = (
             self.db.query(WhatsAppOutgoingPayment)
             .filter(WhatsAppOutgoingPayment.id == payment_id)
@@ -146,12 +161,22 @@ class ClientLoanService:
         if payment.amount is None or payment.amount <= 0:
             raise QuoteServiceError("invalid_amount", "El comprobante no tiene un monto válido", 409)
 
-        detected_currency = self._settlement_currency(payment.currency)
+        source_currency = (
+            (payment_currency or "").strip().upper()
+            or (payment.currency or "").strip().upper()
+            or self._infer_payment_currency(payment.raw_text)
+        )
+        detected_currency = self._settlement_currency(source_currency)
         valuation_at = payment.created_at or datetime.now(timezone.utc)
         target_fiat = (fiat_currency or ("VES" if detected_currency == "USDT" else detected_currency)).upper()
         warnings: list[str] = []
 
-        if detected_currency == "USDT":
+        if not detected_currency:
+            fiat_amount = None
+            usdt_amount = None
+            usdt_rate_at = None
+            warnings.append("Confirma la moneda del monto detectado")
+        elif detected_currency == "USDT":
             usdt_amount: Optional[float] = float(payment.amount)
             fiat_amount, usdt_rate_at = self._historical_convert(
                 usdt_amount, "USDT", target_fiat, valuation_at
@@ -179,7 +204,7 @@ class ClientLoanService:
             if fiat_amount is not None and usdt_amount is not None and usdt_amount > 0
             else None
         )
-        if usdt_amount is None:
+        if detected_currency and usdt_amount is None:
             warnings.append(f"No se encontró una tasa histórica {target_fiat}/USDT")
 
         bcv_amount: Optional[float] = None
@@ -195,7 +220,7 @@ class ClientLoanService:
         return {
             "payment_id": payment.id,
             "detected_amount": float(payment.amount),
-            "detected_currency": payment.currency,
+            "detected_currency": source_currency,
             "fiat_amount": fiat_amount,
             "fiat_currency": target_fiat,
             "usdt_amount": usdt_amount,
@@ -223,6 +248,7 @@ class ClientLoanService:
         self,
         payment_id: int,
         preferred_value: str,
+        payment_currency: Optional[str],
         fiat_currency: str,
         fiat_amount: Optional[float] = None,
         usdt_amount: Optional[float] = None,
@@ -270,7 +296,15 @@ class ClientLoanService:
                 400,
             )
 
-        preview = self.preview_outgoing(payment_id, fiat_currency)
+        preview = self.preview_outgoing(payment_id, fiat_currency, payment_currency)
+        if not preview["detected_currency"]:
+            raise QuoteServiceError(
+                "payment_currency_required",
+                "Confirma la moneda del monto detectado",
+                400,
+            )
+        if payment_currency or not payment.currency:
+            payment.currency = preview["detected_currency"]
         suggested_fiat = preview["fiat_amount"]
         suggested_usdt = preview["usdt_amount"]
         suggested_bcv = preview["bcv_amount"]

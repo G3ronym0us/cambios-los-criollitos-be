@@ -36,7 +36,11 @@ def enrich_rate_response(rate) -> dict:
         "updated_at": rate.updated_at,
         "manual_rate": rate.manual_rate,
         "is_manual": rate.is_manual,
-        "automatic_rate": rate.automatic_rate
+        "automatic_rate": rate.automatic_rate,
+        "rounding_mode": rate.currency_pair.rounding_mode if rate.currency_pair else None,
+        "rounding_step": float(rate.currency_pair.rounding_step) if rate.currency_pair and rate.currency_pair.rounding_step is not None else None,
+        "rounding_direction": rate.currency_pair.rounding_direction if rate.currency_pair else None,
+        "rounding_amount_side": rate.currency_pair.rounding_amount_side if rate.currency_pair else None,
     }
     print(f"🔍 DEBUG enrich_rate_response: pair_type={result['pair_type']}, currency_pair_uuid={result['currency_pair_uuid']}")
     return result

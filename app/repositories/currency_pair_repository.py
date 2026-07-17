@@ -71,6 +71,10 @@ class CurrencyPairRepository:
             usdt_manual_rate=pair_data.usdt_manual_rate,
             usdt_pair_id=usdt_pair_id,
             usdt_pair_inverse=pair_data.usdt_pair_inverse,
+            rounding_mode=pair_data.rounding_mode,
+            rounding_step=pair_data.rounding_step,
+            rounding_direction=pair_data.rounding_direction,
+            rounding_amount_side=pair_data.rounding_amount_side,
         )
         
         # Validate base pair configuration

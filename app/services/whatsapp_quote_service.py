@@ -44,7 +44,7 @@ from app.schemas.whatsapp import (
     WhatsAppOperationUpdate,
 )
 from app.services.bcv_service import get_cached_bcv_rate
-from app.services.whatsapp_rate_resolver import WhatsAppRateResolver
+from app.services.whatsapp_rate_resolver import WhatsAppRateResolver, apply_rounding
 
 
 QUOTE_TTL_MINUTES = 30
@@ -170,6 +170,18 @@ class WhatsAppQuoteService:
             to_amount = payload.amount
             from_amount = self.resolver.apply_rate(payload.amount, rate, not inverse_percentage)
             side_enum = WhatsAppAmountSide.RECEIVE
+
+        # Redondeo configurable del par (modo RATE o AMOUNT). No-op si el par no lo define.
+        from_amount, to_amount, rate, inverse_percentage = self._apply_pair_rounding(
+            currency_pair,
+            payload.from_currency,
+            payload.to_currency,
+            payload.amount_side,
+            from_amount,
+            to_amount,
+            rate,
+            inverse_percentage,
+        )
 
         now = datetime.now(timezone.utc)
         has_payment_data = bool(payload.notes and payload.notes.strip())
@@ -672,6 +684,7 @@ class WhatsAppQuoteService:
         if update_display_name:
             client.display_name = display_name
         op.client_id = client.id
+        op.client = client
 
         # El operador afirma "esta operación es de este cliente": los comprobantes ya
         # vinculados heredan el teléfono (mismo criterio que set_operation en pagos).
@@ -750,6 +763,28 @@ class WhatsAppQuoteService:
                     op.to_amount,
                     new_rate,
                     not op.inverse_percentage,
+                )
+
+            # Re-aplica el redondeo del par sobre los montos recalculados, con la misma
+            # convención canónica que usa el resto del sistema (op.from == pair.from,
+            # ver WhatsAppOperation.dict()). El lado que el cliente fijó (amount_side)
+            # se preserva; el lado calculado se redondea igual que en create_quote.
+            cp = op.currency_pair
+            if cp is not None and cp.from_currency and cp.to_currency:
+                (
+                    op.from_amount,
+                    op.to_amount,
+                    op.rate_used,
+                    op.inverse_percentage,
+                ) = self._apply_pair_rounding(
+                    cp,
+                    cp.from_currency.symbol,
+                    cp.to_currency.symbol,
+                    op.amount_side.value,
+                    op.from_amount,
+                    op.to_amount,
+                    op.rate_used,
+                    op.inverse_percentage,
                 )
 
         if "client_display_name" in fields_set and payload.client_phone is None:
@@ -901,6 +936,64 @@ class WhatsAppQuoteService:
         }
 
     # ---------- Helpers ----------
+
+    def _apply_pair_rounding(
+        self,
+        pair: CurrencyPair,
+        quote_from: str,
+        quote_to: str,
+        amount_side: str,
+        from_amount: float,
+        to_amount: float,
+        rate: float,
+        inverse: bool,
+    ) -> tuple[float, float, float, bool]:
+        """Aplica el redondeo configurado en el par a la cotización recién calculada.
+
+        Devuelve `(from_amount, to_amount, rate_used, inverse)` ya ajustados. Si el
+        par no define redondeo (o el config es inválido) devuelve los valores intactos.
+
+        - `quote_from`/`quote_to`: monedas EN LA DIRECCIÓN de esta cotización (las del
+          payload), que pueden ser el par canónico o su inverso.
+        - Modo RATE: redondea la tasa efectiva (unidades de `to` por 1 de `from`) y
+          recalcula el lado calculado; se persiste esa tasa efectiva como no-inversa.
+        - Modo AMOUNT: redondea el monto de la moneda canónica configurada, pero solo
+          cuando esa moneda es el lado CALCULADO (no el input del cliente).
+        """
+        mode = pair.rounding_mode if pair is not None else None
+        if not mode:
+            return from_amount, to_amount, rate, inverse
+        step = float(pair.rounding_step) if pair.rounding_step is not None else 0.0
+        if step <= 0:
+            return from_amount, to_amount, rate, inverse
+        direction = pair.rounding_direction or "UP"
+        quote_from = (quote_from or "").upper()
+        quote_to = (quote_to or "").upper()
+
+        if mode == "RATE":
+            eff = self.resolver.apply_rate(1.0, rate, inverse)  # `to` por 1 de `from`
+            eff_round = apply_rounding(eff, step, direction)
+            if eff_round <= 0:
+                return from_amount, to_amount, rate, inverse
+            if amount_side == "SEND":
+                to_amount = from_amount * eff_round
+            else:  # RECEIVE
+                from_amount = to_amount / eff_round
+            return from_amount, to_amount, eff_round, False
+
+        if mode == "AMOUNT":
+            side = pair.rounding_amount_side
+            if side is None or not (pair.from_currency and pair.to_currency):
+                return from_amount, to_amount, rate, inverse
+            target = (pair.from_currency.symbol if side == "FROM" else pair.to_currency.symbol).upper()
+            # SEND calcula el `to`; RECEIVE calcula el `from`. Solo redondeamos si la
+            # moneda objetivo es justamente ese lado calculado.
+            if amount_side == "SEND" and target == quote_to:
+                to_amount = apply_rounding(to_amount, step, direction)
+            elif amount_side == "RECEIVE" and target == quote_from:
+                from_amount = apply_rounding(from_amount, step, direction)
+
+        return from_amount, to_amount, rate, inverse
 
     def _get_op_or_404(self, op_uuid: UUID) -> WhatsAppOperation:
         op = self.get_by_uuid(op_uuid)

@@ -27,6 +27,17 @@ class CurrencyPair(UUIDMixin, Base):
     # Derived rate configuration (only used when base_pair_id is set)
     derived_percentage = Column(Numeric(5, 2), nullable=True)  # Percentage to apply (e.g., 5.00 for 5%)
     use_inverse_percentage = Column(Boolean, default=False, nullable=False)  # Apply percentage inversely
+
+    # Quote rounding configuration (applied when creating WhatsApp quotes).
+    #   rounding_mode:        None (off) | "RATE" (round the per-unit rate) | "AMOUNT" (round a side's amount)
+    #   rounding_step:        the multiple to round to (e.g. 100, 5)
+    #   rounding_direction:   "UP" | "DOWN"
+    #   rounding_amount_side: "FROM" | "TO" — only for AMOUNT mode: which side's amount is rounded,
+    #                         and only when that side is the *calculated* one (not the client's input).
+    rounding_mode = Column(String(6), nullable=True)
+    rounding_step = Column(Numeric(15, 4), nullable=True)
+    rounding_direction = Column(String(4), nullable=True)
+    rounding_amount_side = Column(String(4), nullable=True)
     
     # Pair identifier (e.g., "USDT-VES", "ZELLE-COP")
     pair_symbol = Column(String(20), unique=True, index=True, nullable=False)
@@ -100,6 +111,10 @@ class CurrencyPair(UUIDMixin, Base):
             "base_pair": self.base_pair.dict() if self.base_pair else None,
             "derived_percentage": float(self.derived_percentage) if self.derived_percentage else None,
             "use_inverse_percentage": self.use_inverse_percentage,
+            "rounding_mode": self.rounding_mode,
+            "rounding_step": float(self.rounding_step) if self.rounding_step is not None else None,
+            "rounding_direction": self.rounding_direction,
+            "rounding_amount_side": self.rounding_amount_side,
             "usdt_reference_side": self.usdt_reference_side,
             "usdt_manual_rate": self.usdt_manual_rate,
             "usdt_pair_uuid": self.usdt_pair.uuid if self.usdt_pair else None,

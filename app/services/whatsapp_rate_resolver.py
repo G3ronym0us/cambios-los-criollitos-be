@@ -11,11 +11,30 @@ backend/tests/test_whatsapp_rate_resolver.py validan contra los casos de
 whatsapp-bot/src/test-cases/routing.json.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.models.exchange_rate import ExchangeRate
+
+
+def apply_rounding(amount: float, step: float, direction: str) -> float:
+    """Redondea `amount` al múltiplo `step` en la dirección indicada ('UP'/'DOWN').
+
+    Con `step` inválido o dirección desconocida devuelve el monto sin tocar.
+    Usa un epsilon para que valores ya-múltiplos (afectados por error de float)
+    no salten al siguiente escalón.
+    """
+    if not step or step <= 0:
+        return amount
+    q = amount / step
+    eps = 1e-9
+    if direction == "UP":
+        return math.ceil(q - eps) * step
+    if direction == "DOWN":
+        return math.floor(q + eps) * step
+    return amount
 
 
 @dataclass

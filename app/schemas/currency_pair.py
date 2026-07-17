@@ -23,6 +23,10 @@ class CurrencyPairBase(BaseModel):
     usdt_manual_rate: Optional[float] = Field(None, description="Manual USDT rate: reference_amount * rate = amount_usdt")
     usdt_pair_uuid: Optional[UUID] = Field(None, description="UUID of CurrencyPair used for auto USDT rate")
     usdt_pair_inverse: bool = Field(False, description="If True, use 1/rate from the conversion pair")
+    rounding_mode: Optional[Literal["RATE", "AMOUNT"]] = Field(None, description="Quote rounding: 'RATE' rounds the per-unit rate, 'AMOUNT' rounds a side's amount, null disables it")
+    rounding_step: Optional[Decimal] = Field(None, description="Multiple to round to (e.g. 100, 5)")
+    rounding_direction: Optional[Literal["UP", "DOWN"]] = Field(None, description="Rounding direction")
+    rounding_amount_side: Optional[Literal["FROM", "TO"]] = Field(None, description="AMOUNT mode only: which side's amount is rounded (rounded only when it is the calculated side)")
 
     @validator('to_currency_uuid')
     def validate_different_currencies(cls, v, values):
@@ -48,6 +52,18 @@ class CurrencyPairBase(BaseModel):
     def validate_base_pair_not_self(cls, v, values):
         # This validation will be enhanced at the database level
         # to ensure base_pair exists and is not self-referencing
+        return v
+
+    @validator('rounding_amount_side')
+    def validate_rounding_config(cls, v, values):
+        mode = values.get('rounding_mode')
+        if mode is not None:
+            if not values.get('rounding_step') or values['rounding_step'] <= 0:
+                raise ValueError('rounding_step is required and must be > 0 when rounding_mode is set')
+            if not values.get('rounding_direction'):
+                raise ValueError('rounding_direction is required when rounding_mode is set')
+            if mode == 'AMOUNT' and v is None:
+                raise ValueError("rounding_amount_side is required when rounding_mode is 'AMOUNT'")
         return v
 
     @validator('pair_type', pre=True)
@@ -78,6 +94,10 @@ class CurrencyPairUpdate(BaseModel):
     usdt_manual_rate: Optional[float] = None
     usdt_pair_uuid: Optional[UUID] = None
     usdt_pair_inverse: Optional[bool] = None
+    rounding_mode: Optional[Literal["RATE", "AMOUNT"]] = None
+    rounding_step: Optional[Decimal] = None
+    rounding_direction: Optional[Literal["UP", "DOWN"]] = None
+    rounding_amount_side: Optional[Literal["FROM", "TO"]] = None
 
     @validator('pair_type', pre=True)
     def validate_pair_type(cls, v):
@@ -113,6 +133,10 @@ class CurrencyPairResponse(BaseModel):
     usdt_pair_uuid: Optional[UUID] = None
     usdt_pair_symbol: Optional[str] = None
     usdt_pair_inverse: bool = False
+    rounding_mode: Optional[str] = None
+    rounding_step: Optional[Decimal] = None
+    rounding_direction: Optional[str] = None
+    rounding_amount_side: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
 

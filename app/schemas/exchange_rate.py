@@ -36,6 +36,11 @@ class ExchangeRateResponse(BaseModel):
     manual_rate: Optional[float] = None
     is_manual: bool = False
     automatic_rate: Optional[float] = None
+    # Config de redondeo del par (para que el bot pueda espejar el cálculo)
+    rounding_mode: Optional[str] = None
+    rounding_step: Optional[float] = None
+    rounding_direction: Optional[str] = None
+    rounding_amount_side: Optional[str] = None
 
     @field_validator('is_manual', mode='before')
     @classmethod

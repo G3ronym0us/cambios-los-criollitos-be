@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Text
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from app.database.connection import Base
@@ -31,6 +31,13 @@ class WhatsAppClient(UUIDMixin, Base):
     is_blocked = Column(Boolean, default=False, nullable=False)
     is_usdt_authorized = Column(Boolean, default=False, nullable=False)
 
+    # Cuenta de pago predeterminada del cliente (una sola). `default_payment_info`
+    # es el bloque de datos (banco/cédula/teléfono, cuenta, o llave Pix) en texto;
+    # el bot lo re-normaliza al inyectarlo en una cotización sin datos. La moneda
+    # fiat indica en qué cotizaciones aplica (VES, BRL, COP...).
+    default_payment_info = Column(Text, nullable=True)
+    default_payment_currency = Column(String(10), nullable=True)
+
     last_seen_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -51,6 +58,8 @@ class WhatsAppClient(UUIDMixin, Base):
             "is_tracked": self.is_tracked,
             "is_blocked": self.is_blocked,
             "is_usdt_authorized": self.is_usdt_authorized,
+            "default_payment_info": self.default_payment_info,
+            "default_payment_currency": self.default_payment_currency,
             "last_seen_at": self.last_seen_at,
             "created_at": self.created_at,
             "updated_at": self.updated_at,

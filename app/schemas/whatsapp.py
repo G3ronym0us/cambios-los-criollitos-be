@@ -15,6 +15,8 @@ class WhatsAppClientUpsert(BaseModel):
     is_tracked: Optional[bool] = None
     is_blocked: Optional[bool] = None
     is_usdt_authorized: Optional[bool] = None
+    default_payment_info: Optional[str] = None
+    default_payment_currency: Optional[str] = None
 
     @validator("preferred_pair_symbol")
     def normalize_preferred_pair_symbol(cls, value: Optional[str]) -> Optional[str]:
@@ -30,6 +32,8 @@ class WhatsAppClientResponse(BaseModel):
     is_tracked: bool
     is_blocked: bool
     is_usdt_authorized: bool
+    default_payment_info: Optional[str] = None
+    default_payment_currency: Optional[str] = None
     last_seen_at: Optional[datetime] = None
     created_at: datetime
     updated_at: Optional[datetime] = None

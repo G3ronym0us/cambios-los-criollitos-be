@@ -50,6 +50,14 @@ def test_quote_initial_status_depends_on_payment_data(notes, expected_status):
             get_rate_entry_for_pair=lambda *_args: entry,
             apply_rate=lambda amount, rate, inverse: amount / rate if inverse else amount * rate,
         ),
+        # El par de este test no configura redondeo: passthrough. El redondeo en sí
+        # se cubre en test_whatsapp_rounding.py.
+        _apply_pair_rounding=lambda _pair, _qfrom, _qto, _side, from_amount, to_amount, rate, inverse: (
+            from_amount,
+            to_amount,
+            rate,
+            inverse,
+        ),
     )
 
     op = WhatsAppQuoteService.create_quote(

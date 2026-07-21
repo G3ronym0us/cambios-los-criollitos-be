@@ -329,6 +329,10 @@ def upsert_client(
         client.is_blocked = payload.is_blocked
     if payload.is_usdt_authorized is not None:
         client.is_usdt_authorized = payload.is_usdt_authorized
+    if "default_payment_info" in payload.model_fields_set:
+        client.default_payment_info = payload.default_payment_info
+    if "default_payment_currency" in payload.model_fields_set:
+        client.default_payment_currency = payload.default_payment_currency
 
     db.commit()
     db.refresh(client)

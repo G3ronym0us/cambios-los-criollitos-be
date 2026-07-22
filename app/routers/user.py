@@ -57,6 +57,15 @@ async def create_user(
             detail=f"Email '{user_data.email}' already exists"
         )
 
+    # El número de WhatsApp es único entre usuarios.
+    if user_data.phone_number:
+        owner = user_repo.get_by_whatsapp_phone(user_data.phone_number)
+        if owner:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Ese número de WhatsApp ya es de {owner.full_name or owner.username}",
+            )
+
     # Crear usuario usando admin_create_user
     from app.schemas.auth import AdminCreateUser
     from app.enums.user_roles import UserRole
@@ -69,7 +78,7 @@ async def create_user(
         role_name=user_data.role.upper() if user_data.role else "USER",
         is_active=user_data.is_active if user_data.is_active is not None else True,
         is_verified=False,
-        phone_number=None
+        phone_number=user_data.phone_number,
     )
 
     new_user = user_repo.admin_create_user(admin_user_data)
@@ -126,6 +135,16 @@ async def update_user(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Email '{user_data.email}' already exists"
+            )
+
+    # El número de WhatsApp es único entre usuarios (sus membresías lo heredan). Si ya es
+    # de otro usuario, avisar de quién para que el operador lo corrija.
+    if user_data.phone_number:
+        owner = user_repo.get_by_whatsapp_phone(user_data.phone_number, exclude_user_id=user.id)
+        if owner:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Ese número de WhatsApp ya es de {owner.full_name or owner.username}",
             )
 
     # Si se actualiza el rol, convertir a enum

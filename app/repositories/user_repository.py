@@ -125,18 +125,52 @@ class UserRepository:
         
         return user
 
+    @staticmethod
+    def _phone_digits(phone: Optional[str]) -> str:
+        return "".join(ch for ch in (phone or "") if ch.isdigit())
+
+    def get_by_whatsapp_phone(self, phone: str, exclude_user_id: Optional[int] = None) -> Optional[User]:
+        """
+        Usuario cuyo phone_number coincide (comparando solo dígitos). El número de WhatsApp
+        es único entre usuarios: sirve para avisar "ese número ya es de X" y para excluir de
+        la lista los que ya están tomados. Itera en Python porque los formatos guardados
+        varían (con/sin '+', espacios); la base de usuarios es chica.
+        """
+        digits = self._phone_digits(phone)
+        if not digits:
+            return None
+        q = self.db.query(User).filter(User.phone_number.isnot(None))
+        if exclude_user_id is not None:
+            q = q.filter(User.id != exclude_user_id)
+        for u in q.all():
+            if self._phone_digits(u.phone_number) == digits:
+                return u
+        return None
+
     def update_user(self, user_id: int, user_data: UserUpdate) -> Optional[User]:
         user = self.get_by_id(user_id)
         if not user:
             return None
-        
+
         update_data = user_data.dict(exclude_unset=True)
         for field, value in update_data.items():
             setattr(user, field, value)
-        
+
         user.updated_at = datetime.utcnow()
         self.db.commit()
         self.db.refresh(user)
+
+        # El número del usuario es la fuente de verdad del whatsapp_phone de sus membresías:
+        # propagarlo para que el bot (detección vía socio) matchee el número vigente.
+        if "phone_number" in update_data:
+            from app.models.fund import FundGroupMember
+            self.db.query(FundGroupMember).filter(
+                FundGroupMember.user_id == user.id
+            ).update(
+                {FundGroupMember.whatsapp_phone: user.phone_number},
+                synchronize_session=False,
+            )
+            self.db.commit()
         return user
 
     def change_password(self, user_id: int, current_password: str, new_password: str) -> bool:

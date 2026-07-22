@@ -104,11 +104,13 @@ async def add_group_member(
             detail=f"User '{user.username}' is already a member of this group",
         )
 
+    # El número de WhatsApp del socio es el que el usuario tiene definido en su perfil
+    # (pantalla de Usuarios), no un dato suelto del miembro.
     member = fund_repo.add_member(
         group_id=group.id,
         user_id=user.id,
         is_fund_manager=member_data.is_fund_manager,
-        whatsapp_phone=member_data.whatsapp_phone,
+        whatsapp_phone=user.phone_number,
     )
     return member
 
@@ -135,11 +137,12 @@ async def update_group_member(
     if not member:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found in this group")
 
+    # Re-sincroniza el número desde el perfil del usuario (fuente de verdad).
     return fund_repo.update_member(
         member,
         is_fund_manager=payload.is_fund_manager,
-        whatsapp_phone=payload.whatsapp_phone,
-        clear_whatsapp_phone=payload.clear_whatsapp_phone,
+        whatsapp_phone=user.phone_number,
+        clear_whatsapp_phone=user.phone_number is None,
     )
 
 

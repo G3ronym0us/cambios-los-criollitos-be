@@ -12,6 +12,7 @@ class UserBase(BaseModel):
 class UserCreate(UserBase):
     password: str
     role: Optional[str] = "USER"
+    phone_number: Optional[str] = None
 
 class UserUpdate(BaseModel):
     email: Optional[EmailStr] = None
@@ -62,6 +63,7 @@ class CommissionUserResponse(BaseModel):
     email: str
     can_receive_commission: bool
     is_active: bool
+    phone_number: Optional[str] = None  # Número de WhatsApp del usuario (heredado por sus membresías)
     created_at: datetime
 
     class Config:

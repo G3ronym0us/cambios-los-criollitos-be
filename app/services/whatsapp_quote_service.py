@@ -348,7 +348,20 @@ class WhatsAppQuoteService:
         # Completar implica la aprobación (el operador es quien decide proceder). El camino
         # QUOTED→PENDING→COMPLETED sigue válido para flujos que sí confirmen con el cliente.
         if op.status == WhatsAppOperationStatus.QUOTED:
-            if op.expires_at <= datetime.now(timezone.utc):
+            # La expiración es un concepto de "el cliente no acepta una tasa vieja" y solo
+            # protege el paso de aprobación por el cliente (approve_quote). Cuando la op ya
+            # tiene un saliente vinculado, el dinero YA se movió: la tasa se congeló al cotizar
+            # y el cierre es el match del comprobante, no una confirmación del cliente. En
+            # escenarios donde el cliente ni siquiera habla con el bot (VIA_PARTNER: el socio
+            # recibe el entrante y reporta), completar por comprobante tras el TTL es normal.
+            # Bloquearlo dejaba la op huérfana en QUOTED con el saliente colgando.
+            has_linked_outgoing = (
+                self.db.query(WhatsAppOutgoingPayment.id)
+                .filter(WhatsAppOutgoingPayment.whatsapp_operation_id == op.id)
+                .first()
+                is not None
+            )
+            if not has_linked_outgoing and op.expires_at <= datetime.now(timezone.utc):
                 raise QuoteServiceError("quote_expired", "La cotización expiró", 409)
             op.approved_at = datetime.now(timezone.utc)
 

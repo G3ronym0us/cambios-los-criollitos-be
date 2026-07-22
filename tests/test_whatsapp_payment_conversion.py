@@ -197,3 +197,178 @@ def test_link_outgoing_rejects_operation_with_another_outgoing_payment():
 
     assert exc.value.code == "operation_payment_already_linked"
     assert db.commits == 0
+
+
+def test_link_outgoing_adopts_real_client_when_operation_client_is_group(monkeypatch):
+    real_phone = "584121234567"
+    row = _payment(id=7, client_phone=real_phone, whatsapp_operation_id=None)
+    operation_uuid = uuid4()
+    group_client = SimpleNamespace(id=3, phone="120363000000000@g.us")
+    real_client = SimpleNamespace(id=4, phone=real_phone)
+    operation = SimpleNamespace(id=42, uuid=operation_uuid, client=group_client, client_id=group_client.id)
+    assignments = []
+
+    class _LinkDB(_DB):
+        def query(self, entity):
+            if entity is payment_service_module.WhatsAppOperation:
+                return _Query(operation)
+            return _Query(None)
+
+    class _QuoteService:
+        def __init__(self, _db):
+            pass
+
+        def _assign_client(self, op, phone, display_name, update_display_name):
+            assignments.append((phone, display_name, update_display_name))
+            op.client = real_client
+            op.client_id = real_client.id
+
+    db = _LinkDB()
+    service = _service(db, row)
+    monkeypatch.setattr(payment_service_module, "WhatsAppQuoteService", _QuoteService)
+
+    result = service.set_operation("outgoing", row.id, operation_uuid)
+
+    assert assignments == [(real_phone, None, False)]
+    assert operation.client is real_client
+    assert row.client_phone == real_phone
+    assert row.whatsapp_operation_id == operation.id
+    assert result is row
+    assert db.commits == 1
+
+
+def test_link_outgoing_keeps_explicit_operation_client(monkeypatch):
+    operation_phone = "584129999999"
+    row = _payment(id=7, client_phone="584121234567", whatsapp_operation_id=None)
+    operation_uuid = uuid4()
+    operation = SimpleNamespace(
+        id=42,
+        uuid=operation_uuid,
+        client=SimpleNamespace(id=3, phone=operation_phone),
+    )
+
+    class _LinkDB(_DB):
+        def query(self, entity):
+            if entity is payment_service_module.WhatsAppOperation:
+                return _Query(operation)
+            return _Query(None)
+
+    class _UnexpectedQuoteService:
+        def __init__(self, _db):
+            raise AssertionError("No debe inferir otro cliente si la operación ya tiene uno real")
+
+    db = _LinkDB()
+    service = _service(db, row)
+    monkeypatch.setattr(payment_service_module, "WhatsAppQuoteService", _UnexpectedQuoteService)
+
+    service.set_operation("outgoing", row.id, operation_uuid)
+
+    assert row.client_phone == operation_phone
+    assert row.whatsapp_operation_id == operation.id
+    assert db.commits == 1
+
+
+# ===== Cliente y fondo de la operación creada desde un comprobante =====
+
+
+class _QuoteSvcSpy:
+    """Doble de WhatsAppQuoteService que registra qué cliente se pidió crear."""
+
+    def __init__(self):
+        self.anonymous_calls = []
+        self.upsert_calls = []
+
+    def upsert_anonymous_group_client(self, group):
+        self.anonymous_calls.append(group)
+        return SimpleNamespace(id=99, phone=f"anon:group:{group.id}")
+
+    def upsert_client(self, phone):
+        self.upsert_calls.append(phone)
+        return SimpleNamespace(id=1, phone=phone)
+
+
+def test_operation_from_group_receipt_uses_anonymous_client_not_the_group():
+    """El grupo contable no es el cliente: la op nace anónima, no a nombre del grupo."""
+    group = SimpleNamespace(id=1, name="Zelle/Paypal")
+    row = _payment(client_phone="120363405617730310@g.us")
+    service = _service(_DB({payment_service_module.FundGroup: group}), row)
+    quote_svc = _QuoteSvcSpy()
+
+    client = service._resolve_operation_client(quote_svc, row, None)
+
+    assert quote_svc.anonymous_calls == [group]
+    assert quote_svc.upsert_calls == []
+    assert client.phone == "anon:group:1"
+
+
+def test_operation_from_client_receipt_keeps_the_real_client():
+    row = _payment(client_phone="584121234567")
+    service = _service(_DB(), row)
+    quote_svc = _QuoteSvcSpy()
+
+    client = service._resolve_operation_client(quote_svc, row, None)
+
+    assert quote_svc.anonymous_calls == []
+    assert quote_svc.upsert_calls == ["584121234567"]
+    assert client.phone == "584121234567"
+
+
+def test_operation_inherits_fund_group_of_the_payment_when_omitted():
+    """Sin fondo explícito, la op hereda el del comprobante en vez de nacer huérfana."""
+    group = SimpleNamespace(id=1, name="Zelle/Paypal")
+    row = _payment(fund_group_id=1)
+    service = _service(_DB({payment_service_module.FundGroup: group}), row)
+
+    resolved = service._resolve_operation_fund_group(row, None, fund_group_provided=False)
+
+    assert resolved is group
+
+
+def test_explicit_null_fund_group_is_respected_over_the_payment_one():
+    """Si el operador quitó el fondo a propósito, no se lo devolvemos por la puerta de atrás."""
+    group = SimpleNamespace(id=1, name="Zelle/Paypal")
+    row = _payment(fund_group_id=1)
+    service = _service(_DB({payment_service_module.FundGroup: group}), row)
+
+    resolved = service._resolve_operation_fund_group(row, None, fund_group_provided=True)
+
+    assert resolved is None
+
+
+def test_link_outgoing_adopts_real_client_when_operation_client_is_anonymous(monkeypatch):
+    """
+    Una op creada desde un comprobante de grupo ya no queda con el JID sino con un cliente
+    anónimo: al vincular el saliente real, ese teléfono debe seguir adoptándose igual.
+    """
+    real_phone = "584121234567"
+    row = _payment(id=7, client_phone=real_phone, whatsapp_operation_id=None)
+    operation_uuid = uuid4()
+    anon_client = SimpleNamespace(id=3, phone="anon:group:1")
+    real_client = SimpleNamespace(id=4, phone=real_phone)
+    operation = SimpleNamespace(id=42, uuid=operation_uuid, client=anon_client, client_id=anon_client.id)
+    assignments = []
+
+    class _LinkDB(_DB):
+        def query(self, entity):
+            if entity is payment_service_module.WhatsAppOperation:
+                return _Query(operation)
+            return _Query(None)
+
+    class _QuoteService:
+        def __init__(self, _db):
+            pass
+
+        def _assign_client(self, op, phone, display_name, update_display_name):
+            assignments.append((phone, display_name, update_display_name))
+            op.client = real_client
+            op.client_id = real_client.id
+
+    db = _LinkDB()
+    service = _service(db, row)
+    monkeypatch.setattr(payment_service_module, "WhatsAppQuoteService", _QuoteService)
+
+    service.set_operation("outgoing", row.id, operation_uuid)
+
+    assert assignments == [(real_phone, None, False)]
+    assert operation.client is real_client
+    assert db.commits == 1

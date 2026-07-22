@@ -50,6 +50,17 @@ from app.services.whatsapp_rate_resolver import WhatsAppRateResolver, apply_roun
 QUOTE_TTL_MINUTES = 30
 
 
+def is_unassigned_client_phone(phone: Optional[str]) -> bool:
+    """
+    ¿Este "cliente" es en realidad un marcador de que aún no sabemos quién es? Cubre el
+    JID de un grupo contable (comprobante reenviado; ops antiguas) y los clientes
+    anónimos. Sirve para decidir si conviene adoptar un teléfono real cuando aparece.
+    """
+    if not phone:
+        return False
+    return phone.endswith("@g.us") or phone.startswith("anon:")
+
+
 class QuoteServiceError(Exception):
     """Error de negocio del servicio. El router lo mapea a HTTPException."""
 
@@ -81,6 +92,18 @@ class WhatsAppQuoteService:
             client.display_name = display_name
         client.last_seen_at = now
         return client
+
+    def upsert_anonymous_group_client(self, group: FundGroup) -> WhatsAppClient:
+        """
+        Cliente anónimo de un grupo contable. Un FundGroup NO es un cliente: cuando el
+        operador atiende al cliente por fuera del bot y solo reenvía los comprobantes al
+        grupo, la op no debe quedar a nombre del grupo. Queda anónima hasta que se vincule
+        el pago saliente (ver `set_operation`) o se corrija desde el detalle de la op.
+
+        Clave propia (`anon:group:`) para no colisionar con `anon:partner:{user_id}` de
+        VIA_PARTNER, que indexa por usuario receptor sobre el mismo espacio de enteros.
+        """
+        return self.upsert_client(f"anon:group:{group.id}", f"Anónimo (vía {group.name})")
 
     # ---------- Crear cotización ----------
 

@@ -30,7 +30,11 @@ from app.models.client_loan import ClientLoan
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.repositories.fund_repository import FundRepository
 from app.schemas.whatsapp import WhatsAppOperationComplete
-from app.services.whatsapp_quote_service import QuoteServiceError, WhatsAppQuoteService
+from app.services.whatsapp_quote_service import (
+    QuoteServiceError,
+    WhatsAppQuoteService,
+    is_unassigned_client_phone,
+)
 
 
 EDITABLE_FIELDS = ["provider", "amount", "currency", "bank_from", "bank_to", "identification", "phone_to", "reference"]
@@ -351,10 +355,30 @@ class WhatsAppPaymentService:
                     "El pago ya pertenece a otra operación; desvincúlalo primero",
                     409,
                 )
+            # Una operación creada desde un comprobante reenviado al grupo queda sin
+            # cliente conocido (anónima, o con el JID del grupo en ops antiguas). Al
+            # vincular después el pago saliente real, ese número es la primera referencia
+            # confiable del destinatario: adoptarlo antes de sincronizar los pagos.
+            payment_client_phone = row.client_phone
             row.whatsapp_operation_id = op.id
-            # Sincroniza client_phone al de la op (el operador afirma "este pago es de este cliente").
-            if op.client and op.client.phone:
-                row.client_phone = op.client.phone
+            operation_client_phone = op.client.phone if op.client else None
+            should_infer_client = (
+                table == "outgoing"
+                and is_unassigned_client_phone(operation_client_phone)
+                and bool(payment_client_phone)
+                and not is_unassigned_client_phone(payment_client_phone)
+            )
+            if should_infer_client:
+                WhatsAppQuoteService(self.db)._assign_client(
+                    op,
+                    payment_client_phone,
+                    display_name=None,
+                    update_display_name=False,
+                )
+            # En el resto de los casos se conserva el criterio existente: vincular
+            # el comprobante a una operación afirma que pertenece a su cliente.
+            elif operation_client_phone:
+                row.client_phone = operation_client_phone
         else:
             row.whatsapp_operation_id = None
 
@@ -771,6 +795,44 @@ class WhatsAppPaymentService:
 
     # ---------- Crear operación desde pago ----------
 
+    def _resolve_operation_fund_group(
+        self,
+        row,
+        fund_group_uuid: Optional[UUID],
+        fund_group_provided: bool,
+    ):
+        """
+        Fondo de la op que nace de un comprobante. El explícito manda; si el caller omitió
+        el campo, se hereda el del pago (ej. reenviado al grupo y convertido a entrante),
+        que si no quedaría huérfano. Un null explícito significa "sin fondo" y se respeta,
+        para no pisar al operador que lo quitó a propósito.
+        """
+        if fund_group_uuid is not None:
+            group = self.db.query(FundGroup).filter(FundGroup.uuid == str(fund_group_uuid)).first()
+            if group is None:
+                raise QuoteServiceError("fund_group_not_found", f"Fondo {fund_group_uuid} no encontrado", 404)
+            return group
+        if not fund_group_provided and getattr(row, "fund_group_id", None) is not None:
+            return self.db.query(FundGroup).filter(FundGroup.id == row.fund_group_id).first()
+        return None
+
+    def _resolve_operation_client(self, quote_svc: WhatsAppQuoteService, row, group):
+        """
+        Cliente de la op que nace de un comprobante. Un grupo contable NO es un cliente: si
+        el comprobante llegó reenviado al grupo, al cliente real lo atendió el operador por
+        fuera del bot y todavía no sabemos quién es. La op nace con el cliente anónimo del
+        grupo y se resuelve al vincular el saliente (`set_operation`) o desde su detalle.
+        """
+        if (row.client_phone or "").endswith("@g.us"):
+            source_group = (
+                self.db.query(FundGroup)
+                .filter(FundGroup.whatsapp_group_jid == row.client_phone)
+                .first()
+            ) or group
+            if source_group is not None:
+                return quote_svc.upsert_anonymous_group_client(source_group)
+        return quote_svc.upsert_client(row.client_phone)
+
     def create_operation_from_payment(
         self, table: str, payment_id: int, from_currency: str, to_currency: str,
         from_amount: float, to_amount: float,
@@ -778,6 +840,7 @@ class WhatsAppPaymentService:
         fund_group_uuid: Optional[UUID] = None,
         exchange_user_uuid: Optional[UUID] = None,
         recorded_by_user_id: Optional[int] = None,
+        fund_group_provided: bool = False,
     ) -> dict:
         row = self._get_or_404(table, payment_id)
         if table == "outgoing":
@@ -798,14 +861,10 @@ class WhatsAppPaymentService:
             raise QuoteServiceError("pair_not_found", f"No existe currency pair para {from_currency}/{to_currency}", 404)
 
         # Fondo opcional (etiqueta + movimiento EXCHANGE). Resolver antes de crear la op.
-        group = None
-        if fund_group_uuid is not None:
-            group = self.db.query(FundGroup).filter(FundGroup.uuid == str(fund_group_uuid)).first()
-            if group is None:
-                raise QuoteServiceError("fund_group_not_found", f"Fondo {fund_group_uuid} no encontrado", 404)
+        group = self._resolve_operation_fund_group(row, fund_group_uuid, fund_group_provided)
 
         quote_svc = WhatsAppQuoteService(self.db)
-        client = quote_svc.upsert_client(row.client_phone)
+        client = self._resolve_operation_client(quote_svc, row, group)
 
         now = datetime.utcnow()
         track_delivery = table == "outgoing" and from_currency == "USD"

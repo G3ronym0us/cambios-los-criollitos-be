@@ -86,6 +86,7 @@ def test_assign_client_clears_name_and_syncs_both_payment_types():
 
     assert client.display_name is None
     assert op.client_id == client.id
+    assert op.client is client
     assert db.payment_updates == [
         {"client_phone": client.phone},
         {"client_phone": client.phone},

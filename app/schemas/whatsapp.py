@@ -126,6 +126,10 @@ class WhatsAppOperationResponse(BaseModel):
     delivery_status: Optional[Literal["PENDING", "RECEIVED"]] = None
     delivered_at: Optional[datetime] = None
     notes: Optional[str] = None
+    # Quedó sin ningún comprobante y un operador lo aceptó explícitamente.
+    no_payments_ack_by_username: Optional[str] = None
+    no_payments_ack_at: Optional[datetime] = None
+    no_payments_ack_note: Optional[str] = None
     transaction_uuid: Optional[UUID] = None
     legacy_sqlite_id: Optional[str] = None
     quoted_at: datetime
@@ -268,19 +272,31 @@ class WhatsAppPartialSettle(BaseModel):
     settle_amount: float = Field(gt=0)
 
 
-class WhatsAppPaymentLink(BaseModel):
+class OrphanDecision(BaseModel):
+    """
+    Qué hacer con la operación si al desvincular este pago se queda sin ningún comprobante.
+    Sin decisión el backend rechaza el desvinculado (409 `operation_would_be_orphan`).
+
+    - DELETE_OPERATION: borra la op con su transacción y sus movimientos de fondo.
+    - KEEP: la conserva y firma quién aceptó dejarla sin pago asociado.
+    """
+    orphan_action: Optional[Literal["KEEP", "DELETE_OPERATION"]] = None
+    orphan_note: Optional[str] = None
+
+
+class WhatsAppPaymentLink(OrphanDecision):
     operation_uuid: Optional[UUID] = None
     # Liquidación parcial (solo salientes): monto USD realmente cambiado; el
     # excedente de la op se acredita como saldo a favor al completar.
     settle_amount: Optional[float] = Field(None, gt=0)
 
 
-class WhatsAppPersonalExpense(BaseModel):
+class WhatsAppPersonalExpense(OrphanDecision):
     is_personal_expense: bool
     personal_description: Optional[str] = None
 
 
-class WhatsAppIrrelevant(BaseModel):
+class WhatsAppIrrelevant(OrphanDecision):
     is_irrelevant: bool
     irrelevant_description: Optional[str] = None
 

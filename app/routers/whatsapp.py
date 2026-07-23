@@ -451,7 +451,17 @@ def link_payment_operation(
 ):
     service = WhatsAppPaymentService(db)
     try:
-        return service.set_operation(table, payment_id, payload.operation_uuid)
+        # El bot no tiene con quién confirmar: si su desvinculado deja la op sin comprobantes,
+        # se conserva y queda firmada a nombre del usuario de servicio (el operador la ve
+        # marcada "sin pago asociado" en el panel). El cuadro de decisión es del front.
+        return service.set_operation(
+            table,
+            payment_id,
+            payload.operation_uuid,
+            completing_user=principal.service_user,
+            orphan_action=payload.orphan_action or "KEEP",
+            orphan_note=payload.orphan_note or "Desvinculado por el bot",
+        )
     except QuoteServiceError as exc:
         _handle_service_error(exc)
 

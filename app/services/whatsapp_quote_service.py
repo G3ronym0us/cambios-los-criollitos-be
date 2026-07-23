@@ -19,9 +19,10 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.models.currency_pair import CurrencyPair
-from app.models.fund import FundGroup, FundGroupMember
+from app.models.fund import FundGroup, FundGroupMember, FundMovement, FundMovementType
 from app.models.transaction import Transaction, TransactionProfitSplit, TransactionStatus
 from app.models.user import User
+from app.models.whatsapp_balance import WhatsAppBalanceEntry
 from app.models.whatsapp_client import WhatsAppClient
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from app.models.whatsapp_operation import (
@@ -274,6 +275,91 @@ class WhatsAppQuoteService:
         self.db.commit()
         self.db.refresh(op)
         return op
+
+    def orphan_fund_movements(self, op: WhatsAppOperation) -> list:
+        """
+        Movimientos de fondo que se irían con la operación. Los que cuelgan de su Transaction
+        salen por CASCADE al borrarla; además hay EXCHANGE antiguos creados sin
+        `transaction_id` (ver `create_operation_from_payment`), que solo se pueden reconocer
+        por fondo + fecha del movimiento, que es la de la operación.
+        """
+        movements = []
+        if op.transaction_id is not None:
+            movements.extend(
+                self.db.query(FundMovement)
+                .filter(FundMovement.transaction_id == op.transaction_id)
+                .all()
+            )
+        stamp = op.completed_at or op.created_at
+        if op.fund_group_id is not None and stamp is not None:
+            loose = (
+                self.db.query(FundMovement)
+                .filter(
+                    FundMovement.group_id == op.fund_group_id,
+                    FundMovement.transaction_id.is_(None),
+                    FundMovement.movement_type == FundMovementType.EXCHANGE,
+                    FundMovement.movement_date == stamp,
+                )
+                .all()
+            )
+            known = {m.id for m in movements}
+            movements.extend(m for m in loose if m.id not in known)
+        return movements
+
+    def delete_operation(self, op: WhatsAppOperation) -> dict:
+        """
+        Borra una operación sin comprobantes junto con su rastro contable: la Transaction
+        (que arrastra por CASCADE sus profit splits y los movimientos ligados a ella) y los
+        movimientos EXCHANGE sueltos del mismo fondo y fecha.
+
+        No toca el ledger de saldo del cliente: si la op tiene abonos/créditos, se rechaza
+        para que el operador resuelva el saldo antes.
+        """
+        payments = (
+            self.db.query(WhatsAppIncomingPayment.id)
+            .filter(WhatsAppIncomingPayment.whatsapp_operation_id == op.id)
+            .count()
+            + self.db.query(WhatsAppOutgoingPayment.id)
+            .filter(WhatsAppOutgoingPayment.whatsapp_operation_id == op.id)
+            .count()
+        )
+        if payments:
+            raise QuoteServiceError(
+                "operation_has_payments",
+                "La operación todavía tiene pagos vinculados; desvincúlalos primero",
+                409,
+            )
+
+        entries = (
+            self.db.query(WhatsAppBalanceEntry.id)
+            .filter(WhatsAppBalanceEntry.whatsapp_operation_id == op.id)
+            .count()
+        )
+        if entries:
+            raise QuoteServiceError(
+                "operation_has_balance_entries",
+                "La operación movió el saldo a favor del cliente; resuelve esos abonos antes "
+                "de borrarla",
+                409,
+            )
+
+        movements = self.orphan_fund_movements(op)
+        deleted = {
+            "operation_uuid": op.uuid,
+            "transaction_uuid": op.transaction.uuid if op.transaction else None,
+            "fund_movements": [m.uuid for m in movements],
+        }
+
+        for movement in movements:
+            self.db.delete(movement)
+        transaction_id = op.transaction_id
+        op.transaction_id = None
+        self.db.delete(op)
+        self.db.flush()
+        if transaction_id is not None:
+            TransactionRepository(self.db).delete_transaction(transaction_id)
+        self.db.commit()
+        return deleted
 
     def restore_quote(self, op_uuid: UUID) -> WhatsAppOperation:
         """Revierte una cancelación reciente: CANCELLED -> QUOTED (refresca expires_at).

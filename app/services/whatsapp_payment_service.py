@@ -8,7 +8,7 @@ se queda en el bot; aquí solo persistimos y resolvemos vínculos.
 """
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -312,6 +312,55 @@ class WhatsAppPaymentService:
 
     # ---------- Vincular / flags ----------
 
+    def _payments_left_without(self, op_id: int, table: str, payment_id: int) -> int:
+        """Comprobantes que le quedarían a la operación si este pago se desvincula."""
+        incoming = self.db.query(WhatsAppIncomingPayment.id).filter(
+            WhatsAppIncomingPayment.whatsapp_operation_id == op_id
+        )
+        outgoing = self.db.query(WhatsAppOutgoingPayment.id).filter(
+            WhatsAppOutgoingPayment.whatsapp_operation_id == op_id
+        )
+        if table == "incoming":
+            incoming = incoming.filter(WhatsAppIncomingPayment.id != payment_id)
+        else:
+            outgoing = outgoing.filter(WhatsAppOutgoingPayment.id != payment_id)
+        return incoming.count() + outgoing.count()
+
+    def _resolve_orphan(
+        self,
+        row,
+        table: str,
+        payment_id: int,
+        orphan_action: Optional[str],
+        orphan_note: Optional[str],
+        actor: Optional[User],
+    ) -> Optional[WhatsAppOperation]:
+        """
+        Decide qué pasa con la operación cuando este pago era el único que la respaldaba.
+        Devuelve la op a borrar (el borrado va después de soltar el vínculo) o None.
+
+        Sin decisión explícita se rechaza: una op —sobre todo COMPLETED, que ya no puede
+        cambiar de estado— no debe quedarse sin ningún comprobante sin que alguien lo asuma.
+        """
+        op = row.operation
+        if op is None or self._payments_left_without(op.id, table, payment_id) > 0:
+            return None
+
+        if orphan_action == "DELETE_OPERATION":
+            return op
+        if orphan_action == "KEEP":
+            op.no_payments_ack_by_user_id = actor.id if actor else None
+            op.no_payments_ack_at = datetime.now(timezone.utc)
+            op.no_payments_ack_note = orphan_note
+            return None
+        raise QuoteServiceError(
+            "operation_would_be_orphan",
+            f"Es el único pago de la operación {op.uuid}: quedaría sin ningún comprobante que "
+            "la respalde. Confirma si se borra la operación con su transacción o si se "
+            "mantiene así.",
+            409,
+        )
+
     def set_operation(
         self,
         table: str,
@@ -320,8 +369,15 @@ class WhatsAppPaymentService:
         completing_user: Optional[User] = None,
         complete_outgoing: bool = False,
         settle_amount: Optional[float] = None,
+        orphan_action: Optional[str] = None,
+        orphan_note: Optional[str] = None,
     ) -> dict:
         row = self._get_or_404(table, payment_id)
+        orphaned_op = (
+            self._resolve_orphan(row, table, payment_id, orphan_action, orphan_note, completing_user)
+            if operation_uuid is None
+            else None
+        )
         if table == "outgoing" and operation_uuid is not None:
             self._assert_not_loan(payment_id)
         op = None
@@ -379,6 +435,8 @@ class WhatsAppPaymentService:
             # el comprobante a una operación afirma que pertenece a su cliente.
             elif operation_client_phone:
                 row.client_phone = operation_client_phone
+            # La op vuelve a tener respaldo: el aval de "sin pago asociado" ya no aplica.
+            self._clear_no_payments_ack(op)
         else:
             row.whatsapp_operation_id = None
 
@@ -415,7 +473,21 @@ class WhatsAppPaymentService:
         else:
             self.db.commit()
         self.db.refresh(row)
+
+        # El borrado va al final, con el vínculo ya soltado: así la op llega sin pagos a
+        # delete_operation y se lleva su transacción y sus movimientos de fondo.
+        if orphaned_op is not None:
+            WhatsAppQuoteService(self.db).delete_operation(orphaned_op)
+
         return self._with_name(row)
+
+    @staticmethod
+    def _clear_no_payments_ack(op: Optional[WhatsAppOperation]) -> None:
+        if op is None:
+            return
+        op.no_payments_ack_by_user_id = None
+        op.no_payments_ack_at = None
+        op.no_payments_ack_note = None
 
     def _apply_partial_settle(
         self,
@@ -582,10 +654,25 @@ class WhatsAppPaymentService:
         )
         return surplus
 
-    def set_personal_expense(self, payment_id: int, is_personal: bool, description: Optional[str]) -> dict:
+    def set_personal_expense(
+        self,
+        payment_id: int,
+        is_personal: bool,
+        description: Optional[str],
+        actor: Optional[User] = None,
+        orphan_action: Optional[str] = None,
+        orphan_note: Optional[str] = None,
+    ) -> dict:
         row = self._get_or_404("outgoing", payment_id)
         if is_personal:
             self._assert_not_loan(payment_id)
+        # Marcarlo como personal lo desvincula: si era el único comprobante de la op, pasa
+        # por la misma decisión que un desvinculado explícito.
+        orphaned_op = (
+            self._resolve_orphan(row, "outgoing", payment_id, orphan_action, orphan_note, actor)
+            if is_personal
+            else None
+        )
         row.is_personal_expense = is_personal
         if is_personal:
             row.personal_description = description
@@ -594,12 +681,27 @@ class WhatsAppPaymentService:
             row.personal_description = None
         self.db.commit()
         self.db.refresh(row)
+        if orphaned_op is not None:
+            WhatsAppQuoteService(self.db).delete_operation(orphaned_op)
         return self._with_name(row)
 
-    def set_irrelevant(self, payment_id: int, is_irrelevant: bool, description: Optional[str] = None) -> dict:
+    def set_irrelevant(
+        self,
+        payment_id: int,
+        is_irrelevant: bool,
+        description: Optional[str] = None,
+        actor: Optional[User] = None,
+        orphan_action: Optional[str] = None,
+        orphan_note: Optional[str] = None,
+    ) -> dict:
         row = self._get_or_404("outgoing", payment_id)
         if is_irrelevant:
             self._assert_not_loan(payment_id)
+        orphaned_op = (
+            self._resolve_orphan(row, "outgoing", payment_id, orphan_action, orphan_note, actor)
+            if is_irrelevant
+            else None
+        )
         row.is_irrelevant = is_irrelevant
         if is_irrelevant:
             row.irrelevant_description = description
@@ -608,7 +710,48 @@ class WhatsAppPaymentService:
             row.irrelevant_description = None
         self.db.commit()
         self.db.refresh(row)
+        if orphaned_op is not None:
+            WhatsAppQuoteService(self.db).delete_operation(orphaned_op)
         return self._with_name(row)
+
+    def unlink_preview(self, table: str, payment_id: int) -> dict:
+        """
+        Qué pasaría si este pago se desvincula de su operación: si la dejaría sin ningún
+        comprobante y, en ese caso, todo lo que se borraría al elegir borrarla. Es lo que el
+        front muestra en el cuadro de confirmación.
+        """
+        row = self._get_or_404(table, payment_id)
+        op = row.operation
+        if op is None:
+            return {"would_orphan": False, "operation": None}
+        if self._payments_left_without(op.id, table, payment_id) > 0:
+            return {"would_orphan": False, "operation": op.dict()}
+
+        quote_svc = WhatsAppQuoteService(self.db)
+        movements = quote_svc.orphan_fund_movements(op)
+        balance_entries = (
+            self.db.query(WhatsAppBalanceEntry.id)
+            .filter(WhatsAppBalanceEntry.whatsapp_operation_id == op.id)
+            .count()
+        )
+        return {
+            "would_orphan": True,
+            "operation": op.dict(),
+            "transaction_uuid": op.transaction.uuid if op.transaction else None,
+            "fund_group_name": op.fund_group.name if op.fund_group else None,
+            "fund_movements": [
+                {
+                    "uuid": m.uuid,
+                    "movement_type": m.movement_type.value if m.movement_type else None,
+                    "amount": m.amount,
+                    "currency": m.currency,
+                }
+                for m in movements
+            ],
+            "balance_entries": balance_entries,
+            # Con saldo de por medio el borrado no está disponible: solo mantener.
+            "can_delete": balance_entries == 0,
+        }
 
     def mark_incoming_forwarded_to_group(
         self,
@@ -883,6 +1026,18 @@ class WhatsAppPaymentService:
                     400,
                 )
 
+            transaction_user = self.db.query(User).filter(User.id == exchange_user_id).first()
+            if transaction_user is None:
+                raise QuoteServiceError("transaction_user_required", "Falta el usuario de la transacción", 400)
+            # La transacción va primero para que el movimiento cuelgue de ella: así el
+            # movimiento se va con la transacción (FK ON DELETE CASCADE) si la op se borra.
+            tx = quote_svc._create_transaction_for_op(
+                op,
+                WhatsAppOperationComplete(),
+                transaction_user,
+            )
+            op.transaction_id = tx.id
+
             FundRepository(self.db).create_movement(
                 group_id=group.id,
                 user_id=exchange_user_id,
@@ -890,18 +1045,9 @@ class WhatsAppPaymentService:
                 amount=mv_amount,
                 currency=base,
                 movement_date=now,
+                transaction_id=tx.id,
                 recorded_by_user_id=recorded_by_user_id,
             )
-
-            transaction_user = self.db.query(User).filter(User.id == exchange_user_id).first()
-            if transaction_user is None:
-                raise QuoteServiceError("transaction_user_required", "Falta el usuario de la transacción", 400)
-            tx = quote_svc._create_transaction_for_op(
-                op,
-                WhatsAppOperationComplete(),
-                transaction_user,
-            )
-            op.transaction_id = tx.id
 
         # Un entrante inicia la operación pero no confirma que el dinero haya sido entregado al
         # cliente: siempre permanece PENDING hasta vincular el pago saliente. Si la operación se

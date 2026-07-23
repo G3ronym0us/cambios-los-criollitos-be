@@ -17,7 +17,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user, get_moderator_user
 from app.database.connection import get_db
 from app.models.user import User
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
@@ -201,6 +201,28 @@ async def update_operation_status(
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
     return WhatsAppOperationResponse.model_validate(op.dict())
+
+
+@router.delete("/{op_uuid}")
+async def delete_operation(
+    op_uuid: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """
+    Borra una operación que quedó sin ningún comprobante, junto con su transacción contable
+    y los movimientos que dejó en el fondo. Requiere moderador.
+
+    Rechaza si todavía tiene pagos vinculados o si movió el saldo a favor del cliente.
+    """
+    service = WhatsAppQuoteService(db)
+    op = service.get_by_uuid(op_uuid)
+    if op is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Operación no encontrada")
+    try:
+        return service.delete_operation(op)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
 
 @router.patch("/{op_uuid}/scenario", response_model=WhatsAppOperationResponse)

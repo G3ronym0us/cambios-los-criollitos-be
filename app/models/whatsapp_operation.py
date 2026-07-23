@@ -84,6 +84,15 @@ class WhatsAppOperation(UUIDMixin, Base):
     # Notas: payment_info extraída por el bot (cédula, banco, teléfono, etc.)
     notes = Column(Text, nullable=True)
 
+    # Operación que quedó sin ningún comprobante vinculado y el operador decidió conservar
+    # igual (al desvincular su último pago). Queda quién lo aceptó, cuándo y por qué: una op
+    # completada sin pago que la respalde no puede pasar en silencio.
+    no_payments_ack_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    no_payments_ack_at = Column(DateTime(timezone=True), nullable=True)
+    no_payments_ack_note = Column(Text, nullable=True)
+
     # Vínculo con la Transaction derivada. Puede existir desde QUOTED/PENDING si hay fondo.
     transaction_id = Column(Integer, ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True, index=True)
 
@@ -105,6 +114,7 @@ class WhatsAppOperation(UUIDMixin, Base):
     transaction = relationship("Transaction", foreign_keys=[transaction_id])
     fund_group = relationship("FundGroup", foreign_keys=[fund_group_id])
     received_by = relationship("User", foreign_keys=[received_by_user_id])
+    no_payments_ack_by = relationship("User", foreign_keys=[no_payments_ack_by_user_id])
 
     def __repr__(self):
         return (
@@ -140,6 +150,11 @@ class WhatsAppOperation(UUIDMixin, Base):
             "delivery_status": self.delivery_status.value if self.delivery_status else None,
             "delivered_at": self.delivered_at,
             "notes": self.notes,
+            "no_payments_ack_by_username": (
+                self.no_payments_ack_by.username if self.no_payments_ack_by else None
+            ),
+            "no_payments_ack_at": self.no_payments_ack_at,
+            "no_payments_ack_note": self.no_payments_ack_note,
             "transaction_uuid": self.transaction.uuid if self.transaction else None,
             "legacy_sqlite_id": self.legacy_sqlite_id,
             "quoted_at": self.quoted_at,

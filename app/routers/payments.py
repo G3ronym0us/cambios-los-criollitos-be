@@ -113,6 +113,9 @@ async def link_payment_operation(
     Vincula un pago; si es saliente, completa la operación activa y su transacción.
     Con `settle_amount` (solo salientes) la op se redimensiona al monto realmente
     cambiado y el excedente se acredita como saldo a favor del cliente.
+
+    Al DESVINCULAR (`operation_uuid` null) el último comprobante de una operación hace falta
+    `orphan_action`: sin él responde 409 para que el operador decida (ver `unlink-preview`).
     """
     service = WhatsAppPaymentService(db)
     try:
@@ -123,7 +126,27 @@ async def link_payment_operation(
             completing_user=current_user,
             complete_outgoing=True,
             settle_amount=payload.settle_amount,
+            orphan_action=payload.orphan_action,
+            orphan_note=payload.orphan_note,
         )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.get("/{table}/{payment_id}/unlink-preview")
+async def preview_payment_unlink(
+    table: Literal["incoming", "outgoing"],
+    payment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Qué dejaría atrás desvincular este pago: si su operación se quedaría sin comprobantes y,
+    en ese caso, la transacción y los movimientos de fondo que se irían con ella. Operador JWT.
+    """
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.unlink_preview(table, payment_id)
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
@@ -139,7 +162,12 @@ async def mark_personal_expense(
     service = WhatsAppPaymentService(db)
     try:
         return service.set_personal_expense(
-            payment_id, payload.is_personal_expense, payload.personal_description
+            payment_id,
+            payload.is_personal_expense,
+            payload.personal_description,
+            actor=current_user,
+            orphan_action=payload.orphan_action,
+            orphan_note=payload.orphan_note,
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
@@ -156,7 +184,12 @@ async def mark_irrelevant(
     service = WhatsAppPaymentService(db)
     try:
         return service.set_irrelevant(
-            payment_id, payload.is_irrelevant, payload.irrelevant_description
+            payment_id,
+            payload.is_irrelevant,
+            payload.irrelevant_description,
+            actor=current_user,
+            orphan_action=payload.orphan_action,
+            orphan_note=payload.orphan_note,
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)

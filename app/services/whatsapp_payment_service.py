@@ -620,6 +620,11 @@ class WhatsAppPaymentService:
         Marca un pago ENTRANTE como contabilizado en un grupo (FundGroup), al reenviarlo
         el operador al grupo (escenario ZELLE_DIRECT). Resuelve el grupo por su JID de
         WhatsApp (`whatsapp_group_jid`) o por uuid. No crea ningún saliente.
+
+        El grupo se guarda en la OPERACIÓN del pago (el pago ya no tiene columna propia: el
+        fondo se deriva de la op). Si el entrante todavía no está vinculado a una operación,
+        no hay dónde anotarlo — el bot etiqueta la op un instante después con `set_scenario`,
+        que vuelve a fijar el grupo.
         """
         row = self._get_or_404("incoming", payment_id)
         group = None
@@ -631,9 +636,11 @@ class WhatsAppPaymentService:
             raise QuoteServiceError(
                 "fund_group_not_found", f"Fondo para grupo {group_uuid or group_jid} no encontrado", 404
             )
-        row.fund_group_id = group.id
-        self.db.commit()
-        self.db.refresh(row)
+        op = row.operation
+        if op is not None and op.fund_group_id != group.id:
+            op.fund_group_id = group.id
+            self.db.commit()
+            self.db.refresh(row)
         return self._with_name(row)
 
     @staticmethod
@@ -684,10 +691,12 @@ class WhatsAppPaymentService:
                 "fund_group_not_found", "No se pudo resolver el fondo del grupo", 404
             )
 
-        incoming = WhatsAppIncomingPayment(
-            **self._payment_copy_kwargs(out),
-            fund_group_id=group.id if group else None,
-        )
+        incoming = WhatsAppIncomingPayment(**self._payment_copy_kwargs(out))
+        op = out.operation
+        # El fondo va en la operación (el pago lo deriva). Si el pago aún no tiene op, el
+        # grupo se sigue viendo por el JID en client_phone.
+        if group is not None and op is not None and op.fund_group_id is None:
+            op.fund_group_id = group.id
         self.db.add(incoming)
         self.db.delete(out)
         self.db.commit()
@@ -746,52 +755,11 @@ class WhatsAppPaymentService:
         self.db.refresh(outgoing)
         return self._with_name(outgoing)
 
-    # ---------- Depósito a fondo desde pago entrante ----------
-
-    def create_deposit_from_payment(
-        self,
-        payment_id: int,
-        group_uuid: UUID,
-        user_uuid: UUID,
-        amount: float,
-        currency: str,
-        deposit_method: str,
-        reference: Optional[str] = None,
-        notes: Optional[str] = None,
-        recorded_by_user_id: Optional[int] = None,
-    ) -> dict:
-        """Registra un pago ENTRANTE como depósito (FundMovement DEPOSIT) a un fondo."""
-        row = self._get_or_404("incoming", payment_id)
-
-        group = self.db.query(FundGroup).filter(FundGroup.uuid == str(group_uuid)).first()
-        if group is None:
-            raise QuoteServiceError("fund_group_not_found", f"Fondo {group_uuid} no encontrado", 404)
-
-        user = self.db.query(User).filter(User.uuid == user_uuid).first()
-        if user is None:
-            raise QuoteServiceError("user_not_found", f"Usuario {user_uuid} no encontrado", 404)
-
-        if amount is None or amount <= 0:
-            raise QuoteServiceError("invalid_amount", "El monto debe ser > 0", 400)
-
-        FundRepository(self.db).create_movement(
-            group_id=group.id,
-            user_id=user.id,
-            movement_type=FundMovementType.DEPOSIT,
-            amount=amount,
-            currency=currency,
-            movement_date=datetime.utcnow(),
-            reference=reference,
-            notes=notes,
-            recorded_by_user_id=recorded_by_user_id,
-            deposit_method=deposit_method,
-            incoming_payment_id=row.id,
-        )
-
-        # Devolver el pago con el bloque `deposit` ya adjunto.
-        d = self._with_name(row)
-        self._attach_deposits([d])
-        return d
+    # Un pago entrante NO se puede convertir en depósito: el dinero del cliente entra al fondo
+    # como pata USD del cambio (FundMovement EXCHANGE vía la transacción de la operación).
+    # El único camino a un DEPOSIT es `fund_pending_deposits` — comprobante de reposición del
+    # gestor en el grupo, o alta manual en /admin/funds. `_attach_deposits` se queda porque
+    # sigue mostrando los depósitos históricos ligados a un entrante (0 filas en prod).
 
     # ---------- Crear operación desde pago ----------
 
@@ -812,8 +780,10 @@ class WhatsAppPaymentService:
             if group is None:
                 raise QuoteServiceError("fund_group_not_found", f"Fondo {fund_group_uuid} no encontrado", 404)
             return group
-        if not fund_group_provided and getattr(row, "fund_group_id", None) is not None:
-            return self.db.query(FundGroup).filter(FundGroup.id == row.fund_group_id).first()
+        # Heredado del pago: hoy el entrante lo deriva del JID del grupo en `client_phone`
+        # (ya no hay columna propia); el saliente nunca tuvo fondo.
+        if not fund_group_provided:
+            return getattr(row, "fund_group", None)
         return None
 
     def _resolve_operation_client(self, quote_svc: WhatsAppQuoteService, row, group):

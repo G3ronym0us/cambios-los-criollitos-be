@@ -36,17 +36,32 @@ class WhatsAppIncomingPayment(UUIDMixin, Base):
     whatsapp_operation_id = Column(
         Integer, ForeignKey("whatsapp_operations.id", ondelete="SET NULL"), nullable=True, index=True
     )
-    # Grupo contable (FundGroup) donde se contabilizó este entrante al reenviarlo (escenario
-    # ZELLE_DIRECT). Reemplaza al antiguo "saliente fantasma" que duplicaba el comprobante.
-    fund_group_id = Column(
-        Integer, ForeignKey("fund_groups.id", ondelete="SET NULL"), nullable=True, index=True
-    )
     corrected_at = Column(DateTime(timezone=True), nullable=True)
     correction_original = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     operation = relationship("WhatsAppOperation", foreign_keys=[whatsapp_operation_id])
-    fund_group = relationship("FundGroup", foreign_keys=[fund_group_id])
+    # Grupo del que vino el comprobante cuando `client_phone` es el JID del grupo (el operador
+    # lo reenvió ahí y el pago se movió a la bandeja de entrantes). Solo lectura, por JID.
+    fund_group_by_jid = relationship(
+        "FundGroup",
+        primaryjoin="foreign(WhatsAppIncomingPayment.client_phone) == FundGroup.whatsapp_group_jid",
+        viewonly=True,
+        uselist=False,
+    )
+
+    @property
+    def fund_group(self):
+        """
+        Fondo contable donde cae este entrante. Se DERIVA — antes era la columna
+        `fund_group_id`, el único enlace directo pago→fondo del modelo (el saliente no lo
+        tenía) y por tanto redundante: el fondo llega por la operación. Si el pago aún no
+        tiene op, vale el grupo del que vino el comprobante (client_phone = JID del grupo).
+        """
+        op = self.operation
+        if op is not None and op.fund_group is not None:
+            return op.fund_group
+        return self.fund_group_by_jid
 
     def dict(self):
         return {

@@ -24,7 +24,6 @@ from app.schemas.whatsapp import (
     WhatsAppCreateOpManual,
     WhatsAppForwardToGroup,
     WhatsAppIrrelevant,
-    WhatsAppPaymentDeposit,
     WhatsAppPaymentLink,
     WhatsAppPersonalExpense,
     ClientLoanCreate,
@@ -248,26 +247,3 @@ async def credit_balance_from_incoming(
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
 
-@router.post("/incoming/{payment_id}/deposit")
-async def register_payment_deposit(
-    payment_id: int,
-    payload: WhatsAppPaymentDeposit,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Registra un pago entrante como depósito (FundMovement DEPOSIT) a un fondo. Operador JWT."""
-    service = WhatsAppPaymentService(db)
-    try:
-        return service.create_deposit_from_payment(
-            payment_id,
-            payload.group_uuid,
-            payload.user_uuid,
-            payload.amount,
-            payload.currency,
-            payload.deposit_method,
-            payload.reference,
-            payload.notes,
-            recorded_by_user_id=current_user.id,
-        )
-    except QuoteServiceError as exc:
-        raise HTTPException(status_code=exc.http_status, detail=exc.message)

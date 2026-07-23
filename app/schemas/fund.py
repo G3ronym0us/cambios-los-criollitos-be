@@ -158,6 +158,10 @@ class FundPendingDepositResponse(BaseModel):
     uuid: UUID
     group_uuid: Optional[UUID] = None
     group_name: Optional[str] = None
+    origin: Optional[str] = None                          # GROUP (bot) | MANUAL (operador)
+    created_by_username: Optional[str] = None
+    source_incoming_payment_id: Optional[int] = None      # posible duplicado de un entrante
+    source_incoming_payment_phone: Optional[str] = None
     detected_user_uuid: Optional[UUID] = None
     detected_username: Optional[str] = None
     amount: Optional[float] = None
@@ -171,6 +175,20 @@ class FundPendingDepositResponse(BaseModel):
     updated_at: Optional[datetime] = None
 
 
+class FundPendingDepositCreate(BaseModel):
+    """
+    Alta manual de un depósito pendiente (el bot no detectó el comprobante del grupo).
+    Es la única alternativa al flujo del grupo: `POST /funds/movements` rechaza DEPOSIT.
+    """
+    group_uuid: UUID
+    user_uuid: UUID                                   # gestor que depositó
+    amount: float = Field(..., gt=0)
+    currency: str = Field(..., min_length=1, max_length=10)
+    provider: Optional[str] = None
+    reference: Optional[str] = None
+    notes: Optional[str] = None
+
+
 class FundPendingDepositConfirm(BaseModel):
     """Confirmar un depósito pendiente → crea un FundMovement DEPOSIT."""
     deposit_method: str = Field("ZELLE", description="ZELLE | BINANCE | KRAKEN | TRANSFER | OTHER")
@@ -179,6 +197,7 @@ class FundPendingDepositConfirm(BaseModel):
     user_uuid: Optional[UUID] = None                  # depositante (default: gestor detectado)
     reference: Optional[str] = None
     notes: Optional[str] = None
+    override_duplicate: bool = False                  # confirmar pese al match con un entrante
 
     @validator('deposit_method')
     def validate_method(cls, v: str) -> str:

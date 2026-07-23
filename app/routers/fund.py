@@ -10,7 +10,7 @@ from app.schemas.fund import (
     FundGroupMemberCreate, FundGroupMemberUpdate, FundGroupMemberResponse,
     FundMovementCreate, FundMovementResponse, FundMovementList,
     UserPositionResponse, FundGroupBalanceResponse,
-    FundPendingDepositResponse, FundPendingDepositConfirm,
+    FundPendingDepositResponse, FundPendingDepositConfirm, FundPendingDepositCreate,
 )
 from app.repositories.fund_repository import FundRepository
 from app.repositories.user_repository import UserRepository
@@ -245,9 +245,26 @@ async def create_movement(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_moderator_user),
 ):
-    """Registrar un movimiento de fondo manualmente (requiere moderador)"""
+    """
+    Registrar un movimiento de fondo manualmente (requiere moderador).
+
+    NO admite DEPOSIT: los depósitos entran por `fund_pending_deposits` (comprobante del
+    grupo detectado por el bot, o alta manual en `POST /funds/pending-deposits`) y se
+    materializan al confirmarlos. Un solo camino → todo depósito queda con su comprobante,
+    su gestor y quién lo aprobó.
+    """
     fund_repo = FundRepository(db)
     user_repo = UserRepository(db)
+
+    if (movement_data.movement_type or "").upper() == FundMovementType.DEPOSIT.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Los depósitos no se cargan como movimiento: crea un depósito pendiente "
+                "(POST /funds/pending-deposits) y confírmalo, o deja que el bot lo detecte "
+                "del grupo."
+            ),
+        )
 
     group = fund_repo.get_group_by_uuid(movement_data.group_uuid)
     if not group:
@@ -336,6 +353,31 @@ async def list_pending_deposits(
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
 
+@router.post("/pending-deposits", response_model=FundPendingDepositResponse, status_code=status.HTTP_201_CREATED)
+async def create_pending_deposit(
+    payload: FundPendingDepositCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """
+    Alta manual de un depósito pendiente, para cuando el bot no detectó el comprobante del
+    grupo. Queda PENDING y se confirma por el mismo camino que los detectados.
+    """
+    try:
+        return FundPendingDepositService(db).create_manual(
+            group_uuid=payload.group_uuid,
+            user_uuid=payload.user_uuid,
+            amount=payload.amount,
+            currency=payload.currency,
+            provider=payload.provider,
+            reference=payload.reference,
+            notes=payload.notes,
+            created_by_user_id=current_user.id,
+        )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
 @router.post("/pending-deposits/{deposit_uuid}/confirm", response_model=FundPendingDepositResponse)
 async def confirm_pending_deposit(
     deposit_uuid: UUID,
@@ -354,6 +396,7 @@ async def confirm_pending_deposit(
             user_uuid=payload.user_uuid,
             reference=payload.reference,
             notes=payload.notes,
+            override_duplicate=payload.override_duplicate,
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)

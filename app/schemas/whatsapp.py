@@ -323,25 +323,6 @@ class WhatsAppForwardToGroup(BaseModel):
     group_uuid: Optional[UUID] = None
 
 
-class WhatsAppPaymentDeposit(BaseModel):
-    """Registrar un pago entrante como depósito (FundMovement DEPOSIT) a un fondo."""
-    group_uuid: UUID
-    user_uuid: UUID  # depositante (gestor)
-    amount: float = Field(..., gt=0)
-    currency: str = Field(..., min_length=1, max_length=10)
-    deposit_method: str = Field(..., description="ZELLE | BINANCE | KRAKEN | TRANSFER | OTHER")
-    reference: Optional[str] = None
-    notes: Optional[str] = None
-
-    @validator('deposit_method')
-    def validate_method(cls, v: str) -> str:
-        allowed = {"ZELLE", "BINANCE", "KRAKEN", "TRANSFER", "OTHER"}
-        v_up = v.upper()
-        if v_up not in allowed:
-            raise ValueError(f"deposit_method must be one of: {', '.join(sorted(allowed))}")
-        return v_up
-
-
 class WhatsAppBalanceCredit(BaseModel):
     """Acreditar un pago entrante como saldo a favor. Sin amount → usa el del pago."""
     amount: Optional[float] = Field(None, gt=0)

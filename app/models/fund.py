@@ -223,12 +223,23 @@ class FundPendingDepositStatus(enum.Enum):
     REJECTED  = "REJECTED"
 
 
+class FundPendingDepositOrigin(enum.Enum):
+    """De dónde salió el pendiente. GROUP = comprobante que el gestor subió al grupo (bot);
+    MANUAL = lo cargó un operador desde /admin/funds porque el bot no lo detectó."""
+    GROUP  = "GROUP"
+    MANUAL = "MANUAL"
+
+
 class FundPendingDeposit(UUIDMixin, Base):
     """
     Depósito DETECTADO por el bot cuando un gestor (FundGroupMember.is_fund_manager) sube un
     comprobante al grupo. Queda PENDING hasta que un operador lo confirma/rechaza desde
     `/admin/funds`. Al confirmar se crea un FundMovement DEPOSIT (`confirmed_movement_id`).
     Tabla separada para no ensuciar el ledger (el balance solo cuenta FundMovement).
+
+    Es la ÚNICA puerta de entrada a un FundMovement DEPOSIT: el alta manual de movimientos
+    (`POST /funds/movements`) rechaza DEPOSIT y el operador que necesita registrar uno que el
+    bot no detectó crea aquí un pendiente con `origin=MANUAL`.
     """
     __tablename__ = "fund_pending_deposits"
 
@@ -250,6 +261,20 @@ class FundPendingDeposit(UUIDMixin, Base):
         server_default=FundPendingDepositStatus.PENDING.value,
         index=True,
     )
+    origin = Column(
+        CaseInsensitiveEnum(FundPendingDepositOrigin),
+        nullable=False,
+        server_default=FundPendingDepositOrigin.GROUP.value,
+    )
+    # Pago entrante del cliente que este comprobante parece ser. Se llena al detectar el
+    # pendiente: si el gestor reenvía al grupo el Zelle de un cliente, ese dinero YA está
+    # contabilizado como entrante (pata USD de un cambio) y confirmarlo como depósito lo
+    # contaría dos veces. Marca de duplicado, no de origen.
+    source_incoming_payment_id = Column(
+        Integer, ForeignKey("whatsapp_incoming_payments.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     confirmed_movement_id = Column(
         Integer, ForeignKey("fund_movements.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -260,13 +285,22 @@ class FundPendingDeposit(UUIDMixin, Base):
 
     group = relationship("FundGroup", foreign_keys=[group_id])
     detected_user = relationship("User", foreign_keys=[detected_user_id])
+    created_by = relationship("User", foreign_keys=[created_by_user_id])
     confirmed_movement = relationship("FundMovement", foreign_keys=[confirmed_movement_id])
+    source_incoming_payment = relationship(
+        "WhatsAppIncomingPayment", foreign_keys=[source_incoming_payment_id]
+    )
 
     def dict(self):
+        src = self.source_incoming_payment
         return {
             "uuid": self.uuid,
             "group_uuid": self.group.uuid if self.group else None,
             "group_name": self.group.name if self.group else None,
+            "origin": self.origin.value if self.origin else None,
+            "created_by_username": self.created_by.username if self.created_by else None,
+            "source_incoming_payment_id": self.source_incoming_payment_id,
+            "source_incoming_payment_phone": src.client_phone if src else None,
             "detected_user_uuid": self.detected_user.uuid if self.detected_user else None,
             "detected_username": self.detected_user.username if self.detected_user else None,
             "amount": self.amount,

@@ -10,7 +10,9 @@ SQLite `incoming_payments` / `outgoing_payments` del bot.
   en el bridge.
 """
 
-from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, ForeignKey, Text
+from sqlalchemy import (
+    Column, Integer, String, Float, DateTime, Boolean, ForeignKey, Text, UniqueConstraint,
+)
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 
@@ -41,6 +43,15 @@ class WhatsAppIncomingPayment(UUIDMixin, Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     operation = relationship("WhatsAppOperation", foreign_keys=[whatsapp_operation_id])
+    # Reparto del pago entre operaciones (un Zelle puede cubrir varios cambios). El FK de
+    # arriba es la op principal — la de la asignación mayor — y se mantiene por compatibilidad
+    # con el bot y el matcher.
+    allocations = relationship(
+        "WhatsAppPaymentAllocation",
+        back_populates="payment",
+        cascade="all, delete-orphan",
+        order_by="WhatsAppPaymentAllocation.id",
+    )
     # Grupo del que vino el comprobante cuando `client_phone` es el JID del grupo (el operador
     # lo reenvió ahí y el pago se movió a la bandeja de entrantes). Solo lectura, por JID.
     fund_group_by_jid = relationship(
@@ -87,6 +98,59 @@ class WhatsAppIncomingPayment(UUIDMixin, Base):
         }
 
 
+class WhatsAppPaymentAllocation(UUIDMixin, Base):
+    """
+    Qué parte de un pago ENTRANTE le corresponde a cada operación. Un Zelle de 220 puede
+    cubrir dos cambios (200 a BRL y 20 a VES): el FK único del pago solo alcanzaba para uno
+    y el otro quedaba sin comprobante.
+
+    Es documental, no contable: cada operación sigue teniendo su propia tasa, su transacción
+    y su movimiento de fondo. Aquí solo se dice de dónde salió su dinero. Los montos van en la
+    moneda del pago (el lado que envió el cliente); la suma nunca puede pasarse del pago.
+    """
+    __tablename__ = "whatsapp_payment_allocations"
+    __table_args__ = (
+        UniqueConstraint(
+            "incoming_payment_id", "whatsapp_operation_id", name="uq_allocation_payment_operation"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    incoming_payment_id = Column(
+        Integer, ForeignKey("whatsapp_incoming_payments.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    whatsapp_operation_id = Column(
+        Integer, ForeignKey("whatsapp_operations.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    amount = Column(Float, nullable=False)
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    payment = relationship("WhatsAppIncomingPayment", back_populates="allocations")
+    operation = relationship("WhatsAppOperation", foreign_keys=[whatsapp_operation_id])
+    created_by = relationship("User", foreign_keys=[created_by_user_id])
+
+    def dict(self):
+        op = self.operation
+        cp = op.currency_pair if op else None
+        return {
+            "uuid": self.uuid,
+            "amount": self.amount,
+            "operation_uuid": op.uuid if op else None,
+            "operation_status": op.status.value if op and op.status else None,
+            "pair_symbol": cp.pair_symbol if cp else None,
+            "from_amount": op.from_amount if op else None,
+            "from_currency": cp.from_currency.symbol if cp and cp.from_currency else None,
+            "to_amount": op.to_amount if op else None,
+            "to_currency": cp.to_currency.symbol if cp and cp.to_currency else None,
+            "rate_used": op.rate_used if op else None,
+            "created_by_username": self.created_by.username if self.created_by else None,
+            "created_at": self.created_at,
+        }
+
+
 class WhatsAppOutgoingPayment(UUIDMixin, Base):
     __tablename__ = "whatsapp_outgoing_payments"
 
@@ -105,6 +169,12 @@ class WhatsAppOutgoingPayment(UUIDMixin, Base):
     whatsapp_operation_id = Column(
         Integer, ForeignKey("whatsapp_operations.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Cuánto del valor de su operación cubre este comprobante, en la moneda del valor: el Pix
+    # de 914,04 BRL cubre 200 de un trato de 220 ZELLE. NULL = todavía no se ha dicho.
+    settled_amount = Column(Float, nullable=True)
+    # Tasa contra la que se comparó al vincular (la cotizada, o la activa del par), para que la
+    # diferencia entre lo pagado y lo que tocaba siga siendo auditable si el par cambia.
+    settled_reference_rate = Column(Float, nullable=True)
     is_personal_expense = Column(Boolean, nullable=False, server_default="false")
     personal_description = Column(Text, nullable=True)
     is_irrelevant = Column(Boolean, nullable=False, server_default="false")
@@ -135,6 +205,13 @@ class WhatsAppOutgoingPayment(UUIDMixin, Base):
             "reference": self.reference,
             "raw_text": self.raw_text,
             "operation_uuid": self.operation.uuid if self.operation else None,
+            "settled_amount": self.settled_amount,
+            "settled_reference_rate": self.settled_reference_rate,
+            # Tasa a la que realmente se pagó esta parte del trato.
+            "settled_rate": (
+                round(self.amount / self.settled_amount, 6)
+                if self.amount and self.settled_amount else None
+            ),
             "is_personal_expense": 1 if self.is_personal_expense else 0,
             "personal_description": self.personal_description,
             "is_irrelevant": 1 if self.is_irrelevant else 0,

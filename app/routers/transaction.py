@@ -30,8 +30,8 @@ def enrich_transaction_response(transaction, db: Session) -> dict:
     response_data = transaction.dict()
     response_data['currency_pair_uuid'] = cp.uuid if cp else None
     response_data['pair_symbol'] = cp.pair_symbol if cp else None
-    response_data['from_currency'] = cp.from_currency.symbol if cp else None
-    response_data['to_currency'] = cp.to_currency.symbol if cp else None
+    # transaction.dict() ya trae from/to_currency: el símbolo guardado (transacción por valor)
+    # o, si no hay, el del par. No sobreescribir con el par, que sería None sin par.
     response_data['profit_splits'] = [split.dict() for split in transaction.profit_splits]
     return response_data
 

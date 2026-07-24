@@ -16,7 +16,7 @@ from typing import Optional
 from uuid import UUID
 
 from sqlalchemy import or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.models.currency_pair import CurrencyPair
 from app.models.fund import FundGroup, FundGroupMember, FundMovement, FundMovementType
@@ -44,6 +44,7 @@ from app.schemas.whatsapp import (
     WhatsAppOperationScenarioUpdate,
     WhatsAppOperationUpdate,
 )
+from app.services import valuation
 from app.services.bcv_service import get_cached_bcv_rate
 from app.services.whatsapp_rate_resolver import WhatsAppRateResolver, apply_rounding
 
@@ -209,9 +210,18 @@ class WhatsAppQuoteService:
 
         now = datetime.now(timezone.utc)
         has_payment_data = bool(payload.notes and payload.notes.strip())
+        # El valor del trato es lo que entrega el cliente; el par y el `to` son la cotización.
+        value = valuation.equivalents(self.db, from_amount, payload.from_currency, now)
         op = WhatsAppOperation(
             client_id=client.id,
             currency_pair_id=currency_pair.id,
+            amount=from_amount,
+            currency=payload.from_currency,
+            amount_usdt=value["usdt_amount"],
+            usdt_rate=value["usdt_rate"],
+            bcv_amount=value["bcv_amount"],
+            bcv_rate=value["bcv_rate"],
+            valuation_at=now,
             from_amount=from_amount,
             to_amount=to_amount,
             rate_used=rate,
@@ -472,15 +482,34 @@ class WhatsAppQuoteService:
         self.db.refresh(op)
         return op
 
+    def _operation_value_usdt(self, op: WhatsAppOperation) -> tuple[float, str, float, float]:
+        """
+        Valor del trato y su equivalente USDT, con los que se contabiliza — no la cotización.
+        Devuelve (valor, moneda, valor_usdt, tasa valor→USDT). Si a la op le faltan los
+        equivalentes (creada antes de O2 sin backfill), los calcula al vuelo.
+        """
+        cp = op.currency_pair
+        value = op.amount if op.amount is not None else op.from_amount
+        currency = op.currency or (cp.from_currency.symbol if cp and cp.from_currency else "")
+        value_usdt = op.amount_usdt
+        usdt_rate = op.usdt_rate
+        if value_usdt is None and value and currency:
+            eq = valuation.equivalents(self.db, value, currency, op.valuation_at or datetime.now(timezone.utc))
+            value_usdt = eq["usdt_amount"]
+            usdt_rate = eq["usdt_rate"]
+        # Sin tasa disponible se asume paridad (ZELLE/PAYPAL/USD ≈ USDT).
+        value_usdt = value_usdt if value_usdt is not None else value
+        usdt_rate = usdt_rate if usdt_rate else 1.0
+        return float(value or 0), currency, float(value_usdt or 0), float(usdt_rate or 1)
+
     def _create_transaction_for_op(
         self,
         op: WhatsAppOperation,
         payload: WhatsAppOperationComplete,
         bot_service_user: User,
     ) -> Transaction:
-        cp = op.currency_pair
-        if cp is None:
-            raise QuoteServiceError("invalid_state", "Operation sin currency_pair", 500)
+        # La transacción contabiliza el VALOR del trato → su equivalente USDT, no la cotización.
+        value, value_currency, value_usdt, usdt_rate = self._operation_value_usdt(op)
 
         config_repo = CommissionConfigRepository(self.db)
 
@@ -525,7 +554,8 @@ class WhatsAppQuoteService:
                 self.db.query(TransactionProfitSplit).filter(
                     TransactionProfitSplit.transaction_id == tx.id
                 ).delete(synchronize_session=False)
-                profit_amount = float(op.to_amount) * total_pct / 100
+                # La ganancia sale del valor (en USDT), no del `to` de la cotización.
+                profit_amount = value_usdt * total_pct / 100
                 for split_data, config_split in zip(profit_splits or [], config.splits):
                     ratio = split_data.profit_percentage / total_pct if total_pct else 0
                     self.db.add(
@@ -540,14 +570,18 @@ class WhatsAppQuoteService:
             return tx
 
         tx_create = TransactionCreate(
-            currency_pair_uuid=cp.uuid,
-            from_amount=op.from_amount,
-            to_amount=op.to_amount,
-            exchange_rate=op.rate_used,
+            currency_pair_uuid=None,
+            from_currency=value_currency,
+            to_currency="USDT",
+            from_amount=value,
+            to_amount=value_usdt,
+            exchange_rate=usdt_rate,
             description=f"WhatsApp op {op.uuid}",
             transaction_type="whatsapp",
             total_profit_percentage=total_pct,
             profit_splits=profit_splits,
+            # La ganancia ya está en USDT (to_amount=USDT), así que su conversión es 1:1.
+            usdt_rate=1.0,
             skip_fund=payload.skip_fund,
             status=op.status.value.lower(),
         )
@@ -556,12 +590,12 @@ class WhatsAppQuoteService:
         tx = tx_repo.create_transaction(
             tx_create,
             created_by_user_id=bot_service_user.id,
-            currency_pair_id=cp.id,
+            currency_pair_id=None,
         )
         return tx
 
     def _sync_linked_transaction(self, op: WhatsAppOperation) -> None:
-        """Mantiene la transacción derivada como espejo contable de la operación."""
+        """Mantiene la transacción derivada como espejo contable del VALOR de la operación."""
         if op.transaction_id is None:
             return
 
@@ -569,17 +603,22 @@ class WhatsAppQuoteService:
         if tx is None:
             raise QuoteServiceError("transaction_not_found", "Transaction vinculada no encontrada", 409)
 
+        value, value_currency, value_usdt, usdt_rate = self._operation_value_usdt(op)
         previous_profit = float(tx.profit_amount or 0)
         previous_total = float(tx.total_profit_percentage or 0)
         total_pct = float(op.applied_percentage or 0)
-        profit_amount = float(op.to_amount) * total_pct / 100
+        # Ganancia sobre el valor, en USDT (el `to` de la transacción ya es USDT).
+        profit_amount = value_usdt * total_pct / 100
 
-        tx.currency_pair_id = op.currency_pair_id
-        tx.from_amount = op.from_amount
-        tx.to_amount = op.to_amount
-        tx.exchange_rate = op.rate_used
+        tx.currency_pair_id = None
+        tx.from_currency_symbol = value_currency
+        tx.to_currency_symbol = "USDT"
+        tx.from_amount = value
+        tx.to_amount = value_usdt
+        tx.exchange_rate = usdt_rate
         tx.total_profit_percentage = total_pct
         tx.profit_amount = profit_amount
+        tx.profit_amount_usdt = profit_amount
         tx.status = TransactionStatus[op.status.name]
         tx.completed_at = op.completed_at if op.status == WhatsAppOperationStatus.COMPLETED else None
 
@@ -625,7 +664,11 @@ class WhatsAppQuoteService:
         limit: int = 100,
         delivery_status: Optional[str] = None,
     ) -> list[WhatsAppOperation]:
-        q = self.db.query(WhatsAppOperation)
+        # `delivered_amount` recorre los comprobantes de salida de cada operación: sin
+        # precargarlos, listar 500 operaciones dispararía 500 consultas sueltas.
+        q = self.db.query(WhatsAppOperation).options(
+            selectinload(WhatsAppOperation.outgoing_payments)
+        )
         if phone:
             q = q.join(WhatsAppClient, WhatsAppClient.id == WhatsAppOperation.client_id)\
                  .filter(WhatsAppClient.phone == phone)

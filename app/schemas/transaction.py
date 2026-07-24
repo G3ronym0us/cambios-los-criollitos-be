@@ -32,7 +32,10 @@ class ProfitSplitResponse(ProfitSplitBase):
 
 class TransactionBase(BaseModel):
     """Schema base para transacciones"""
-    currency_pair_uuid: UUID
+    currency_pair_uuid: Optional[UUID] = None
+    # Monedas explícitas para una transacción por valor (sin par). Con par se dejan vacías.
+    from_currency: Optional[str] = None
+    to_currency: Optional[str] = None
     from_amount: float
     to_amount: Optional[float] = None
     exchange_rate: Optional[float] = None

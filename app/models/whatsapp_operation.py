@@ -52,6 +52,22 @@ class WhatsAppOperation(UUIDMixin, Base):
     currency_pair_id = Column(Integer, ForeignKey("currency_pairs.id"), nullable=False, index=True)
 
     # Cotización congelada en el momento
+    # ── Valor del trato ──────────────────────────────────────────────────────
+    # Cuánto vale la operación y en qué moneda (lo que entrega el cliente), con sus
+    # equivalentes: USDT siempre, y BCV cuando el valor está en bolívares. Es lo que se
+    # contabiliza y sobre lo que se calcula la ganancia, independientemente de en cuántas
+    # monedas se haya pagado.
+    amount = Column(Float, nullable=True)
+    currency = Column(String(10), nullable=True)
+    amount_usdt = Column(Float, nullable=True)
+    usdt_rate = Column(Float, nullable=True)
+    bcv_amount = Column(Float, nullable=True)
+    bcv_rate = Column(Float, nullable=True)
+    valuation_at = Column(DateTime(timezone=True), nullable=True)
+
+    # ── Cotización prometida ─────────────────────────────────────────────────
+    # El par, los montos y la tasa que se le dijeron al cliente. Dejan de ser lo que se
+    # pagó (eso lo dicen los comprobantes salientes) y quedan como referencia.
     from_amount = Column(Float, nullable=False)
     to_amount = Column(Float, nullable=False)
     rate_used = Column(Float, nullable=False)
@@ -110,6 +126,13 @@ class WhatsAppOperation(UUIDMixin, Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     client = relationship("WhatsAppClient", back_populates="operations")
+    # Los comprobantes de salida dicen cómo se pagó el trato; su `settled_amount` suma lo
+    # entregado. Solo lectura: el vínculo lo maneja el servicio de pagos.
+    outgoing_payments = relationship(
+        "WhatsAppOutgoingPayment",
+        primaryjoin="WhatsAppOperation.id == foreign(WhatsAppOutgoingPayment.whatsapp_operation_id)",
+        viewonly=True,
+    )
     currency_pair = relationship("CurrencyPair", lazy="joined")
     transaction = relationship("Transaction", foreign_keys=[transaction_id])
     fund_group = relationship("FundGroup", foreign_keys=[fund_group_id])
@@ -122,8 +145,18 @@ class WhatsAppOperation(UUIDMixin, Base):
             f"{self.from_amount}->{self.to_amount} @ {self.rate_used})>"
         )
 
+    @property
+    def delivered_amount(self) -> float:
+        """Cuánto del valor cubren ya sus comprobantes de salida."""
+        return round(
+            sum(p.settled_amount or 0 for p in (self.outgoing_payments or [])),
+            2,
+        )
+
     def dict(self):
         cp = self.currency_pair
+        value = self.amount if self.amount is not None else self.from_amount
+        delivered = self.delivered_amount
         return {
             "uuid": self.uuid,
             "client_uuid": self.client.uuid if self.client else None,
@@ -133,6 +166,15 @@ class WhatsAppOperation(UUIDMixin, Base):
             "pair_symbol": cp.pair_symbol if cp else None,
             "from_currency": cp.from_currency.symbol if cp and cp.from_currency else None,
             "to_currency": cp.to_currency.symbol if cp and cp.to_currency else None,
+            "amount": self.amount,
+            "currency": self.currency,
+            "delivered_amount": delivered,
+            "pending_amount": round((value or 0) - delivered, 2),
+            "amount_usdt": self.amount_usdt,
+            "usdt_rate": self.usdt_rate,
+            "bcv_amount": self.bcv_amount,
+            "bcv_rate": self.bcv_rate,
+            "valuation_at": self.valuation_at,
             "from_amount": self.from_amount,
             "to_amount": self.to_amount,
             "rate_used": self.rate_used,

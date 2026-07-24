@@ -109,6 +109,17 @@ class WhatsAppOperationResponse(BaseModel):
     pair_symbol: Optional[str] = None
     from_currency: Optional[str] = None
     to_currency: Optional[str] = None
+    # Valor del trato: lo que entrega el cliente, con sus equivalentes.
+    amount: Optional[float] = None
+    currency: Optional[str] = None
+    delivered_amount: Optional[float] = None
+    pending_amount: Optional[float] = None
+    amount_usdt: Optional[float] = None
+    usdt_rate: Optional[float] = None
+    bcv_amount: Optional[float] = None
+    bcv_rate: Optional[float] = None
+    valuation_at: Optional[datetime] = None
+    # Cotización prometida (par + montos + tasa).
     from_amount: float
     to_amount: float
     rate_used: float
@@ -267,9 +278,28 @@ class WhatsAppPaymentUpdate(BaseModel):
     reference: Optional[str] = None
 
 
-class WhatsAppPartialSettle(BaseModel):
-    """Corrección retroactiva de una op COMPLETED: monto USD realmente cambiado."""
-    settle_amount: float = Field(gt=0)
+class WhatsAppOperationValue(BaseModel):
+    """Corregir cuánto vale el trato (sube y baja)."""
+    amount: float = Field(..., gt=0)
+
+
+class OutgoingCoverage(BaseModel):
+    """Cuánto del valor de la operación cubre este comprobante de salida."""
+    settled_amount: Optional[float] = Field(None, gt=0)
+
+
+class PaymentAllocationItem(BaseModel):
+    """Parte de un pago entrante que respalda a una operación (en la moneda del pago)."""
+    operation_uuid: UUID
+    amount: float = Field(..., gt=0)
+
+
+class PaymentAllocationsUpdate(BaseModel):
+    """
+    Reparto completo del pago: reemplaza el anterior. La suma no puede pasarse del monto del
+    pago (contando lo ya acreditado al saldo del cliente) ni quedar vacía.
+    """
+    allocations: List[PaymentAllocationItem]
 
 
 class OrphanDecision(BaseModel):
@@ -286,9 +316,9 @@ class OrphanDecision(BaseModel):
 
 class WhatsAppPaymentLink(OrphanDecision):
     operation_uuid: Optional[UUID] = None
-    # Liquidación parcial (solo salientes): monto USD realmente cambiado; el
-    # excedente de la op se acredita como saldo a favor al completar.
-    settle_amount: Optional[float] = Field(None, gt=0)
+    # Solo salientes: cuánto del valor de la operación cubre este comprobante. Sin esto se
+    # toma lo que da la tasa de referencia.
+    settled_amount: Optional[float] = Field(None, gt=0)
 
 
 class WhatsAppPersonalExpense(OrphanDecision):

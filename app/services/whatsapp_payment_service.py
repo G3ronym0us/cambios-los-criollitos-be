@@ -25,10 +25,15 @@ from app.models.whatsapp_operation import (
 from app.models.fund import FundGroup, FundMovement, FundMovementType
 from app.models.user import User
 from app.models.whatsapp_balance import WhatsAppBalanceEntry, WhatsAppBalanceEntryType
-from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
+from app.models.whatsapp_payment import (
+    WhatsAppIncomingPayment,
+    WhatsAppOutgoingPayment,
+    WhatsAppPaymentAllocation,
+)
 from app.models.client_loan import ClientLoan
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.repositories.fund_repository import FundRepository
+from app.services import valuation
 from app.schemas.whatsapp import WhatsAppOperationComplete
 from app.services.whatsapp_quote_service import (
     QuoteServiceError,
@@ -225,6 +230,7 @@ class WhatsAppPaymentService:
         items = [self._row_to_dict(*r) for r in rows]
         if table == "incoming" and items:
             self._attach_deposits(items)
+            self._attach_allocations(items)
         if table == "outgoing" and items:
             self._attach_loans(items)
         return {"items": items, "total": total}
@@ -263,14 +269,52 @@ class WhatsAppPaymentService:
         for it in items:
             it["deposit"] = by_payment.get(it["id"])
 
+    def _attach_allocations(self, items: list[dict]) -> None:
+        """
+        Agrega a cada entrante cuánto de él está repartido entre operaciones y cuánto queda
+        sin asignar: es el aviso de "el pago dice 220 y la op 200" en el listado.
+        """
+        ids = [it["id"] for it in items]
+        rows = (
+            self.db.query(WhatsAppPaymentAllocation)
+            .filter(WhatsAppPaymentAllocation.incoming_payment_id.in_(ids))
+            .all()
+        )
+        assigned: dict[int, float] = {}
+        counts: dict[int, int] = {}
+        for row in rows:
+            assigned[row.incoming_payment_id] = assigned.get(row.incoming_payment_id, 0) + row.amount
+            counts[row.incoming_payment_id] = counts.get(row.incoming_payment_id, 0) + 1
+        for it in items:
+            total = round(it.get("amount") or 0, 2)
+            done = round(assigned.get(it["id"], 0), 2)
+            credited = self._credited_to_balance(it["id"]) if total else 0.0
+            it["allocated_amount"] = done
+            it["allocations_count"] = counts.get(it["id"], 0)
+            it["unassigned_amount"] = round(total - done - credited, 2) if total else 0.0
+
     def list_payments_for_operation(self, op_uuid: UUID) -> dict:
-        """Pagos entrantes + salientes vinculados a una operación (para el detalle de la op)."""
+        """
+        Pagos entrantes + salientes de una operación (para el detalle de la op). Del lado
+        entrante entran también los pagos que la respaldan por reparto sin ser su op principal.
+        """
         op = self.db.query(WhatsAppOperation).filter(WhatsAppOperation.uuid == op_uuid).first()
         if op is None:
             raise QuoteServiceError("op_not_found", f"Operation {op_uuid} no encontrada", 404)
+        allocated_ids = [
+            row[0]
+            for row in self.db.query(WhatsAppPaymentAllocation.incoming_payment_id)
+            .filter(WhatsAppPaymentAllocation.whatsapp_operation_id == op.id)
+            .all()
+        ]
         inc_rows = (
             self.db.query(WhatsAppIncomingPayment)
-            .filter(WhatsAppIncomingPayment.whatsapp_operation_id == op.id)
+            .filter(
+                or_(
+                    WhatsAppIncomingPayment.whatsapp_operation_id == op.id,
+                    WhatsAppIncomingPayment.id.in_(allocated_ids) if allocated_ids else False,
+                )
+            )
             .order_by(WhatsAppIncomingPayment.created_at.asc())
             .all()
         )
@@ -284,6 +328,16 @@ class WhatsAppPaymentService:
         outgoing = [self._with_name(p) for p in out_rows]
         if incoming:
             self._attach_deposits(incoming)
+            self._attach_allocations(incoming)
+            # Cuánto de cada entrante corresponde a ESTA op (puede ser solo una parte).
+            by_payment = {
+                a.incoming_payment_id: a.amount
+                for a in self.db.query(WhatsAppPaymentAllocation)
+                .filter(WhatsAppPaymentAllocation.whatsapp_operation_id == op.id)
+                .all()
+            }
+            for item in incoming:
+                item["allocated_to_operation"] = by_payment.get(item["id"])
         return {"incoming": incoming, "outgoing": outgoing}
 
     # ---------- Editar (correction tracking) ----------
@@ -313,18 +367,363 @@ class WhatsAppPaymentService:
     # ---------- Vincular / flags ----------
 
     def _payments_left_without(self, op_id: int, table: str, payment_id: int) -> int:
-        """Comprobantes que le quedarían a la operación si este pago se desvincula."""
-        incoming = self.db.query(WhatsAppIncomingPayment.id).filter(
-            WhatsAppIncomingPayment.whatsapp_operation_id == op_id
-        )
+        """
+        Comprobantes que le quedarían a la operación si este pago se desvincula. Del lado
+        entrante cuenta el reparto (`whatsapp_payment_allocations`) además del FK: un pago
+        puede respaldar a una op sin ser su op principal.
+        """
+        incoming_ids = {
+            row[0]
+            for row in self.db.query(WhatsAppIncomingPayment.id)
+            .filter(WhatsAppIncomingPayment.whatsapp_operation_id == op_id)
+            .all()
+        } | {
+            row[0]
+            for row in self.db.query(WhatsAppPaymentAllocation.incoming_payment_id)
+            .filter(WhatsAppPaymentAllocation.whatsapp_operation_id == op_id)
+            .all()
+        }
         outgoing = self.db.query(WhatsAppOutgoingPayment.id).filter(
             WhatsAppOutgoingPayment.whatsapp_operation_id == op_id
         )
         if table == "incoming":
-            incoming = incoming.filter(WhatsAppIncomingPayment.id != payment_id)
+            incoming_ids.discard(payment_id)
         else:
             outgoing = outgoing.filter(WhatsAppOutgoingPayment.id != payment_id)
-        return incoming.count() + outgoing.count()
+        return len(incoming_ids) + outgoing.count()
+
+    # ---------- Cuánto cubre un saliente del valor de la operación ----------
+
+    def operation_value(self, op: WhatsAppOperation) -> tuple[float, str]:
+        """Valor del trato y su moneda. Cae al lado origen de la cotización si aún no lo tiene."""
+        if op.amount:
+            return float(op.amount), (op.currency or "")
+        cp = op.currency_pair
+        from_symbol = cp.from_currency.symbol if cp and cp.from_currency else ""
+        return float(op.from_amount or 0), from_symbol
+
+    def delivered_amount(self, op: WhatsAppOperation, exclude_payment_id: Optional[int] = None) -> float:
+        """Suma de lo que cubren los comprobantes de salida de la operación."""
+        q = self.db.query(WhatsAppOutgoingPayment).filter(
+            WhatsAppOutgoingPayment.whatsapp_operation_id == op.id,
+            WhatsAppOutgoingPayment.settled_amount.isnot(None),
+        )
+        if exclude_payment_id is not None:
+            q = q.filter(WhatsAppOutgoingPayment.id != exclude_payment_id)
+        return round(sum(p.settled_amount for p in q.all()), 2)
+
+    def _reference_rate(self, op: WhatsAppOperation, payment) -> Optional[float]:
+        """
+        Tasa contra la que se juzga este pago: la cotizada en la operación si su moneda de
+        salida coincide con la del comprobante; si no, la activa del par correspondiente.
+        """
+        cp = op.currency_pair
+        quoted_to = cp.to_currency.symbol if cp and cp.to_currency else None
+        payment_currency = (payment.currency or "").upper()
+        if quoted_to and payment_currency == quoted_to.upper() and op.rate_used:
+            return float(op.rate_used)
+
+        _, value_currency = self.operation_value(op)
+        if not payment_currency or not value_currency:
+            return None
+        entry = WhatsAppQuoteService(self.db).resolver.get_rate_entry_for_pair(
+            value_currency, payment_currency
+        )
+        if entry is None or not entry.rate:
+            return None
+        # `rate` con inversa significa dividir: se normaliza a "unidades de destino por unidad
+        # de valor" para poder dividir el monto del comprobante entre ella.
+        return float(1 / entry.rate) if entry.inverse_percentage else float(entry.rate)
+
+    def coverage_preview(self, payment_id: int, operation_uuid: UUID) -> dict:
+        """
+        Qué parte del valor de la operación cubriría este comprobante. Es lo que el diálogo de
+        vincular necesita para proponer un monto en vez de pedirlo a ciegas.
+
+        - `suggested`: lo que da la tasa (914,04 ÷ 4,5702 = 200)
+        - `pending`: lo que le falta a la operación (220)
+        - si el operador dice que cubre el pendiente, `full_effective_rate` es la tasa a la que
+          realmente cambió y `full_rate_difference` cuánto se aparta de la de referencia
+        """
+        payment = self._get_or_404("outgoing", payment_id)
+        op = (
+            self.db.query(WhatsAppOperation)
+            .filter(WhatsAppOperation.uuid == str(operation_uuid))
+            .first()
+        )
+        if op is None:
+            raise QuoteServiceError("op_not_found", f"Operación {operation_uuid} no encontrada", 404)
+
+        value, value_currency = self.operation_value(op)
+        delivered = self.delivered_amount(op, exclude_payment_id=payment.id)
+        pending = round(value - delivered, 2)
+        reference_rate = self._reference_rate(op, payment)
+
+        suggested = None
+        if reference_rate and payment.amount:
+            suggested = round(float(payment.amount) / reference_rate, 2)
+
+        full_effective_rate = None
+        full_rate_difference = None
+        full_amount_difference = None
+        if pending > 0 and payment.amount:
+            full_effective_rate = round(float(payment.amount) / pending, 6)
+            if reference_rate:
+                full_rate_difference = round(full_effective_rate - reference_rate, 6)
+                # Lo que habría tocado pagar por ese pendiente a la tasa de referencia.
+                full_amount_difference = round(float(payment.amount) - pending * reference_rate, 2)
+
+        return {
+            "payment": {
+                "id": payment.id,
+                "amount": payment.amount,
+                "currency": payment.currency,
+            },
+            "operation_uuid": str(op.uuid),
+            "value": value,
+            "value_currency": value_currency,
+            "delivered": delivered,
+            "pending": pending,
+            "reference_rate": reference_rate,
+            "suggested_settled_amount": suggested,
+            "full_effective_rate": full_effective_rate,
+            "full_rate_difference": full_rate_difference,
+            "full_amount_difference": full_amount_difference,
+        }
+
+    def _apply_settlement(
+        self,
+        payment,
+        op: WhatsAppOperation,
+        settled_amount: Optional[float],
+    ) -> None:
+        """Fija cuánto cubre este comprobante. Sin monto explícito, lo que da la tasa."""
+        reference_rate = self._reference_rate(op, payment)
+        value = settled_amount
+        if value is None:
+            if reference_rate and payment.amount:
+                value = round(float(payment.amount) / reference_rate, 2)
+            else:
+                _, _ = self.operation_value(op)
+                value = self.operation_value(op)[0] - self.delivered_amount(op, payment.id)
+        if value is not None and value <= 0:
+            raise QuoteServiceError("invalid_settled_amount", "Lo cubierto debe ser > 0", 400)
+        payment.settled_amount = round(float(value), 2)
+        payment.settled_reference_rate = reference_rate
+
+    def _sync_status_from_delivery(self, op: WhatsAppOperation, completing_user: Optional[User]) -> bool:
+        """
+        ¿El trato quedó cubierto? Si sí y la operación estaba abierta, se completa. Devuelve
+        True cuando la completó, para que el caller no la complete otra vez.
+        """
+        if op.status not in (WhatsAppOperationStatus.QUOTED, WhatsAppOperationStatus.PENDING):
+            return False
+        value, _ = self.operation_value(op)
+        if value <= 0:
+            return False
+        # La sesión va sin autoflush: sin esto, lo que acaba de cubrir este comprobante
+        # todavía no lo ve la consulta y el trato parecería incompleto.
+        self.db.flush()
+        if self.delivered_amount(op) + 0.01 < value:
+            return False
+        if completing_user is None:
+            return False
+        self.db.flush()
+        WhatsAppQuoteService(self.db).update_status(
+            op.uuid, WhatsAppOperationStatus.COMPLETED.value, completing_user
+        )
+        return True
+
+    # ---------- Reparto de un entrante entre operaciones ----------
+
+    def _allocated_total(self, payment_id: int, exclude_op_id: Optional[int] = None) -> float:
+        q = self.db.query(WhatsAppPaymentAllocation).filter(
+            WhatsAppPaymentAllocation.incoming_payment_id == payment_id
+        )
+        if exclude_op_id is not None:
+            q = q.filter(WhatsAppPaymentAllocation.whatsapp_operation_id != exclude_op_id)
+        return round(sum(a.amount for a in q.all()), 2)
+
+    def _credited_to_balance(self, payment_id: int) -> float:
+        """Parte del pago que se acreditó al saldo del cliente en vez de a una operación."""
+        rows = (
+            self.db.query(WhatsAppBalanceEntry)
+            .filter(
+                WhatsAppBalanceEntry.incoming_payment_id == payment_id,
+                WhatsAppBalanceEntry.entry_type == WhatsAppBalanceEntryType.CREDIT,
+            )
+            .all()
+        )
+        return round(sum(e.amount for e in rows), 2)
+
+    def _default_allocation_amount(self, payment: WhatsAppIncomingPayment, op: WhatsAppOperation) -> float:
+        """
+        Cuánto de este pago le toca a la operación al vincularla: lo que la op pide, o lo que
+        queda del pago si es menos. Si las monedas no son comparables (la op no liquida en la
+        moneda del pago) se asigna lo disponible y el operador lo ajusta.
+        """
+        available = round((payment.amount or 0) - self._allocated_total(payment.id, op.id), 2)
+        if available <= 0:
+            return 0.0
+        cp = op.currency_pair
+        from_symbol = cp.from_currency.symbol if cp and cp.from_currency else None
+        comparable = (
+            from_symbol == payment.currency
+            or settlement_currency(from_symbol) == settlement_currency(payment.currency)
+        )
+        if comparable and op.from_amount and op.from_amount < available:
+            return round(op.from_amount, 2)
+        return available
+
+    def _upsert_allocation(
+        self,
+        payment: WhatsAppIncomingPayment,
+        op: WhatsAppOperation,
+        amount: Optional[float] = None,
+        actor: Optional[User] = None,
+    ) -> None:
+        """Crea o actualiza la parte del pago que respalda a esta operación."""
+        value = amount if amount is not None else self._default_allocation_amount(payment, op)
+        if value <= 0:
+            return
+        existing = (
+            self.db.query(WhatsAppPaymentAllocation)
+            .filter(
+                WhatsAppPaymentAllocation.incoming_payment_id == payment.id,
+                WhatsAppPaymentAllocation.whatsapp_operation_id == op.id,
+            )
+            .first()
+        )
+        if existing is not None:
+            existing.amount = round(value, 2)
+            return
+        self.db.add(
+            WhatsAppPaymentAllocation(
+                incoming_payment_id=payment.id,
+                whatsapp_operation_id=op.id,
+                amount=round(value, 2),
+                created_by_user_id=actor.id if actor else None,
+            )
+        )
+
+    def _drop_allocation(self, payment_id: int, op_id: int) -> None:
+        self.db.query(WhatsAppPaymentAllocation).filter(
+            WhatsAppPaymentAllocation.incoming_payment_id == payment_id,
+            WhatsAppPaymentAllocation.whatsapp_operation_id == op_id,
+        ).delete(synchronize_session=False)
+
+    def _sync_primary_operation(self, payment: WhatsAppIncomingPayment) -> None:
+        """
+        La op principal del pago (el FK de siempre, que usan el bot y el matcher) es la del
+        reparto mayor. Sin reparto el FK se deja como esté: el vínculo directo sigue valiendo.
+        """
+        self.db.flush()
+        allocations = (
+            self.db.query(WhatsAppPaymentAllocation)
+            .filter(WhatsAppPaymentAllocation.incoming_payment_id == payment.id)
+            .order_by(WhatsAppPaymentAllocation.amount.desc(), WhatsAppPaymentAllocation.id)
+            .all()
+        )
+        if allocations:
+            payment.whatsapp_operation_id = allocations[0].whatsapp_operation_id
+
+    def allocation_summary(self, payment_id: int) -> dict:
+        """
+        El reparto de un pago entrante: qué operaciones cubre, con qué monto y cómo se pagó
+        cada una. Lo que sobra queda como "sin asignar", para asignarlo a otra operación o
+        acreditarlo al saldo del cliente.
+        """
+        payment = self._get_or_404("incoming", payment_id)
+        allocations = list(payment.allocations)
+        assigned = round(sum(a.amount for a in allocations), 2)
+        credited = self._credited_to_balance(payment_id)
+        total = round(payment.amount or 0, 2)
+
+        items = []
+        for allocation in allocations:
+            item = allocation.dict()
+            outgoing = (
+                self.db.query(WhatsAppOutgoingPayment)
+                .filter(WhatsAppOutgoingPayment.whatsapp_operation_id == allocation.whatsapp_operation_id)
+                .all()
+            )
+            item["paid_with"] = [
+                {"id": o.id, "amount": o.amount, "currency": o.currency, "reference": o.reference}
+                for o in outgoing
+            ]
+            items.append(item)
+
+        return {
+            "payment_id": payment.id,
+            "amount": total,
+            "currency": payment.currency,
+            "client_phone": payment.client_phone,
+            "assigned": assigned,
+            "credited_to_balance": credited,
+            "unassigned": round(total - assigned - credited, 2),
+            "allocations": items,
+        }
+
+    def set_allocations(
+        self,
+        payment_id: int,
+        items: list,
+        actor: Optional[User] = None,
+    ) -> dict:
+        """
+        Reemplaza el reparto completo del pago. Cada item es {operation_uuid, amount}.
+        La suma no puede pasarse del pago (contando lo ya acreditado al saldo) y no puede
+        quedar vacío: para eso se desvincula el pago, que tiene su propia confirmación.
+        """
+        payment = self._get_or_404("incoming", payment_id)
+        if not items:
+            raise QuoteServiceError(
+                "allocations_empty",
+                "El reparto no puede quedar vacío: desvincula el pago si ya no respalda a "
+                "ninguna operación",
+                400,
+            )
+
+        resolved = []
+        seen = set()
+        for item in items:
+            op = (
+                self.db.query(WhatsAppOperation)
+                .filter(WhatsAppOperation.uuid == str(item.operation_uuid))
+                .first()
+            )
+            if op is None:
+                raise QuoteServiceError("op_not_found", f"Operación {item.operation_uuid} no encontrada", 404)
+            if op.id in seen:
+                raise QuoteServiceError(
+                    "allocation_duplicated",
+                    f"La operación {op.uuid} aparece dos veces en el reparto",
+                    400,
+                )
+            if item.amount <= 0:
+                raise QuoteServiceError("invalid_amount", "Cada parte del reparto debe ser > 0", 400)
+            seen.add(op.id)
+            resolved.append((op, round(item.amount, 2)))
+
+        total = round(payment.amount or 0, 2)
+        credited = self._credited_to_balance(payment_id)
+        assigned = round(sum(amount for _, amount in resolved), 2)
+        if assigned + credited > total + 0.01:
+            raise QuoteServiceError(
+                "allocation_exceeds_payment",
+                f"El reparto suma {assigned:.2f} y con lo acreditado al saldo ({credited:.2f}) "
+                f"se pasa del pago ({total:.2f})",
+                400,
+            )
+
+        payment.allocations.clear()
+        self.db.flush()
+        for op, amount in resolved:
+            self._upsert_allocation(payment, op, amount, actor)
+        self._sync_primary_operation(payment)
+        self.db.commit()
+        self.db.refresh(payment)
+        return self.allocation_summary(payment_id)
 
     def _resolve_orphan(
         self,
@@ -368,9 +767,9 @@ class WhatsAppPaymentService:
         operation_uuid: Optional[UUID],
         completing_user: Optional[User] = None,
         complete_outgoing: bool = False,
-        settle_amount: Optional[float] = None,
         orphan_action: Optional[str] = None,
         orphan_note: Optional[str] = None,
+        settled_amount: Optional[float] = None,
     ) -> dict:
         row = self._get_or_404(table, payment_id)
         orphaned_op = (
@@ -386,21 +785,9 @@ class WhatsAppPaymentService:
             if op is None:
                 raise QuoteServiceError("op_not_found", f"Operation {operation_uuid} no encontrada", 404)
             Model = self._model(table)
-            same_side_payment = (
-                self.db.query(Model.id)
-                .filter(
-                    Model.whatsapp_operation_id == op.id,
-                    Model.id != row.id,
-                )
-                .first()
-            )
-            if same_side_payment is not None:
-                side_label = "entrante" if table == "incoming" else "saliente"
-                raise QuoteServiceError(
-                    "operation_payment_already_linked",
-                    f"La operación ya tiene un pago {side_label} vinculado",
-                    409,
-                )
+            # Una operación puede tener varios comprobantes por lado: el trato de 220 se pagó
+            # con un Pix y un pago móvil, y cada uno cubre su parte del valor (`settled_amount`).
+            # Lo que antes se rechazaba como duplicado ahora se contabiliza.
             if (
                 complete_outgoing
                 and row.whatsapp_operation_id is not None
@@ -437,40 +824,29 @@ class WhatsAppPaymentService:
                 row.client_phone = operation_client_phone
             # La op vuelve a tener respaldo: el aval de "sin pago asociado" ya no aplica.
             self._clear_no_payments_ack(op)
+            # El entrante estrena (o refresca) su parte del reparto para esta op.
+            if table == "incoming":
+                self._upsert_allocation(row, op, actor=completing_user)
         else:
-            row.whatsapp_operation_id = None
+            # Desvincular suelta la op principal. Si el pago repartía con otras operaciones,
+            # el FK pasa a la siguiente del reparto en vez de quedarse en nada.
+            if table == "incoming" and row.whatsapp_operation_id is not None:
+                self._drop_allocation(row.id, row.whatsapp_operation_id)
+                row.whatsapp_operation_id = None
+                self._sync_primary_operation(row)
+            else:
+                row.whatsapp_operation_id = None
 
-        # Liquidación parcial: el cliente envió el total de la op (ej. 200) pero solo pidió
-        # cambiar una parte (ej. 30). Se redimensiona la op al monto realmente cambiado
-        # (mismo ratio from→to de la cotización) y el excedente se ACREDITA como saldo a
-        # favor ANTES de completar, para que la transacción contable nazca con los montos
-        # reales. Solo aplica al vincular el saliente que completa la op.
-        if settle_amount is not None:
-            self._apply_partial_settle(table, op, settle_amount, complete_outgoing, completing_user)
+        # Un comprobante de salida cubre una parte del valor del trato. Sin monto explícito se
+        # toma lo que da la tasa de referencia: el Pix de 914,04 a 4,5702 cubre 200 de 220, y
+        # los 20 restantes quedan pendientes hasta que llegue otro pago.
+        completed_by_delivery = False
+        if table == "outgoing" and op is not None:
+            self._apply_settlement(row, op, settled_amount)
+            if complete_outgoing:
+                completed_by_delivery = self._sync_status_from_delivery(op, completing_user)
 
-        # En el panel, vincular manualmente una captura saliente confirma que el
-        # dinero fue enviado. La operación y su transacción deben completarse en
-        # la misma acción. El endpoint del bot no activa esta rama porque ese
-        # flujo ya llama explícitamente a complete_operation después del match.
-        if (
-            complete_outgoing
-            and table == "outgoing"
-            and op is not None
-            and op.status in (WhatsAppOperationStatus.QUOTED, WhatsAppOperationStatus.PENDING)
-        ):
-            if completing_user is None:
-                raise QuoteServiceError(
-                    "complete_user_required",
-                    "Falta el usuario que completa la operación",
-                    400,
-                )
-            self.db.flush()
-            WhatsAppQuoteService(self.db).update_status(
-                op.uuid,
-                WhatsAppOperationStatus.COMPLETED.value,
-                completing_user,
-            )
-        else:
+        if not completed_by_delivery:
             self.db.commit()
         self.db.refresh(row)
 
@@ -489,170 +865,165 @@ class WhatsAppPaymentService:
         op.no_payments_ack_at = None
         op.no_payments_ack_note = None
 
-    def _apply_partial_settle(
-        self,
-        table: str,
-        op: Optional[WhatsAppOperation],
-        settle_amount: float,
-        complete_outgoing: bool,
-        completing_user: Optional[User],
-    ) -> None:
-        """
-        Redimensiona la op al monto USD realmente cambiado y acredita el excedente
-        como saldo a favor (ledger `whatsapp_balance_entries`). NO comitea: el
-        caller completa la op (y comitea) en la misma acción.
-        """
-        if not (complete_outgoing and table == "outgoing" and op is not None):
-            raise QuoteServiceError(
-                "partial_settle_invalid",
-                "El monto parcial solo aplica al vincular un saliente a una operación",
-                400,
-            )
-        if op.status not in (WhatsAppOperationStatus.QUOTED, WhatsAppOperationStatus.PENDING):
-            raise QuoteServiceError(
-                "partial_settle_invalid_status",
-                f"La operación está {op.status.value}; solo se liquida parcial una op activa",
-                409,
-            )
-        self._partial_settle_core(op, settle_amount, completing_user)
+    # ---------- Editar el valor del trato ----------
 
-    def partial_settle_completed(
+    def set_operation_value(
         self,
         op_uuid: UUID,
-        settle_amount: float,
-        completing_user: Optional[User],
+        amount: float,
+        actor: Optional[User] = None,
     ) -> dict:
         """
-        Corrección retroactiva: una op ya COMPLETED que se completó por el total
-        cuando el cliente solo cambió una parte. Redimensiona la op, sincroniza la
-        transacción contable (montos + ganancia + splits) y acredita el excedente
-        como saldo a favor.
-        """
-        op = (
-            self.db.query(WhatsAppOperation)
-            .filter(WhatsAppOperation.uuid == op_uuid)
-            .first()
-        )
-        if op is None:
-            raise QuoteServiceError("op_not_found", f"Operation {op_uuid} no encontrada", 404)
-        if op.status != WhatsAppOperationStatus.COMPLETED:
-            raise QuoteServiceError(
-                "partial_settle_invalid_status",
-                f"La operación está {op.status.value}; la corrección aplica a ops COMPLETED "
-                "(para una op activa usa el monto parcial al vincular el saliente)",
-                409,
-            )
+        Corrige cuánto vale el trato. Sube y baja: lo que faltaba era poder subirlo (la
+        corrección vieja solo achicaba, y por eso una op de 200 con un comprobante de 220 no
+        se podía arreglar).
 
-        surplus = self._partial_settle_core(op, settle_amount, completing_user)
-        # Espejo contable: la transacción (y sus profit splits) deben reflejar los
-        # montos corregidos, no los originales.
+        - La cotización de referencia se reescala con la misma tasa.
+        - Si el valor baja por debajo de lo que le asignaron sus entrantes o cubrieron sus
+          salientes, ambos se recortan y la diferencia queda sin asignar / sin cubrir.
+        - El estado se recalcula con lo entregado; la transacción y el movimiento del fondo
+          se re-sincronizan.
+        """
+        op = self.db.query(WhatsAppOperation).filter(WhatsAppOperation.uuid == str(op_uuid)).first()
+        if op is None:
+            raise QuoteServiceError("op_not_found", f"Operación {op_uuid} no encontrada", 404)
+        if amount is None or amount <= 0:
+            raise QuoteServiceError("invalid_amount", "El valor debe ser > 0", 400)
+
+        previous, currency = self.operation_value(op)
+        value = round(float(amount), 2)
+        if abs(value - previous) < 0.01:
+            return op.dict()
+
+        now = datetime.now(timezone.utc)
+        op.amount = value
+        if not op.currency:
+            op.currency = currency
+        equivalents = valuation.equivalents(self.db, value, op.currency, now)
+        op.amount_usdt = equivalents["usdt_amount"]
+        op.usdt_rate = equivalents["usdt_rate"]
+        op.bcv_amount = equivalents["bcv_amount"]
+        op.bcv_rate = equivalents["bcv_rate"]
+        op.valuation_at = now
+
+        # La cotización acompaña al valor con la misma tasa que se le prometió al cliente.
+        if op.from_amount and op.to_amount:
+            ratio = op.to_amount / op.from_amount
+            op.from_amount = value
+            op.to_amount = round(value * ratio, 2)
+
+        released = self._trim_allocations_to_value(op, value)
+        self._trim_settlements_to_value(op, value)
+        self.db.flush()
+        self._sync_status_from_delivery(op, actor)
+        # El valor cambió: su transacción y el movimiento del fondo lo siguen.
         WhatsAppQuoteService(self.db)._sync_linked_transaction(op)
+        self._sync_fund_movement(op)
         self.db.commit()
         self.db.refresh(op)
 
-        from app.services.whatsapp_balance_service import WhatsAppBalanceService
+        result = op.dict()
+        result["released_from_allocations"] = released
+        return result
 
-        return {
-            "operation": op.dict(),
-            "credited": surplus,
-            "balance_after": WhatsAppBalanceService(self.db).get_balance(op.client_id),
-        }
-
-    def _partial_settle_core(
-        self,
-        op: WhatsAppOperation,
-        settle_amount: float,
-        completing_user: Optional[User],
-    ) -> float:
+    def _fund_movement_figures(self, op: WhatsAppOperation, group) -> tuple[float, str, float, float]:
         """
-        Validaciones + redimensión + crédito del excedente, compartido entre la
-        liquidación parcial al vincular y la corrección retroactiva. NO comitea.
-        Devuelve el excedente acreditado.
+        Cuánto sale del fondo por esta operación, en la moneda base del fondo: el VALOR del
+        trato convertido a esa moneda, con su equivalente USDT. Un solo movimiento por
+        operación, sin importar en cuántas monedas se pagó.
         """
-        cp = op.currency_pair
-        from_symbol = cp.from_currency.symbol if cp and cp.from_currency else None
-        if settlement_currency(from_symbol) != "USD":
-            raise QuoteServiceError(
-                "partial_settle_unsupported",
-                f"Solo ops con lado origen USD/ZELLE/PAYPAL acreditan excedente (origen: {from_symbol})",
-                400,
-            )
-        if op.client_id is None:
-            raise QuoteServiceError(
-                "partial_settle_no_client",
-                "La operación no tiene cliente al que acreditar el excedente",
-                400,
-            )
-        if settle_amount <= 0:
-            raise QuoteServiceError("invalid_amount", "El monto cambiado debe ser > 0", 400)
+        value, currency, value_usdt, usdt_rate = (
+            WhatsAppQuoteService(self.db)._operation_value_usdt(op)
+        )
+        base = settlement_currency(group.currency)
+        # Fondo en dólares (el caso real): el movimiento es el valor en USD ≈ su USDT.
+        if base in ("USD", "USDT"):
+            return round(value_usdt, 2), base, round(value_usdt, 2), 1.0
+        # Fondo en la misma moneda que el valor (ej. fondo VES y valor en Bs).
+        if base == settlement_currency(currency):
+            rate = round(value / value_usdt, 6) if value_usdt else 1.0
+            return round(value, 2), base, round(value_usdt, 2), rate
+        raise QuoteServiceError(
+            "fund_currency_mismatch",
+            f"El fondo está en {group.currency} y la operación vale en {currency}",
+            400,
+        )
 
-        # Una sola corrección por op: si ya existe un crédito de excedente para esta
-        # operación, un segundo achicaría los montos otra vez y duplicaría saldo.
-        prior_credit = (
-            self.db.query(WhatsAppBalanceEntry)
+    def _sync_fund_movement(self, op: WhatsAppOperation) -> None:
+        """Reajusta el movimiento EXCHANGE del fondo cuando cambia el valor de la operación."""
+        if op.transaction_id is None or op.fund_group_id is None:
+            return
+        movement = (
+            self.db.query(FundMovement)
             .filter(
-                WhatsAppBalanceEntry.whatsapp_operation_id == op.id,
-                WhatsAppBalanceEntry.entry_type == WhatsAppBalanceEntryType.CREDIT,
+                FundMovement.transaction_id == op.transaction_id,
+                FundMovement.movement_type == FundMovementType.EXCHANGE,
             )
             .first()
         )
-        if prior_credit is not None:
-            raise QuoteServiceError(
-                "partial_settle_already_applied",
-                f"Esta operación ya acreditó un excedente de {prior_credit.amount:.2f} USD",
-                409,
+        if movement is None:
+            return
+        group = self.db.query(FundGroup).filter(FundGroup.id == op.fund_group_id).first()
+        if group is None:
+            return
+        amount, currency, mv_usdt, mv_rate = self._fund_movement_figures(op, group)
+        movement.amount = amount
+        movement.currency = currency
+        movement.amount_usdt = mv_usdt
+        movement.usdt_rate = mv_rate
+
+    def _trim_settlements_to_value(self, op: WhatsAppOperation, value: float) -> None:
+        """
+        Recorta cuánto cubren los salientes cuando el valor baja por debajo de lo entregado:
+        si el trato ahora vale menos, un comprobante no puede seguir cubriendo de más. Se
+        reduce a prorrata; la tasa efectiva de cada pago se recalcula sola (amount/settled).
+        """
+        payouts = (
+            self.db.query(WhatsAppOutgoingPayment)
+            .filter(
+                WhatsAppOutgoingPayment.whatsapp_operation_id == op.id,
+                WhatsAppOutgoingPayment.settled_amount.isnot(None),
             )
-
-        surplus = round(op.from_amount - settle_amount, 2)
-        if surplus <= 0.01:
-            raise QuoteServiceError(
-                "partial_settle_not_partial",
-                f"El monto cambiado ({settle_amount:.2f}) debe ser menor al total de la op ({op.from_amount:.2f})",
-                400,
-            )
-
-        original_from = op.from_amount
-        ratio = op.to_amount / op.from_amount
-        op.from_amount = round(settle_amount, 2)
-        op.to_amount = round(settle_amount * ratio, 2)
-
-        # Trazabilidad: si la op tiene un entrante vinculado que aún no fue acreditado,
-        # el crédito lo referencia (misma restricción de un-crédito-por-entrante que
-        # usa credit_from_incoming).
-        incoming_id = None
-        incoming = (
-            self.db.query(WhatsAppIncomingPayment)
-            .filter(WhatsAppIncomingPayment.whatsapp_operation_id == op.id)
-            .first()
+            .order_by(WhatsAppOutgoingPayment.id)
+            .all()
         )
-        if incoming is not None:
-            already = (
-                self.db.query(WhatsAppBalanceEntry)
-                .filter(
-                    WhatsAppBalanceEntry.incoming_payment_id == incoming.id,
-                    WhatsAppBalanceEntry.entry_type == WhatsAppBalanceEntryType.CREDIT,
-                )
-                .first()
-            )
-            if already is None:
-                incoming_id = incoming.id
+        covered = round(sum(p.settled_amount for p in payouts), 2)
+        if not payouts or covered <= value + 0.01:
+            return
 
-        self.db.add(
-            WhatsAppBalanceEntry(
-                client_id=op.client_id,
-                entry_type=WhatsAppBalanceEntryType.CREDIT,
-                amount=surplus,
-                currency="USD",
-                incoming_payment_id=incoming_id,
-                whatsapp_operation_id=op.id,
-                notes=(
-                    f"Excedente de op {str(op.uuid)[:8]}: cambió {settle_amount:.2f} "
-                    f"de {original_from:.2f} {from_symbol}"
-                ),
-                created_by_user_id=completing_user.id if completing_user else None,
-            )
+        remaining = value
+        for index, payout in enumerate(payouts):
+            if index == len(payouts) - 1:
+                payout.settled_amount = round(max(remaining, 0), 2)
+            else:
+                share = round(payout.settled_amount * value / covered, 2)
+                payout.settled_amount = share
+                remaining = round(remaining - share, 2)
+
+    def _trim_allocations_to_value(self, op: WhatsAppOperation, value: float) -> float:
+        """
+        Recorta el reparto de los entrantes cuando el valor baja: se reduce a prorrata y se
+        devuelve cuánto quedó liberado (sin asignar en sus comprobantes).
+        """
+        allocations = (
+            self.db.query(WhatsAppPaymentAllocation)
+            .filter(WhatsAppPaymentAllocation.whatsapp_operation_id == op.id)
+            .order_by(WhatsAppPaymentAllocation.id)
+            .all()
         )
-        return surplus
+        assigned = round(sum(a.amount for a in allocations), 2)
+        if not allocations or assigned <= value + 0.01:
+            return 0.0
+
+        remaining = value
+        for index, allocation in enumerate(allocations):
+            if index == len(allocations) - 1:
+                allocation.amount = round(max(remaining, 0), 2)
+            else:
+                share = round(allocation.amount * value / assigned, 2)
+                allocation.amount = share
+                remaining = round(remaining - share, 2)
+        return round(assigned - value, 2)
 
     def set_personal_expense(
         self,
@@ -981,9 +1352,18 @@ class WhatsAppPaymentService:
 
         now = datetime.utcnow()
         track_delivery = table == "outgoing" and from_currency == "USD"
+        # El valor del trato es lo que entrega el cliente; el par y el `to` son la cotización.
+        value = valuation.equivalents(self.db, from_amount, from_currency, now)
         op = WhatsAppOperation(
             client_id=client.id,
             currency_pair_id=pair.id,
+            amount=from_amount,
+            currency=from_currency,
+            amount_usdt=value["usdt_amount"],
+            usdt_rate=value["usdt_rate"],
+            bcv_amount=value["bcv_amount"],
+            bcv_rate=value["bcv_rate"],
+            valuation_at=now,
             from_amount=from_amount,
             to_amount=to_amount,
             rate_used=to_amount / from_amount,
@@ -999,6 +1379,15 @@ class WhatsAppPaymentService:
         self.db.add(op)
         self.db.flush()
         row.whatsapp_operation_id = op.id
+        # El entrante estrena su parte del reparto: lo que pide la op, y si el comprobante
+        # trae más, la diferencia queda visible como "sin asignar".
+        if table == "incoming":
+            self._upsert_allocation(row, op)
+        else:
+            # Crear la operación DESDE un comprobante de salida afirma que ese pago es el que
+            # la cubre: el valor se fijó mirándolo. Si el operador puso un valor distinto al
+            # que da la tasa, la tasa efectiva del pago sale de ahí.
+            self._apply_settlement(row, op, from_amount)
 
         # Salida con fondo: registrar el EXCHANGE (sale plata del fondo) por el lado de la op
         # cuya moneda coincide con la moneda base del fondo.
@@ -1012,19 +1401,7 @@ class WhatsAppPaymentService:
             if exchange_user_id is None:
                 raise QuoteServiceError("exchange_user_required", "Falta el gestor del movimiento EXCHANGE", 400)
 
-            # Match por moneda de liquidación: ZELLE/PAYPAL cuentan como USD. El movimiento se
-            # registra en la moneda base del fondo (ej. un Zelle en un fondo USD → movimiento USD).
-            base = settlement_currency(group.currency)
-            if base == settlement_currency(from_currency):
-                mv_amount = from_amount
-            elif base == settlement_currency(to_currency):
-                mv_amount = to_amount
-            else:
-                raise QuoteServiceError(
-                    "fund_currency_mismatch",
-                    f"El fondo está en {group.currency} y la operación es {from_currency}/{to_currency}",
-                    400,
-                )
+            mv_amount, mv_currency, mv_usdt, mv_rate = self._fund_movement_figures(op, group)
 
             transaction_user = self.db.query(User).filter(User.id == exchange_user_id).first()
             if transaction_user is None:
@@ -1043,7 +1420,9 @@ class WhatsAppPaymentService:
                 user_id=exchange_user_id,
                 movement_type=FundMovementType.EXCHANGE,
                 amount=mv_amount,
-                currency=base,
+                currency=mv_currency,
+                amount_usdt=mv_usdt,
+                usdt_rate=mv_rate,
                 movement_date=now,
                 transaction_id=tx.id,
                 recorded_by_user_id=recorded_by_user_id,

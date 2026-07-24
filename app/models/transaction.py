@@ -18,7 +18,10 @@ class Transaction(UUIDMixin, Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # Usuario que registró la transacción
-    currency_pair_id = Column(Integer, ForeignKey("currency_pairs.id"), nullable=False, index=True)
+    # Nullable: una transacción por valor no cuelga de un par. Las monedas van explícitas.
+    currency_pair_id = Column(Integer, ForeignKey("currency_pairs.id"), nullable=True, index=True)
+    from_currency_symbol = Column("from_currency", String(10), nullable=True)
+    to_currency_symbol = Column("to_currency", String(10), nullable=True)
 
     # Información de la transacción
     from_amount = Column(Float, nullable=False)  # Monto enviado
@@ -47,10 +50,15 @@ class Transaction(UUIDMixin, Base):
 
     @property
     def from_currency(self):
+        # El símbolo guardado manda (transacciones por valor, sin par); las viejas caen al par.
+        if self.from_currency_symbol:
+            return self.from_currency_symbol
         return self.currency_pair.from_currency.symbol if self.currency_pair else None
 
     @property
     def to_currency(self):
+        if self.to_currency_symbol:
+            return self.to_currency_symbol
         return self.currency_pair.to_currency.symbol if self.currency_pair else None
 
     def __repr__(self):

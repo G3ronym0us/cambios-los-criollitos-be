@@ -39,8 +39,10 @@ class TransactionRepository:
                 raise ValueError(f"User with UUID {transaction_data.user_uuid} not found")
             user_id = user.id
 
-        if not currency_pair_id:
-            raise ValueError("currency_pair_id must be provided")
+        # Una transacción por valor no tiene par; nombra sus monedas directamente. Las de par
+        # (sistema legacy) siguen exigiendo el par para no perder los reportes por par.
+        if not currency_pair_id and not getattr(transaction_data, "from_currency", None):
+            raise ValueError("currency_pair_id or explicit currencies must be provided")
 
         # Calcular profit_amount basado en el porcentaje y el monto
         profit_amount = (transaction_data.to_amount * transaction_data.total_profit_percentage) / 100
@@ -51,6 +53,8 @@ class TransactionRepository:
         db_transaction = Transaction(
             user_id=user_id,
             currency_pair_id=currency_pair_id,
+            from_currency_symbol=getattr(transaction_data, "from_currency", None),
+            to_currency_symbol=getattr(transaction_data, "to_currency", None),
             from_amount=transaction_data.from_amount,
             to_amount=transaction_data.to_amount,
             exchange_rate=transaction_data.exchange_rate,

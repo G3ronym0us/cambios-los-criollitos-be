@@ -14,10 +14,9 @@ from app.models.client_loan import (
     ClientLoanRepayment,
     ClientLoanStatus,
 )
-from app.models.bcv_rate import BcvRate
-from app.models.exchange_rate import ExchangeRate
 from app.models.whatsapp_client import WhatsAppClient
 from app.models.whatsapp_payment import WhatsAppOutgoingPayment
+from app.services import valuation
 from app.services.bcv_service import get_cached_bcv_rate
 from app.services.whatsapp_quote_service import QuoteServiceError
 from app.services.whatsapp_rate_resolver import WhatsAppRateResolver
@@ -79,47 +78,15 @@ class ClientLoanService:
             return "USDT"
         return None
 
+    # La valuación histórica es compartida con las operaciones: vive en
+    # `app/services/valuation.py` y aquí solo se delega.
     def _historical_rate(
         self,
         from_currency: str,
         to_currency: str,
         at: datetime,
     ) -> tuple[Optional[float], Optional[bool], Optional[datetime]]:
-        """Tasa base vigente inmediatamente antes del comprobante, sin margen comercial."""
-        source = from_currency.upper()
-        target = to_currency.upper()
-        if source == target or {source, target} == {"USD", "USDT"}:
-            return 1.0, False, at
-
-        direct = (
-            self.db.query(ExchangeRate)
-            .filter(
-                ExchangeRate.from_currency == source,
-                ExchangeRate.to_currency == target,
-                ExchangeRate.created_at <= at,
-            )
-            .order_by(ExchangeRate.created_at.desc())
-            .first()
-        )
-        if direct is not None and direct.base_rate > 0:
-            return float(direct.base_rate), bool(direct.inverse_percentage), direct.created_at
-
-        inverse = (
-            self.db.query(ExchangeRate)
-            .filter(
-                ExchangeRate.from_currency == target,
-                ExchangeRate.to_currency == source,
-                ExchangeRate.created_at <= at,
-            )
-            .order_by(ExchangeRate.created_at.desc())
-            .first()
-        )
-        if inverse is None or inverse.base_rate <= 0:
-            return None, None, None
-        # Para recorrer el par en sentido contrario se conserva la tasa y se
-        # intercambia multiplicar/dividir. Invertir también el número aplicaría
-        # la inversión dos veces.
-        return float(inverse.base_rate), not bool(inverse.inverse_percentage), inverse.created_at
+        return valuation.historical_rate(self.db, from_currency, to_currency, at)
 
     def _historical_convert(
         self,
@@ -128,22 +95,10 @@ class ClientLoanService:
         to_currency: str,
         at: datetime,
     ) -> tuple[Optional[float], Optional[datetime]]:
-        rate, inverse_percentage, rate_at = self._historical_rate(from_currency, to_currency, at)
-        if rate is None or inverse_percentage is None:
-            return None, None
-        converted = self.resolver.apply_rate(float(amount), rate, inverse_percentage)
-        return float(converted), rate_at
+        return valuation.historical_convert(self.db, amount, from_currency, to_currency, at)
 
     def _historical_bcv(self, at: datetime) -> tuple[Optional[float], Optional[datetime]]:
-        row = (
-            self.db.query(BcvRate)
-            .filter(BcvRate.fetched_at <= at)
-            .order_by(BcvRate.fetched_at.desc())
-            .first()
-        )
-        if row is None or row.rate <= 0:
-            return None, None
-        return float(row.rate), row.fetched_at
+        return valuation.historical_bcv(self.db, at)
 
     def preview_outgoing(
         self,

@@ -12,6 +12,7 @@ de comprobantes (OCR) y el matching los hace el bot vía `/whatsapp/payments/*`
 """
 
 from typing import Literal
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -24,6 +25,7 @@ from app.schemas.whatsapp import (
     WhatsAppCreateOpManual,
     WhatsAppForwardToGroup,
     WhatsAppIrrelevant,
+    PaymentAllocationsUpdate,
     WhatsAppPaymentLink,
     WhatsAppPersonalExpense,
     ClientLoanCreate,
@@ -110,9 +112,8 @@ async def link_payment_operation(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Vincula un pago; si es saliente, completa la operación activa y su transacción.
-    Con `settle_amount` (solo salientes) la op se redimensiona al monto realmente
-    cambiado y el excedente se acredita como saldo a favor del cliente.
+    Vincula un pago; si es saliente, completa la operación cuando lo entregado cubre su valor.
+    Con `settled_amount` (solo salientes) se fija cuánto de ese valor cubre el comprobante.
 
     Al DESVINCULAR (`operation_uuid` null) el último comprobante de una operación hace falta
     `orphan_action`: sin él responde 409 para que el operador decida (ver `unlink-preview`).
@@ -125,10 +126,64 @@ async def link_payment_operation(
             payload.operation_uuid,
             completing_user=current_user,
             complete_outgoing=True,
-            settle_amount=payload.settle_amount,
             orphan_action=payload.orphan_action,
             orphan_note=payload.orphan_note,
+            settled_amount=payload.settled_amount,
         )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.get("/outgoing/{payment_id}/coverage")
+async def preview_outgoing_coverage(
+    payment_id: int,
+    operation_uuid: UUID = Query(..., description="Operación a la que se vincularía"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Cuánto del valor de la operación cubriría este comprobante: lo que da la tasa, lo que le
+    falta al trato, y —si se decide que lo cubre entero— a qué tasa quedaría y cuánto se
+    aparta de la de referencia. Operador JWT.
+    """
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.coverage_preview(payment_id, operation_uuid)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.get("/incoming/{payment_id}/allocations")
+async def get_payment_allocations(
+    payment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Reparto de un pago entrante: qué operaciones cubre, con cuánto y cómo se pagó cada una.
+    Lo que sobra sale como `unassigned`. Operador JWT.
+    """
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.allocation_summary(payment_id)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.put("/incoming/{payment_id}/allocations")
+async def set_payment_allocations(
+    payment_id: int,
+    payload: PaymentAllocationsUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Reparte un pago entrante entre varias operaciones (un Zelle de 220 puede cubrir 200 de un
+    cambio a BRL y 20 de otro a VES). Reemplaza el reparto anterior. Operador JWT.
+    """
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.set_allocations(payment_id, payload.allocations, actor=current_user)
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 

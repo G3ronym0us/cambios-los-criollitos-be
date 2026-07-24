@@ -28,7 +28,7 @@ from app.schemas.whatsapp import (
     WhatsAppOperationScenarioUpdate,
     WhatsAppOperationStatusUpdate,
     WhatsAppOperationUpdate,
-    WhatsAppPartialSettle,
+    WhatsAppOperationValue,
     WhatsAppStatsResponse,
 )
 from app.services.whatsapp_balance_service import WhatsAppBalanceService
@@ -152,25 +152,6 @@ async def mark_operation_delivered(
     return WhatsAppOperationResponse.model_validate(op.dict())
 
 
-@router.post("/{op_uuid}/partial-settle")
-async def partial_settle_operation(
-    op_uuid: UUID,
-    payload: WhatsAppPartialSettle,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """
-    Corrección retroactiva de una op COMPLETED que se completó por el total cuando
-    el cliente solo cambió una parte: redimensiona la op al monto realmente cambiado,
-    sincroniza la transacción contable y acredita el excedente como saldo a favor.
-    """
-    service = WhatsAppPaymentService(db)
-    try:
-        return service.partial_settle_completed(op_uuid, payload.settle_amount, current_user)
-    except QuoteServiceError as exc:
-        raise HTTPException(status_code=exc.http_status, detail=exc.message)
-
-
 @router.patch("/{op_uuid}", response_model=WhatsAppOperationResponse)
 async def update_operation(
     op_uuid: UUID,
@@ -201,6 +182,24 @@ async def update_operation_status(
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
     return WhatsAppOperationResponse.model_validate(op.dict())
+
+
+@router.patch("/{op_uuid}/value", response_model=WhatsAppOperationResponse)
+async def update_operation_value(
+    op_uuid: UUID,
+    payload: WhatsAppOperationValue,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Corrige cuánto vale el trato, hacia arriba o hacia abajo. Reescala la cotización, recorta
+    el reparto de los entrantes si el valor baja y recalcula el estado con lo entregado.
+    """
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.set_operation_value(op_uuid, payload.amount, actor=current_user)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
 
 @router.delete("/{op_uuid}")

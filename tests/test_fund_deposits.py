@@ -141,3 +141,45 @@ def test_the_statement_shows_the_balance_going_back(db, fund, operator):
     assert running[deposit.id]["balance_usdt"] == pytest.approx(500)   # antes de anularlo
     assert running[reversal.id]["balance_usdt"] == pytest.approx(0)    # después
     assert len(movements) == 2  # las dos líneas quedan visibles
+
+
+def test_you_can_jump_from_an_annulled_movement_to_its_correction(db, fund, operator):
+    """
+    La reversa se fecha el día de la corrección, así que el par casi nunca cae en la misma
+    página. Cada lado tiene que saber en cuál está el otro.
+    """
+    from datetime import datetime, timedelta, timezone
+    from app.models.fund import FundMovementType
+    from app.repositories.fund_repository import FundRepository
+
+    repo = FundRepository(db)
+    viejo = _movement(db, fund, operator, FundMovementType.EXCHANGE, 320,
+                      when=datetime.now(timezone.utc) - timedelta(days=30))
+    # Movimientos más recientes que empujan al original fuera de la primera página.
+    for i in range(3):
+        _movement(db, fund, operator, FundMovementType.DEPOSIT, 10 + i,
+                  when=datetime.now(timezone.utc) - timedelta(days=i))
+    reversa = repo.reverse_movement(viejo, reason="nunca se ejecutó", actor_id=operator.id)
+
+    # De ida y de vuelta, con páginas de 2 para que el par quede separado.
+    assert repo.locate_movement(reversa, per_page=2) == 1
+    assert repo.locate_movement(viejo, per_page=2) == 3
+    db.refresh(viejo)
+    assert viejo.reversed_by_movement_id == reversa.id
+    assert reversa.reverses_movement_id == viejo.id
+
+
+def test_a_movement_outside_the_filter_has_no_page(db, fund, operator):
+    """Si el filtro deja fuera al otro lado del par, no hay página a la que saltar."""
+    from datetime import datetime, timedelta, timezone
+    from app.models.fund import FundMovementType
+    from app.repositories.fund_repository import FundRepository
+
+    repo = FundRepository(db)
+    viejo = _movement(db, fund, operator, FundMovementType.PERSONAL, 40,
+                      when=datetime.now(timezone.utc) - timedelta(days=10))
+    reversa = repo.reverse_movement(viejo, reason="no era del fondo", actor_id=operator.id)
+
+    corte = datetime.now(timezone.utc) - timedelta(days=5)
+    assert repo.locate_movement(viejo, date_to=corte) == 1
+    assert repo.locate_movement(reversa, date_to=corte) is None

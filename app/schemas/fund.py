@@ -168,6 +168,15 @@ class FundGroupBalanceResponse(BaseModel):
     by_member: List[UserPositionResponse] = []
 
 
+class FundMovementLocation(BaseModel):
+    """Dónde está un movimiento dentro del historial, para poder saltar hasta él."""
+    movement_uuid: UUID
+    group_uuid: Optional[UUID] = None
+    page: Optional[int] = None
+    # False cuando los filtros actuales lo dejan fuera: no hay página a la que ir.
+    found: bool
+
+
 class FundMovementReverse(BaseModel):
     """Anular un movimiento exige decir por qué: es lo que queda en el libro."""
     reason: str = Field(..., min_length=3, max_length=500)

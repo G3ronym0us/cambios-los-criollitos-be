@@ -9,7 +9,7 @@ from app.schemas.fund import (
     FundGroupCreate, FundGroupUpdate, FundGroupResponse,
     FundGroupMemberCreate, FundGroupMemberUpdate, FundGroupMemberResponse,
     FundMovementCreate, FundMovementResponse, FundMovementList, FundMovementTotals,
-    FundMovementReverse,
+    FundMovementReverse, FundMovementLocation,
     UserPositionResponse, FundGroupBalanceResponse,
     FundPendingDepositResponse, FundPendingDepositConfirm, FundPendingDepositCreate,
 )
@@ -349,6 +349,47 @@ async def get_movement(
     if not movement:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Movement not found")
     return _serialize_movement(movement, client_name=_resolve_client_name(fund_repo, movement))
+
+
+@router.get("/movements/{movement_uuid}/locate", response_model=FundMovementLocation)
+async def locate_movement(
+    movement_uuid: UUID,
+    movement_type: Optional[str] = Query(None),
+    date_from: Optional[datetime] = Query(None),
+    date_to: Optional[datetime] = Query(None),
+    per_page: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """
+    En qué página del historial está un movimiento, con los filtros que se estén usando.
+    Permite saltar de un movimiento anulado a su reversa y al revés, aunque las separen meses.
+    """
+    fund_repo = FundRepository(db)
+    movement = fund_repo.get_movement_by_uuid(movement_uuid)
+    if not movement:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Movement not found")
+
+    type_enum = None
+    if movement_type:
+        try:
+            type_enum = FundMovementType(movement_type.upper())
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid movement_type '{movement_type}'",
+            )
+
+    page = fund_repo.locate_movement(
+        movement, per_page=per_page, movement_type=type_enum,
+        date_from=date_from, date_to=date_to,
+    )
+    return FundMovementLocation(
+        movement_uuid=movement.uuid,
+        group_uuid=movement.group.uuid if movement.group else None,
+        page=page,
+        found=page is not None,
+    )
 
 
 @router.post("/movements/{movement_uuid}/reverse", response_model=FundMovementResponse)

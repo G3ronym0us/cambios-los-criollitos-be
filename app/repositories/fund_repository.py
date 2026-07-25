@@ -1,5 +1,5 @@
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import func, and_, case as sa_case
+from sqlalchemy import func, and_, or_ as sa_or, case as sa_case
 from typing import Optional, List
 from datetime import datetime, timezone
 from uuid import UUID
@@ -216,8 +216,54 @@ class FundRepository:
             query = query.filter(FundMovement.movement_date <= date_to)
 
         total = query.count()
-        movements = query.order_by(FundMovement.movement_date.desc()).offset(skip).limit(limit).all()
+        movements = (
+            query.order_by(FundMovement.movement_date.desc(), FundMovement.id.desc())
+            .offset(skip)
+            .limit(limit)
+            .all()
+        )
         return movements, total
+
+    def locate_movement(
+        self,
+        movement: FundMovement,
+        per_page: int = 50,
+        movement_type: Optional[FundMovementType] = None,
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None,
+    ) -> Optional[int]:
+        """
+        En qué página del historial cae un movimiento, con los filtros que se estén usando.
+
+        Sirve para saltar de un movimiento anulado a su reversa y al revés: la reversa se
+        fecha el día de la corrección, así que el par casi nunca está en la misma página.
+        Devuelve None si los filtros actuales lo dejan fuera —ahí no hay página a la que ir.
+        """
+        query = self.db.query(func.count(FundMovement.id)).filter(
+            FundMovement.group_id == movement.group_id
+        )
+        if movement_type:
+            query = query.filter(FundMovement.movement_type == movement_type)
+        if date_from:
+            query = query.filter(FundMovement.movement_date >= date_from)
+        if date_to:
+            query = query.filter(FundMovement.movement_date <= date_to)
+
+        # ¿Sobrevive a los filtros? Si no, no tiene página.
+        if not query.filter(FundMovement.id == movement.id).scalar():
+            return None
+
+        # Cuántos van antes que él en el mismo orden que la lista (fecha desc, id desc).
+        ahead = query.filter(
+            sa_or(
+                FundMovement.movement_date > movement.movement_date,
+                and_(
+                    FundMovement.movement_date == movement.movement_date,
+                    FundMovement.id > movement.id,
+                ),
+            )
+        ).scalar()
+        return int(ahead) // per_page + 1
 
     def get_running_totals(self, group_id: int, movement_ids: List[int]) -> dict:
         """

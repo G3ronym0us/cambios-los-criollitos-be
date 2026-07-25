@@ -90,7 +90,11 @@ class WhatsAppQuoteService:
             self.db.flush()
             return client
 
-        if display_name and client.display_name != display_name:
+        # El nombre que llega del bot es el que el contacto se puso en su propio WhatsApp, y
+        # cambia cuando a él se le antoja. Solo sirve para estrenar la ficha: una vez que hay
+        # un nombre, manda el que decidió el operador. Si no, un cliente que se llame «.....»
+        # renombra su ficha en cada cotización.
+        if display_name and not client.display_name:
             client.display_name = display_name
         client.last_seen_at = now
         return client

@@ -115,6 +115,12 @@ class FundMovementResponse(BaseModel):
     # Acumulados hasta este movimiento (extracto): saldo del fondo y ganancia sumada.
     running_balance_usdt: Optional[float] = None
     running_profit_usdt: Optional[float] = None
+    # Anulación: esta fila anula a otra, o ya fue anulada por otra.
+    is_reversal: bool = False
+    is_reversed: bool = False
+    reverses_movement_uuid: Optional[UUID] = None
+    reversed_by_movement_uuid: Optional[UUID] = None
+    reversed_at: Optional[datetime] = None
     reference: Optional[str] = None
     notes: Optional[str] = None
     recorded_by_uuid: Optional[UUID] = None
@@ -160,6 +166,11 @@ class FundGroupBalanceResponse(BaseModel):
     total_profit_usdt: float         # suma profit splits de miembros COMPLETED → "Acumulada"
     available_funds_usdt: float      # profit + position → "Fondos" Excel
     by_member: List[UserPositionResponse] = []
+
+
+class FundMovementReverse(BaseModel):
+    """Anular un movimiento exige decir por qué: es lo que queda en el libro."""
+    reason: str = Field(..., min_length=3, max_length=500)
 
 
 class FundMovementTotals(BaseModel):

@@ -74,3 +74,70 @@ def test_rejecting_a_pending_deposit_creates_no_movement(deposits, db, fund, ope
     )
     deposits.reject(pending["uuid"], resolved_by_user_id=operator.id)
     assert len(_confirmed_movements(db)) == 0
+
+
+# --------------------------------------------------------------------- reversa de movimientos
+
+def _movement(db, group, user, kind, amount, when=None):
+    from datetime import datetime, timezone
+    from app.models.fund import FundMovement
+    row = FundMovement(
+        group_id=group.id, user_id=user.id, movement_type=kind,
+        amount=amount, currency="USD", amount_usdt=amount,
+        movement_date=when or datetime.now(timezone.utc),
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def test_reversing_a_deposit_undoes_it_without_erasing_it(db, fund, operator):
+    """El original se queda en el libro y el saldo vuelve a donde estaba."""
+    from app.models.fund import FundMovementType
+    from app.repositories.fund_repository import FundRepository
+
+    repo = FundRepository(db)
+    deposit = _movement(db, fund, operator, FundMovementType.DEPOSIT, 500)
+    assert repo.get_group_balance(fund.id)["total_position_usdt"] == pytest.approx(500)
+
+    reversal = repo.reverse_movement(deposit, reason="cargado dos veces", actor_id=operator.id)
+
+    assert repo.get_group_balance(fund.id)["total_position_usdt"] == pytest.approx(0)
+    db.refresh(deposit)
+    assert deposit.reversed_by_movement_id == reversal.id  # sigue ahí, marcado
+    assert deposit.reversed_at is not None
+    assert reversal.movement_type == FundMovementType.DEPOSIT  # mismo tipo, signo opuesto
+    assert reversal.notes == "cargado dos veces"
+    assert reversal.recorded_by_user_id == operator.id
+
+
+def test_reversing_an_outflow_gives_the_money_back(db, fund, operator):
+    from app.models.fund import FundMovementType
+    from app.repositories.fund_repository import FundRepository
+
+    repo = FundRepository(db)
+    _movement(db, fund, operator, FundMovementType.DEPOSIT, 500)
+    personal = _movement(db, fund, operator, FundMovementType.PERSONAL, 200)
+    assert repo.get_group_balance(fund.id)["total_position_usdt"] == pytest.approx(300)
+
+    repo.reverse_movement(personal, reason="no era gasto del fondo", actor_id=operator.id)
+    assert repo.get_group_balance(fund.id)["total_position_usdt"] == pytest.approx(500)
+
+
+def test_the_statement_shows_the_balance_going_back(db, fund, operator):
+    """En el extracto, la reversa aparece como una línea más que devuelve el saldo."""
+    from datetime import datetime, timedelta, timezone
+    from app.models.fund import FundMovementType
+    from app.repositories.fund_repository import FundRepository
+
+    repo = FundRepository(db)
+    base = datetime.now(timezone.utc) - timedelta(days=2)
+    deposit = _movement(db, fund, operator, FundMovementType.DEPOSIT, 500, when=base)
+    reversal = repo.reverse_movement(deposit, reason="duplicado", actor_id=operator.id)
+
+    movements, _ = repo.get_movements(group_id=fund.id)
+    running = repo.get_running_totals(fund.id, [m.id for m in movements])
+
+    assert running[deposit.id]["balance_usdt"] == pytest.approx(500)   # antes de anularlo
+    assert running[reversal.id]["balance_usdt"] == pytest.approx(0)    # después
+    assert len(movements) == 2  # las dos líneas quedan visibles

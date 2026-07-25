@@ -9,6 +9,7 @@ from app.schemas.fund import (
     FundGroupCreate, FundGroupUpdate, FundGroupResponse,
     FundGroupMemberCreate, FundGroupMemberUpdate, FundGroupMemberResponse,
     FundMovementCreate, FundMovementResponse, FundMovementList, FundMovementTotals,
+    FundMovementReverse,
     UserPositionResponse, FundGroupBalanceResponse,
     FundPendingDepositResponse, FundPendingDepositConfirm, FundPendingDepositCreate,
 )
@@ -350,19 +351,48 @@ async def get_movement(
     return _serialize_movement(movement, client_name=_resolve_client_name(fund_repo, movement))
 
 
-@router.delete("/movements/{movement_uuid}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_movement(
+@router.post("/movements/{movement_uuid}/reverse", response_model=FundMovementResponse)
+async def reverse_movement(
     movement_uuid: UUID,
+    payload: FundMovementReverse,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_root_user),
 ):
-    """Eliminar un movimiento (requiere ROOT)"""
+    """
+    Anula un movimiento con otro que lo referencia. El original se queda en el libro, marcado
+    como reversado; el saldo lo corrige la reversa. Requiere ROOT y un motivo.
+
+    Los movimientos que nacen de una operación no se reversan por aquí: se corrige la
+    operación, que es la que manda sobre su transacción y su movimiento.
+    """
     fund_repo = FundRepository(db)
     movement = fund_repo.get_movement_by_uuid(movement_uuid)
     if not movement:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Movement not found")
 
-    fund_repo.delete_movement(movement.id)
+    if movement.reversed_by_movement_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Este movimiento ya fue reversado",
+        )
+    if movement.reverses_movement_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Una reversa no se reversa: registra el movimiento que corresponda",
+        )
+    if movement.transaction_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Este movimiento lo generó una operación. Corrige la operación "
+                "(su valor o su fondo) y el movimiento se ajusta solo."
+            ),
+        )
+
+    reversal = fund_repo.reverse_movement(
+        movement, reason=payload.reason.strip(), actor_id=current_user.id
+    )
+    return _serialize_movement(reversal, client_name=_resolve_client_name(fund_repo, reversal))
 
 
 # ===== Pending deposits (detectados por el bot, confirmables aquí) =====
@@ -513,6 +543,11 @@ def _serialize_movement(
         "profit_amount_usdt": tx.profit_amount_usdt if tx else None,
         "running_balance_usdt": running.get("balance_usdt") if running else None,
         "running_profit_usdt": running.get("profit_usdt") if running else None,
+        "is_reversal": movement.is_reversal,
+        "is_reversed": movement.is_reversed,
+        "reverses_movement_uuid": movement.reverses.uuid if movement.reverses else None,
+        "reversed_by_movement_uuid": movement.reversed_by.uuid if movement.reversed_by else None,
+        "reversed_at": movement.reversed_at,
         "reference": movement.reference,
         "notes": movement.notes,
         "recorded_by_uuid": movement.recorded_by.uuid if movement.recorded_by else None,

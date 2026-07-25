@@ -187,6 +187,17 @@ class FundMovement(UUIDMixin, Base):
     recorded_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     movement_date = Column(DateTime(timezone=True), nullable=False, index=True)
 
+    # Un movimiento no se borra: se reversa con otro que lo anula. La reversa conserva el tipo
+    # del original y apunta a él; el signo sale de esta columna, sin mirar la otra fila.
+    reverses_movement_id = Column(
+        Integer, ForeignKey("fund_movements.id", ondelete="RESTRICT"), nullable=True, unique=True
+    )
+    # Cara opuesta del vínculo, en el original: barata de consultar y permite marcarlo en la UI.
+    reversed_by_movement_id = Column(
+        Integer, ForeignKey("fund_movements.id", ondelete="SET NULL"), nullable=True
+    )
+    reversed_at = Column(DateTime(timezone=True), nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -195,6 +206,22 @@ class FundMovement(UUIDMixin, Base):
     user = relationship("User", foreign_keys=[user_id])
     transaction = relationship("Transaction")
     recorded_by = relationship("User", foreign_keys=[recorded_by_user_id])
+    reverses = relationship(
+        "FundMovement", foreign_keys=[reverses_movement_id], remote_side="FundMovement.id"
+    )
+    reversed_by = relationship(
+        "FundMovement", foreign_keys=[reversed_by_movement_id], remote_side="FundMovement.id"
+    )
+
+    @property
+    def is_reversal(self) -> bool:
+        """Este movimiento anula a otro, así que cuenta con el signo cambiado."""
+        return self.reverses_movement_id is not None
+
+    @property
+    def is_reversed(self) -> bool:
+        """A este ya lo anularon: sigue en el libro, pero no suma."""
+        return self.reversed_by_movement_id is not None
 
     def __repr__(self):
         return f"<FundMovement(id={self.id}, type={self.movement_type.value}, amount={self.amount} {self.currency})>"
@@ -219,6 +246,11 @@ class FundMovement(UUIDMixin, Base):
             "recorded_by_uuid": self.recorded_by.uuid if self.recorded_by else None,
             "recorded_by_username": self.recorded_by.username if self.recorded_by else None,
             "movement_date": self.movement_date,
+            "is_reversal": self.is_reversal,
+            "is_reversed": self.is_reversed,
+            "reverses_movement_uuid": self.reverses.uuid if self.reverses else None,
+            "reversed_by_movement_uuid": self.reversed_by.uuid if self.reversed_by else None,
+            "reversed_at": self.reversed_at,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }

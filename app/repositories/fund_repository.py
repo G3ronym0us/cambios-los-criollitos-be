@@ -1,7 +1,7 @@
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, and_, case as sa_case
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import UUID
 
 from app.models.fund import FundGroup, FundGroupMember, FundMovement, FundMovementType
@@ -9,6 +9,20 @@ from app.models.profit_allocation import OperationProfitAllocation, ProfitAlloca
 from app.models.user import User
 from app.models.transaction import Transaction, TransactionProfitSplit, TransactionStatus
 from app.models.whatsapp_operation import WhatsAppOperation
+
+
+def reversal_signed(column):
+    """
+    El aporte de un movimiento a una suma, con el signo de la reversa ya aplicado.
+
+    Una reversa conserva el tipo del original —anular un depósito es otro DEPOSIT— así que
+    dentro de su propio grupo cuenta en negativo. Se lee de `reverses_movement_id`, que está
+    en la misma fila: ninguna suma necesita mirar el movimiento anulado.
+    """
+    return sa_case(
+        (FundMovement.reverses_movement_id.isnot(None), -func.coalesce(column, 0)),
+        else_=func.coalesce(column, 0),
+    )
 
 
 class FundRepository:
@@ -223,10 +237,10 @@ class FundRepository:
 
         signed_amount = sa_case(
             (FundMovement.movement_type == FundMovementType.DEPOSIT,
-             func.coalesce(FundMovement.amount_usdt, 0)),
+             reversal_signed(FundMovement.amount_usdt)),
             (FundMovement.movement_type.in_(
                 [FundMovementType.EXCHANGE, FundMovementType.PERSONAL]),
-             -func.coalesce(FundMovement.amount_usdt, 0)),
+             -reversal_signed(FundMovement.amount_usdt)),
             else_=0,
         )
         chronological = [FundMovement.movement_date.asc(), FundMovement.id.asc()]
@@ -235,7 +249,13 @@ class FundRepository:
             self.db.query(
                 FundMovement.id.label("movement_id"),
                 func.sum(signed_amount).over(order_by=chronological).label("balance_usdt"),
-                func.sum(func.coalesce(Transaction.profit_amount_usdt, 0))
+                func.sum(
+                    sa_case(
+                        (FundMovement.reversed_by_movement_id.is_(None),
+                         func.coalesce(Transaction.profit_amount_usdt, 0)),
+                        else_=0,
+                    )
+                )
                 .over(order_by=chronological)
                 .label("profit_usdt"),
             )
@@ -275,13 +295,15 @@ class FundRepository:
         """
         by_type = self.db.query(
             FundMovement.movement_type,
-            func.coalesce(func.sum(FundMovement.amount_usdt), 0).label("total_usdt"),
+            func.coalesce(func.sum(reversal_signed(FundMovement.amount_usdt)), 0).label("total_usdt"),
             func.count(FundMovement.id).label("count"),
         )
         profit = self.db.query(
             func.coalesce(func.sum(Transaction.profit_amount_usdt), 0).label("total_usdt"),
             func.count(Transaction.id).label("count"),
-        ).join(FundMovement, FundMovement.transaction_id == Transaction.id)
+        ).join(FundMovement, FundMovement.transaction_id == Transaction.id).filter(
+            FundMovement.reversed_by_movement_id.is_(None)
+        )
 
         for query_name, query in (("movements", by_type), ("profit", profit)):
             if group_id:
@@ -350,13 +372,38 @@ class FundRepository:
             if tx_id is not None
         }
 
-    def delete_movement(self, movement_id: int) -> bool:
-        movement = self.db.query(FundMovement).filter(FundMovement.id == movement_id).first()
-        if not movement:
-            return False
-        self.db.delete(movement)
+    def reverse_movement(
+        self, movement: FundMovement, reason: str, actor_id: Optional[int] = None
+    ) -> FundMovement:
+        """
+        Anula un movimiento con otro que lo referencia, en vez de borrarlo.
+
+        La reversa nace con el mismo tipo, monto y gestor del original —para que se lea como
+        «esto anula aquello»— pero cuenta en negativo. Se fecha HOY, no en la fecha del
+        original: el error se corrigió hoy y el extracto tiene que poder contarlo así.
+        """
+        reversal = FundMovement(
+            group_id=movement.group_id,
+            user_id=movement.user_id,
+            movement_type=movement.movement_type,
+            amount=movement.amount,
+            currency=movement.currency,
+            amount_usdt=movement.amount_usdt,
+            usdt_rate=movement.usdt_rate,
+            reference=movement.reference,
+            notes=reason,
+            recorded_by_user_id=actor_id,
+            movement_date=datetime.now(timezone.utc),
+            reverses_movement_id=movement.id,
+        )
+        self.db.add(reversal)
+        self.db.flush()
+
+        movement.reversed_by_movement_id = reversal.id
+        movement.reversed_at = reversal.movement_date
         self.db.commit()
-        return True
+        self.db.refresh(reversal)
+        return reversal
 
     # ===== Cálculos de posición =====
 
@@ -375,20 +422,20 @@ class FundRepository:
         if not group or not user:
             return None
 
-        # Depósitos
+        # Depósitos (una reversa de depósito resta aquí mismo)
         deposit_result = self.db.query(
-            func.coalesce(func.sum(FundMovement.amount), 0).label("total"),
-            func.coalesce(func.sum(FundMovement.amount_usdt), 0).label("total_usdt"),
+            func.coalesce(func.sum(reversal_signed(FundMovement.amount)), 0).label("total"),
+            func.coalesce(func.sum(reversal_signed(FundMovement.amount_usdt)), 0).label("total_usdt"),
         ).filter(
             FundMovement.group_id == group_id,
             FundMovement.user_id == user_id,
             FundMovement.movement_type == FundMovementType.DEPOSIT
         ).first()
 
-        # Salidas (EXCHANGE + PERSONAL)
+        # Salidas (EXCHANGE + PERSONAL), reversas incluidas con signo negativo
         outflow_result = self.db.query(
-            func.coalesce(func.sum(FundMovement.amount), 0).label("total"),
-            func.coalesce(func.sum(FundMovement.amount_usdt), 0).label("total_usdt"),
+            func.coalesce(func.sum(reversal_signed(FundMovement.amount)), 0).label("total"),
+            func.coalesce(func.sum(reversal_signed(FundMovement.amount_usdt)), 0).label("total_usdt"),
         ).filter(
             FundMovement.group_id == group_id,
             FundMovement.user_id == user_id,
@@ -432,16 +479,16 @@ class FundRepository:
 
         member_user_ids = [m.user_id for m in group.members]
 
-        # Posición consolidada de todos los miembros
+        # Posición consolidada de todos los miembros (las reversas restan de su propio tipo)
         deposit_result = self.db.query(
-            func.coalesce(func.sum(FundMovement.amount_usdt), 0).label("total_usdt")
+            func.coalesce(func.sum(reversal_signed(FundMovement.amount_usdt)), 0).label("total_usdt")
         ).filter(
             FundMovement.group_id == group_id,
             FundMovement.movement_type == FundMovementType.DEPOSIT
         ).first()
 
         outflow_result = self.db.query(
-            func.coalesce(func.sum(FundMovement.amount_usdt), 0).label("total_usdt")
+            func.coalesce(func.sum(reversal_signed(FundMovement.amount_usdt)), 0).label("total_usdt")
         ).filter(
             FundMovement.group_id == group_id,
             FundMovement.movement_type.in_([FundMovementType.EXCHANGE, FundMovementType.PERSONAL])

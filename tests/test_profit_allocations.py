@@ -292,3 +292,17 @@ def test_each_movement_carries_the_running_balance_and_profit(service, db, fund_
 
     balance = repo.get_group_balance(fund_with_shares.id)
     assert running[newest.id]["balance_usdt"] == pytest.approx(balance["total_position_usdt"])
+
+
+def test_a_reversed_movement_stops_counting_its_profit(service, db, fund_with_shares, client, operator):
+    """Anular un movimiento con ganancia también la saca de los acumulados."""
+    from app.repositories.fund_repository import FundRepository
+
+    repo = FundRepository(db)
+    _op_from_cop_payment(service, db, fund_with_shares, operator)
+    movement = repo.get_movements(group_id=fund_with_shares.id)[0][0]
+    assert repo.get_movements_totals(group_id=fund_with_shares.id)["profit_usdt"] == pytest.approx(7)
+
+    # (el guard del endpoint impide reversar movimientos de operación; aquí se prueba la suma)
+    repo.reverse_movement(movement, reason="prueba", actor_id=operator.id)
+    assert repo.get_movements_totals(group_id=fund_with_shares.id)["profit_usdt"] == pytest.approx(0)

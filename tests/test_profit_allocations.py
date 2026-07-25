@@ -214,3 +214,81 @@ def test_the_balance_does_not_count_the_same_profit_twice(service, db, fund_with
 
     balance = FundRepository(db).get_group_balance(fund_with_shares.id)
     assert balance["total_profit_usdt"] == pytest.approx(7.0)  # ...no 14
+
+
+def test_history_totals_add_up_over_the_filter(service, db, fund_with_shares, client, operator):
+    """
+    Los acumulados del historial cubren todo lo filtrado: la ganancia por un lado y el
+    capital (entradas contra salidas) por otro, que son cosas distintas.
+    """
+    from app.models.fund import FundMovement, FundMovementType
+    from datetime import datetime, timezone
+
+    _op_from_cop_payment(service, db, fund_with_shares, operator)  # 100 USDT, 7% al fondo
+    db.add(FundMovement(
+        group_id=fund_with_shares.id, user_id=operator.id,
+        movement_type=FundMovementType.DEPOSIT, amount=500, currency="USD",
+        amount_usdt=500, movement_date=datetime.now(timezone.utc),
+    ))
+    db.flush()
+
+    totals = FundRepository(db).get_movements_totals(group_id=fund_with_shares.id)
+
+    assert totals["deposits_usdt"] == pytest.approx(500)
+    assert totals["exchanges_usdt"] == pytest.approx(100)   # el EXCHANGE de la operación
+    assert totals["net_usdt"] == pytest.approx(400)         # entró 500, salieron 100
+    assert totals["profit_usdt"] == pytest.approx(7.0)      # y dejó 7 de ganancia
+    assert totals["profit_count"] == 1
+
+
+def test_history_totals_follow_the_type_filter(service, db, fund_with_shares, client, operator):
+    """Filtrando por un tipo, los acumulados hablan solo de ese tipo."""
+    from app.models.fund import FundMovement, FundMovementType
+    from datetime import datetime, timezone
+
+    _op_from_cop_payment(service, db, fund_with_shares, operator)
+    db.add(FundMovement(
+        group_id=fund_with_shares.id, user_id=operator.id,
+        movement_type=FundMovementType.DEPOSIT, amount=500, currency="USD",
+        amount_usdt=500, movement_date=datetime.now(timezone.utc),
+    ))
+    db.flush()
+
+    totals = FundRepository(db).get_movements_totals(
+        group_id=fund_with_shares.id, movement_type=FundMovementType.DEPOSIT
+    )
+    assert totals["deposits_usdt"] == pytest.approx(500)
+    assert totals["exchanges_usdt"] == 0
+    assert totals["profit_usdt"] == 0  # un depósito no deja ganancia
+
+
+def test_each_movement_carries_the_running_balance_and_profit(service, db, fund_with_shares, client, operator):
+    """
+    El historial es un extracto: cada movimiento dice cómo quedaba el fondo justo después.
+    El acumulado del más reciente tiene que coincidir con la posición del grupo.
+    """
+    from app.models.fund import FundMovement, FundMovementType
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime.now(timezone.utc) - timedelta(days=3)
+    db.add(FundMovement(
+        group_id=fund_with_shares.id, user_id=operator.id,
+        movement_type=FundMovementType.DEPOSIT, amount=500, currency="USD",
+        amount_usdt=500, movement_date=base,
+    ))
+    db.flush()
+    _op_from_cop_payment(service, db, fund_with_shares, operator)  # EXCHANGE de 100, gana 7
+
+    repo = FundRepository(db)
+    movements, _ = repo.get_movements(group_id=fund_with_shares.id)
+    running = repo.get_running_totals(fund_with_shares.id, [m.id for m in movements])
+
+    # get_movements devuelve del más reciente al más viejo.
+    newest, oldest = movements[0], movements[-1]
+    assert running[oldest.id]["balance_usdt"] == pytest.approx(500)   # solo el depósito
+    assert running[oldest.id]["profit_usdt"] == pytest.approx(0)
+    assert running[newest.id]["balance_usdt"] == pytest.approx(400)   # 500 - 100
+    assert running[newest.id]["profit_usdt"] == pytest.approx(7.0)
+
+    balance = repo.get_group_balance(fund_with_shares.id)
+    assert running[newest.id]["balance_usdt"] == pytest.approx(balance["total_position_usdt"])

@@ -205,6 +205,123 @@ class FundRepository:
         movements = query.order_by(FundMovement.movement_date.desc()).offset(skip).limit(limit).all()
         return movements, total
 
+    def get_running_totals(self, group_id: int, movement_ids: List[int]) -> dict:
+        """
+        Saldo y ganancia acumulados HASTA cada uno de esos movimientos, como un extracto
+        bancario: {movement_id: {"balance_usdt": ..., "profit_usdt": ...}}.
+
+        El acumulado se calcula sobre TODO el historial del grupo en orden cronológico y
+        recién después se recortan los movimientos pedidos: si dependiera de la página o del
+        filtro, la misma fila mostraría un saldo distinto según cómo se esté mirando la lista.
+
+        El saldo sigue la misma cuenta que la posición del fondo —los depósitos suman, los
+        cambios y los personales restan, los ajustes no se cuentan—, así que el saldo del
+        movimiento más reciente coincide con la posición del grupo.
+        """
+        if not movement_ids:
+            return {}
+
+        signed_amount = sa_case(
+            (FundMovement.movement_type == FundMovementType.DEPOSIT,
+             func.coalesce(FundMovement.amount_usdt, 0)),
+            (FundMovement.movement_type.in_(
+                [FundMovementType.EXCHANGE, FundMovementType.PERSONAL]),
+             -func.coalesce(FundMovement.amount_usdt, 0)),
+            else_=0,
+        )
+        chronological = [FundMovement.movement_date.asc(), FundMovement.id.asc()]
+
+        running = (
+            self.db.query(
+                FundMovement.id.label("movement_id"),
+                func.sum(signed_amount).over(order_by=chronological).label("balance_usdt"),
+                func.sum(func.coalesce(Transaction.profit_amount_usdt, 0))
+                .over(order_by=chronological)
+                .label("profit_usdt"),
+            )
+            .outerjoin(Transaction, Transaction.id == FundMovement.transaction_id)
+            .filter(FundMovement.group_id == group_id)
+            .subquery()
+        )
+
+        rows = (
+            self.db.query(running.c.movement_id, running.c.balance_usdt, running.c.profit_usdt)
+            .filter(running.c.movement_id.in_(movement_ids))
+            .all()
+        )
+        return {
+            row.movement_id: {
+                "balance_usdt": float(row.balance_usdt or 0),
+                "profit_usdt": float(row.profit_usdt or 0),
+            }
+            for row in rows
+        }
+
+    def get_movements_totals(
+        self,
+        group_id: Optional[int] = None,
+        user_id: Optional[int] = None,
+        movement_type: Optional[FundMovementType] = None,
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None,
+    ) -> dict:
+        """
+        Acumulados de TODO lo que cae bajo el filtro, no de la página que se está viendo:
+        cuánto entró, cuánto salió y cuánta ganancia dejó.
+
+        La ganancia sale de la transacción ligada, así que solo los EXCHANGE que vienen de una
+        operación suman; un depósito no deja ganancia. Por eso los dos acumulados son
+        independientes: uno mide el capital que se movió y el otro lo que se ganó moviéndolo.
+        """
+        by_type = self.db.query(
+            FundMovement.movement_type,
+            func.coalesce(func.sum(FundMovement.amount_usdt), 0).label("total_usdt"),
+            func.count(FundMovement.id).label("count"),
+        )
+        profit = self.db.query(
+            func.coalesce(func.sum(Transaction.profit_amount_usdt), 0).label("total_usdt"),
+            func.count(Transaction.id).label("count"),
+        ).join(FundMovement, FundMovement.transaction_id == Transaction.id)
+
+        for query_name, query in (("movements", by_type), ("profit", profit)):
+            if group_id:
+                query = query.filter(FundMovement.group_id == group_id)
+            if user_id:
+                query = query.filter(FundMovement.user_id == user_id)
+            if movement_type:
+                query = query.filter(FundMovement.movement_type == movement_type)
+            if date_from:
+                query = query.filter(FundMovement.movement_date >= date_from)
+            if date_to:
+                query = query.filter(FundMovement.movement_date <= date_to)
+            if query_name == "movements":
+                by_type = query
+            else:
+                profit = query
+
+        rows = by_type.group_by(FundMovement.movement_type).all()
+        amounts = {row.movement_type: float(row.total_usdt) for row in rows}
+        counts = {row.movement_type: int(row.count) for row in rows}
+        profit_row = profit.first()
+
+        deposits = amounts.get(FundMovementType.DEPOSIT, 0.0)
+        exchanges = amounts.get(FundMovementType.EXCHANGE, 0.0)
+        personal = amounts.get(FundMovementType.PERSONAL, 0.0)
+        adjustments = amounts.get(FundMovementType.ADJUSTMENT, 0.0)
+
+        return {
+            "deposits_usdt": deposits,
+            "deposits_count": counts.get(FundMovementType.DEPOSIT, 0),
+            "exchanges_usdt": exchanges,
+            "exchanges_count": counts.get(FundMovementType.EXCHANGE, 0),
+            "personal_usdt": personal,
+            "adjustments_usdt": adjustments,
+            # Lo que entró menos todo lo que salió: el capital neto del período filtrado.
+            "net_usdt": deposits - (exchanges + personal),
+            "profit_usdt": float(profit_row.total_usdt) if profit_row else 0.0,
+            "profit_count": int(profit_row.count) if profit_row else 0,
+        }
+
     def get_client_names_by_transaction_ids(self, transaction_ids: List[int]) -> dict:
         """
         Mapa {transaction_id: nombre_del_cliente} para las operaciones de WhatsApp ligadas a

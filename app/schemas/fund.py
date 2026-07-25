@@ -112,6 +112,9 @@ class FundMovementResponse(BaseModel):
     profit_percentage: Optional[float] = None
     profit_amount: Optional[float] = None
     profit_amount_usdt: Optional[float] = None
+    # Acumulados hasta este movimiento (extracto): saldo del fondo y ganancia sumada.
+    running_balance_usdt: Optional[float] = None
+    running_profit_usdt: Optional[float] = None
     reference: Optional[str] = None
     notes: Optional[str] = None
     recorded_by_uuid: Optional[UUID] = None
@@ -159,12 +162,28 @@ class FundGroupBalanceResponse(BaseModel):
     by_member: List[UserPositionResponse] = []
 
 
+class FundMovementTotals(BaseModel):
+    """Acumulados de todo lo que cae bajo el filtro, no de la página que se está viendo."""
+    deposits_usdt: float
+    deposits_count: int
+    exchanges_usdt: float
+    exchanges_count: int
+    personal_usdt: float
+    adjustments_usdt: float
+    # Entradas menos salidas (cambios + personales).
+    net_usdt: float
+    # Ganancia dejada por los movimientos que vienen de una operación.
+    profit_usdt: float
+    profit_count: int
+
+
 class FundMovementList(BaseModel):
     movements: List[FundMovementResponse]
     total: int
     page: int
     per_page: int
     total_pages: int
+    totals: Optional[FundMovementTotals] = None
 
 
 # ===== Pending Deposits (detectados por el bot, confirmables desde /admin/funds) =====

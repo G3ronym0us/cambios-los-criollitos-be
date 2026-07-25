@@ -8,7 +8,7 @@ from app.database.connection import get_db
 from app.schemas.fund import (
     FundGroupCreate, FundGroupUpdate, FundGroupResponse,
     FundGroupMemberCreate, FundGroupMemberUpdate, FundGroupMemberResponse,
-    FundMovementCreate, FundMovementResponse, FundMovementList,
+    FundMovementCreate, FundMovementResponse, FundMovementList, FundMovementTotals,
     UserPositionResponse, FundGroupBalanceResponse,
     FundPendingDepositResponse, FundPendingDepositConfirm, FundPendingDepositCreate,
 )
@@ -237,16 +237,29 @@ async def list_group_movements(
     # Cliente por movimiento resuelto en un solo query (no uno por fila).
     tx_ids = [m.transaction_id for m in movements if m.transaction_id]
     client_map = fund_repo.get_client_names_by_transaction_ids(tx_ids)
+    # Acumulados de extracto: dependen de todo el historial, no de esta página.
+    running = fund_repo.get_running_totals(group.id, [m.id for m in movements])
+    totals = fund_repo.get_movements_totals(
+        group_id=group.id,
+        movement_type=type_enum,
+        date_from=date_from,
+        date_to=date_to,
+    )
     total_pages = (total + per_page - 1) // per_page
     return FundMovementList(
         movements=[
-            _serialize_movement(m, client_name=client_map.get(m.transaction_id))
+            _serialize_movement(
+                m,
+                client_name=client_map.get(m.transaction_id),
+                running=running.get(m.id),
+            )
             for m in movements
         ],
         total=total,
         page=page,
         per_page=per_page,
         total_pages=total_pages,
+        totals=FundMovementTotals(**totals),
     )
 
 
@@ -478,7 +491,9 @@ def _resolve_client_name(fund_repo: FundRepository, movement) -> Optional[str]:
     )
 
 
-def _serialize_movement(movement, client_name: Optional[str] = None) -> dict:
+def _serialize_movement(
+    movement, client_name: Optional[str] = None, running: Optional[dict] = None
+) -> dict:
     tx = movement.transaction
     return {
         "uuid": movement.uuid,
@@ -496,6 +511,8 @@ def _serialize_movement(movement, client_name: Optional[str] = None) -> dict:
         "profit_percentage": tx.total_profit_percentage if tx else None,
         "profit_amount": tx.profit_amount if tx else None,
         "profit_amount_usdt": tx.profit_amount_usdt if tx else None,
+        "running_balance_usdt": running.get("balance_usdt") if running else None,
+        "running_profit_usdt": running.get("profit_usdt") if running else None,
         "reference": movement.reference,
         "notes": movement.notes,
         "recorded_by_uuid": movement.recorded_by.uuid if movement.recorded_by else None,

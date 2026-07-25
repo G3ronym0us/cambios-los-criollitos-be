@@ -161,6 +161,34 @@ def test_single_transaction_and_movement_per_operation(service, db, fund, client
     assert len(movs) == 1 and movs[0].amount == 220 and movs[0].currency == "USD"
 
 
+def test_op_from_payment_earns_the_margin_of_the_rate_it_used(service, db, fund, client, operator):
+    """
+    Una op que nace de un comprobante no trae margen cotizado: se lee de la tasa usada contra
+    la base del par, o su transacción quedaría con ganancia 0 aunque se cobró el margen.
+    """
+    cop = f.outgoing(db, 76360, "COP")  # 100 ZELLE a 763.6 (base 830 menos 8%)
+    op = _op(db, f.create_op_from_payment(
+        service, "outgoing", cop, frm="ZELLE", to="COP", from_amount=100, to_amount=76360,
+        fund_uuid=fund.uuid, user_uuid=operator.uuid, recorded_by=operator.id)["uuid"])
+
+    assert op.applied_percentage == 8.0 and op.default_percentage == 8.0
+    tx = db.query(Transaction).filter(Transaction.id == op.transaction_id).first()
+    assert tx.total_profit_percentage == 8.0
+    assert tx.profit_amount == pytest.approx(8.0)  # 100 USDT * 8%
+
+
+def test_op_from_payment_has_no_margin_when_the_pair_defines_none(service, db, fund, client, operator):
+    """Sin margen configurado en el par no hay ganancia que afirmar: mejor 0 que inventada."""
+    brl = f.outgoing(db, 914.04, "BRL")
+    op = _op(db, f.create_op_from_payment(
+        service, "outgoing", brl, frm="ZELLE", to="BRL", from_amount=200, to_amount=914.04,
+        fund_uuid=fund.uuid, user_uuid=operator.uuid, recorded_by=operator.id)["uuid"])
+
+    assert op.applied_percentage is None
+    tx = db.query(Transaction).filter(Transaction.id == op.transaction_id).first()
+    assert (tx.profit_amount or 0) == 0
+
+
 # --------------------------------------------------------------------- reparto de un entrante
 
 def test_split_incoming_across_two_operations(service, db, fund, client, operator):

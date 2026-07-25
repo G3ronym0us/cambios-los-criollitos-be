@@ -40,6 +40,7 @@ from app.services.whatsapp_quote_service import (
     WhatsAppQuoteService,
     is_unassigned_client_phone,
 )
+from app.services.whatsapp_rate_resolver import WhatsAppRateResolver
 
 
 EDITABLE_FIELDS = ["provider", "amount", "currency", "bank_from", "bank_to", "identification", "phone_to", "reference"]
@@ -1354,6 +1355,13 @@ class WhatsAppPaymentService:
         track_delivery = table == "outgoing" and from_currency == "USD"
         # El valor del trato es lo que entrega el cliente; el par y el `to` son la cotización.
         value = valuation.equivalents(self.db, from_amount, from_currency, now)
+        # Una op que nace de un comprobante no trae margen cotizado: sin esto la operación
+        # queda sin ganancia (la transacción la calcula desde `applied_percentage`). Se lee de
+        # la tasa que se terminó usando contra la base del par, así vale igual si el operador
+        # cotizó a la tasa del día o a una propia.
+        rate_used = to_amount / from_amount
+        entry = WhatsAppRateResolver(self.db).get_rate_entry_for_pair(from_currency, to_currency)
+        applied_percentage = WhatsAppRateResolver.implied_margin(entry, rate_used)
         op = WhatsAppOperation(
             client_id=client.id,
             currency_pair_id=pair.id,
@@ -1366,8 +1374,10 @@ class WhatsAppPaymentService:
             valuation_at=now,
             from_amount=from_amount,
             to_amount=to_amount,
-            rate_used=to_amount / from_amount,
+            rate_used=rate_used,
             inverse_percentage=False,
+            applied_percentage=applied_percentage,
+            default_percentage=entry.base_percentage if entry else None,
             amount_side=side,
             status=WhatsAppOperationStatus.PENDING,
             delivery_status=WhatsAppDeliveryStatus.PENDING if track_delivery else None,

@@ -124,7 +124,7 @@ def _currency(db, symbol: str) -> Currency:
     return row
 
 
-def _pair(db, frm: str, to: str, rate: float) -> CurrencyPair:
+def _pair(db, frm: str, to: str, rate: float, percentage: float = None) -> CurrencyPair:
     pair = CurrencyPair(
         from_currency_id=_currency(db, frm).id,
         to_currency_id=_currency(db, to).id,
@@ -135,6 +135,7 @@ def _pair(db, frm: str, to: str, rate: float) -> CurrencyPair:
     db.flush()
     db.add(ExchangeRate(
         currency_pair_id=pair.id, from_currency=frm, to_currency=to, rate=rate, is_active=True,
+        percentage=percentage,
     ))
     db.flush()
     return pair
@@ -146,6 +147,8 @@ def pairs(db) -> dict:
     return {
         "ZELLE-BRL": _pair(db, "ZELLE", "BRL", 4.5702),
         "ZELLE-VES": _pair(db, "ZELLE", "VES", 782.92),
+        # Con margen configurado: la tasa cotizada ya lo trae dentro (base 830 - 8%).
+        "ZELLE-COP": _pair(db, "ZELLE", "COP", 763.6, percentage=8),
     }
 
 

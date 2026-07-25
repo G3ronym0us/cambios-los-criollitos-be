@@ -594,6 +594,13 @@ class WhatsAppQuoteService:
         )
         return tx
 
+    def resync_transaction(self, op: WhatsAppOperation) -> None:
+        """
+        Re-deriva la transacción del valor y el margen actuales de la operación. Para quien
+        corrige la operación por fuera de los flujos que ya la sincronizan solos (CLIs).
+        """
+        self._sync_linked_transaction(op)
+
     def _sync_linked_transaction(self, op: WhatsAppOperation) -> None:
         """Mantiene la transacción derivada como espejo contable del VALOR de la operación."""
         if op.transaction_id is None:

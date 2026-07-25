@@ -187,6 +187,34 @@ class FundRepository:
         movements = query.order_by(FundMovement.movement_date.desc()).offset(skip).limit(limit).all()
         return movements, total
 
+    def get_client_names_by_transaction_ids(self, transaction_ids: List[int]) -> dict:
+        """
+        Mapa {transaction_id: nombre_del_cliente} para las operaciones de WhatsApp ligadas a
+        esas transacciones. Permite mostrar el cliente en el historial de movimientos sin un
+        query por fila. Cae al teléfono si el cliente no tiene display_name.
+        """
+        if not transaction_ids:
+            return {}
+
+        from app.models.whatsapp_operation import WhatsAppOperation
+        from app.models.whatsapp_client import WhatsAppClient
+
+        rows = (
+            self.db.query(
+                WhatsAppOperation.transaction_id,
+                WhatsAppClient.display_name,
+                WhatsAppClient.phone,
+            )
+            .join(WhatsAppClient, WhatsAppOperation.client_id == WhatsAppClient.id)
+            .filter(WhatsAppOperation.transaction_id.in_(transaction_ids))
+            .all()
+        )
+        return {
+            tx_id: (display_name or phone)
+            for tx_id, display_name, phone in rows
+            if tx_id is not None
+        }
+
     def delete_movement(self, movement_id: int) -> bool:
         movement = self.db.query(FundMovement).filter(FundMovement.id == movement_id).first()
         if not movement:

@@ -227,9 +227,15 @@ async def list_group_movements(
         skip=skip,
         limit=per_page,
     )
+    # Cliente por movimiento resuelto en un solo query (no uno por fila).
+    tx_ids = [m.transaction_id for m in movements if m.transaction_id]
+    client_map = fund_repo.get_client_names_by_transaction_ids(tx_ids)
     total_pages = (total + per_page - 1) // per_page
     return FundMovementList(
-        movements=[_serialize_movement(m) for m in movements],
+        movements=[
+            _serialize_movement(m, client_name=client_map.get(m.transaction_id))
+            for m in movements
+        ],
         total=total,
         page=page,
         per_page=per_page,
@@ -306,7 +312,8 @@ async def create_movement(
         notes=movement_data.notes,
         recorded_by_user_id=current_user.id,
     )
-    return _serialize_movement(fund_repo.get_movement_by_uuid(movement.uuid))
+    saved = fund_repo.get_movement_by_uuid(movement.uuid)
+    return _serialize_movement(saved, client_name=_resolve_client_name(fund_repo, saved))
 
 
 @router.get("/movements/{movement_uuid}", response_model=FundMovementResponse)
@@ -320,7 +327,7 @@ async def get_movement(
     movement = fund_repo.get_movement_by_uuid(movement_uuid)
     if not movement:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Movement not found")
-    return _serialize_movement(movement)
+    return _serialize_movement(movement, client_name=_resolve_client_name(fund_repo, movement))
 
 
 @router.delete("/movements/{movement_uuid}", status_code=status.HTTP_204_NO_CONTENT)
@@ -455,7 +462,17 @@ async def get_user_position(
 
 # ===== Serialization helper =====
 
-def _serialize_movement(movement) -> dict:
+def _resolve_client_name(fund_repo: FundRepository, movement) -> Optional[str]:
+    """Nombre del cliente de un único movimiento (endpoints de detalle/creación)."""
+    if not movement or not movement.transaction_id:
+        return None
+    return fund_repo.get_client_names_by_transaction_ids([movement.transaction_id]).get(
+        movement.transaction_id
+    )
+
+
+def _serialize_movement(movement, client_name: Optional[str] = None) -> dict:
+    tx = movement.transaction
     return {
         "uuid": movement.uuid,
         "group_uuid": movement.group.uuid if movement.group else None,
@@ -467,7 +484,11 @@ def _serialize_movement(movement) -> dict:
         "currency": movement.currency,
         "amount_usdt": movement.amount_usdt,
         "usdt_rate": movement.usdt_rate,
-        "transaction_uuid": movement.transaction.uuid if movement.transaction else None,
+        "transaction_uuid": tx.uuid if tx else None,
+        "client_name": client_name,
+        "profit_percentage": tx.total_profit_percentage if tx else None,
+        "profit_amount": tx.profit_amount if tx else None,
+        "profit_amount_usdt": tx.profit_amount_usdt if tx else None,
         "reference": movement.reference,
         "notes": movement.notes,
         "recorded_by_uuid": movement.recorded_by.uuid if movement.recorded_by else None,

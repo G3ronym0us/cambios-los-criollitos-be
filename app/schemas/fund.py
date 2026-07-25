@@ -97,6 +97,12 @@ class FundMovementResponse(BaseModel):
     amount_usdt: Optional[float] = None
     usdt_rate: Optional[float] = None
     transaction_uuid: Optional[UUID] = None
+    # Cliente de la operación ligada (vía la transacción). Solo aplica a EXCHANGE.
+    client_name: Optional[str] = None
+    # Ganancia de la transacción ligada: porcentaje total y monto (nativo + USDT).
+    profit_percentage: Optional[float] = None
+    profit_amount: Optional[float] = None
+    profit_amount_usdt: Optional[float] = None
     reference: Optional[str] = None
     notes: Optional[str] = None
     recorded_by_uuid: Optional[UUID] = None

@@ -32,7 +32,6 @@ from app.models.whatsapp_operation import (
     WhatsAppOperationScenario,
     WhatsAppOperationStatus,
 )
-from app.repositories.commission_config_repository import CommissionConfigRepository
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.repositories.transaction_repository import TransactionRepository
 from app.schemas.transaction import ProfitSplitCreate, TransactionCreate
@@ -46,6 +45,7 @@ from app.schemas.whatsapp import (
 )
 from app.services import valuation
 from app.services.bcv_service import get_cached_bcv_rate
+from app.services.profit_allocation_service import ProfitAllocationService
 from app.services.whatsapp_rate_resolver import WhatsAppRateResolver, apply_rounding
 
 
@@ -511,38 +511,17 @@ class WhatsAppQuoteService:
         # La transacción contabiliza el VALOR del trato → su equivalente USDT, no la cotización.
         value, value_currency, value_usdt, usdt_rate = self._operation_value_usdt(op)
 
-        config_repo = CommissionConfigRepository(self.db)
+        if payload.commission_config_uuid:
+            raise QuoteServiceError(
+                "commission_config_unsupported",
+                "El reparto de una operación lo definen sus destinos (fondos/cliente), "
+                "no una configuración de comisión por par",
+                400,
+            )
 
-        # El margen aplicado en la cotización es la ganancia total real de esta
-        # operación. La configuración opcional define cómo se reparte, no sustituye
-        # el margen que se le cotizó al cliente.
-        total_pct = float(op.applied_percentage or 0.0)
-        profit_splits: Optional[list[ProfitSplitCreate]] = None
-        commission_config_uuid = payload.commission_config_uuid
-        config = None
-
-        if commission_config_uuid:
-            config = config_repo.get_by_uuid(commission_config_uuid)
-            if not config:
-                raise QuoteServiceError("config_not_found", "Commission config no existe", 404)
-            if not config.is_active:
-                raise QuoteServiceError("config_inactive", f"Commission config '{config.name}' no activa", 400)
-            config_total = float(config.total_percentage)
-            if op.applied_percentage is None:
-                total_pct = config_total
-                op.applied_percentage = total_pct
-
-            # Mantiene las proporciones del reparto configurado, ajustadas al margen
-            # efectivo de la operación. Con ganancia 0 no se crean splits para evitar
-            # una división por cero al calcular sus montos.
-            if total_pct > 0 and config_total > 0:
-                profit_splits = [
-                    ProfitSplitCreate(
-                        user_uuid=split.user.uuid,
-                        profit_percentage=(float(split.percentage) / config_total) * total_pct,
-                    )
-                    for split in config.splits
-                ]
+        # Lo que se le cobró al cliente se reparte entre destinos; el negocio contabiliza como
+        # ganancia lo que se quedan los fondos, y cada fondo lo divide entre sus socios.
+        total_pct, profit_splits = self._profit_from_allocations(op, value_usdt)
 
         if op.transaction_id is not None:
             tx = self.db.query(Transaction).filter(Transaction.id == op.transaction_id).first()
@@ -550,23 +529,6 @@ class WhatsAppQuoteService:
                 raise QuoteServiceError("transaction_not_found", "Transaction vinculada no encontrada", 409)
 
             self._sync_linked_transaction(op)
-            if config is not None:
-                self.db.query(TransactionProfitSplit).filter(
-                    TransactionProfitSplit.transaction_id == tx.id
-                ).delete(synchronize_session=False)
-                # La ganancia sale del valor (en USDT), no del `to` de la cotización.
-                profit_amount = value_usdt * total_pct / 100
-                for split_data, config_split in zip(profit_splits or [], config.splits):
-                    ratio = split_data.profit_percentage / total_pct if total_pct else 0
-                    self.db.add(
-                        TransactionProfitSplit(
-                            transaction_id=tx.id,
-                            user_id=config_split.user.id,
-                            profit_percentage=split_data.profit_percentage,
-                            profit_amount=profit_amount * ratio,
-                            settlement_currency=config_split.user.preferred_settlement_currency,
-                        )
-                    )
             return tx
 
         tx_create = TransactionCreate(
@@ -601,6 +563,68 @@ class WhatsAppQuoteService:
         """
         self._sync_linked_transaction(op)
 
+    def _profit_from_allocations(
+        self, op: WhatsAppOperation, value_usdt: float
+    ) -> tuple[float, Optional[list[ProfitSplitCreate]]]:
+        """
+        Cuánta ganancia contabiliza la transacción y cómo se reparte entre socios.
+
+        Sale del reparto de la operación: los fondos son la ganancia del negocio, cada uno
+        dividido entre sus socios. Una operación sin fondo no reparte y su ganancia sigue
+        siendo el margen cobrado, sin atribuir a nadie.
+        """
+        allocation_svc = ProfitAllocationService(self.db)
+        allocations = allocation_svc.ensure_defaults(op)
+        if not allocations:
+            return float(op.applied_percentage or 0.0), None
+
+        allocation_svc.sync_amounts(op, value_usdt)
+        total_pct = allocation_svc.fund_percentage(op)
+        if total_pct <= 0:
+            return 0.0, None
+
+        splits = [
+            ProfitSplitCreate(user_uuid=user.uuid, profit_percentage=percentage)
+            for user, percentage in allocation_svc.member_shares(op)
+            if percentage > 0
+        ]
+        return total_pct, splits or None
+
+    def _rebuild_profit_splits(
+        self, tx: Transaction, op: WhatsAppOperation, value_usdt: float
+    ) -> None:
+        """
+        Rehace el reparto por socio de una transacción desde el reparto de la operación. Lo
+        que no le toca a ningún socio (un fondo sin partes configuradas) se queda en la
+        transacción sin atribuir, que es mejor que inventarle un dueño.
+        """
+        self.db.query(TransactionProfitSplit).filter(
+            TransactionProfitSplit.transaction_id == tx.id
+        ).delete(synchronize_session=False)
+
+        for user, percentage in ProfitAllocationService(self.db).member_shares(op):
+            if percentage <= 0:
+                continue
+            amount = round(float(value_usdt or 0) * percentage / 100, 6)
+            settlement_currency = user.preferred_settlement_currency
+            self.db.add(
+                TransactionProfitSplit(
+                    transaction_id=tx.id,
+                    user_id=user.id,
+                    profit_percentage=percentage,
+                    profit_amount=amount,
+                    profit_amount_usdt=amount,
+                    settlement_currency=settlement_currency,
+                    settlement_amount=(
+                        amount
+                        if settlement_currency and settlement_currency.upper() in ("USD", "USDT")
+                        else None
+                    ),
+                )
+            )
+        self.db.flush()
+        self.db.expire(tx, ["profit_splits"])
+
     def _sync_linked_transaction(self, op: WhatsAppOperation) -> None:
         """Mantiene la transacción derivada como espejo contable del VALOR de la operación."""
         if op.transaction_id is None:
@@ -613,7 +637,14 @@ class WhatsAppQuoteService:
         value, value_currency, value_usdt, usdt_rate = self._operation_value_usdt(op)
         previous_profit = float(tx.profit_amount or 0)
         previous_total = float(tx.total_profit_percentage or 0)
-        total_pct = float(op.applied_percentage or 0)
+
+        allocation_svc = ProfitAllocationService(self.db)
+        allocations = allocation_svc.ensure_defaults(op)
+        if allocations:
+            allocation_svc.sync_amounts(op, value_usdt)
+            total_pct = allocation_svc.fund_percentage(op)
+        else:
+            total_pct = float(op.applied_percentage or 0)
         # Ganancia sobre el valor, en USDT (el `to` de la transacción ya es USDT).
         profit_amount = value_usdt * total_pct / 100
 
@@ -629,7 +660,11 @@ class WhatsAppQuoteService:
         tx.status = TransactionStatus[op.status.name]
         tx.completed_at = op.completed_at if op.status == WhatsAppOperationStatus.COMPLETED else None
 
-        if tx.profit_splits and previous_total > 0:
+        if allocations:
+            # Con reparto, los splits se rehacen: son una consecuencia de él, no un dato propio.
+            self._rebuild_profit_splits(tx, op, value_usdt)
+        elif tx.profit_splits and previous_total > 0:
+            # Sin reparto (transacciones anteriores a este modelo) se escalan los que ya tenía.
             profit_scale = profit_amount / previous_profit if previous_profit else None
             all_splits_have_usdt = True
             total_profit_usdt = 0.0

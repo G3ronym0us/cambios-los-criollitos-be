@@ -45,6 +45,7 @@ async def create_fund_group(
         currency=group_data.currency,
         description=group_data.description,
         whatsapp_group_jid=group_data.whatsapp_group_jid,
+        default_profit_percentage=group_data.default_profit_percentage,
     )
     return group
 
@@ -67,7 +68,7 @@ async def update_fund_group(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_moderator_user),
 ):
-    """Actualizar un grupo (JID de WhatsApp). Requiere moderador."""
+    """Actualizar un grupo (JID de WhatsApp, ganancia por defecto). Requiere moderador."""
     fund_repo = FundRepository(db)
     group = fund_repo.get_group_by_uuid(group_uuid)
     if not group:
@@ -76,6 +77,10 @@ async def update_fund_group(
         fund_repo.update_group_whatsapp_jid(group, None)
     elif payload.whatsapp_group_jid is not None:
         fund_repo.update_group_whatsapp_jid(group, payload.whatsapp_group_jid)
+    if payload.clear_default_profit_percentage:
+        fund_repo.update_group_profit_percentage(group, None)
+    elif payload.default_profit_percentage is not None:
+        fund_repo.update_group_profit_percentage(group, payload.default_profit_percentage)
     return fund_repo.get_group_by_uuid(group_uuid)
 
 
@@ -111,6 +116,7 @@ async def add_group_member(
         user_id=user.id,
         is_fund_manager=member_data.is_fund_manager,
         whatsapp_phone=user.phone_number,
+        profit_share_percentage=member_data.profit_share_percentage,
     )
     return member
 
@@ -123,7 +129,7 @@ async def update_group_member(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_moderator_user),
 ):
-    """Actualizar un miembro (número de WhatsApp del socio / rol). Requiere moderador."""
+    """Actualizar un miembro (rol, parte de la ganancia). Requiere moderador."""
     fund_repo = FundRepository(db)
     user_repo = UserRepository(db)
 
@@ -143,6 +149,7 @@ async def update_group_member(
         is_fund_manager=payload.is_fund_manager,
         whatsapp_phone=user.phone_number,
         clear_whatsapp_phone=user.phone_number is None,
+        profit_share_percentage=payload.profit_share_percentage,
     )
 
 

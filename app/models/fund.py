@@ -64,6 +64,9 @@ class FundGroup(UUIDMixin, Base):
     # JID del grupo de WhatsApp (...@g.us) asociado a este fondo. Permite que el backend
     # resuelva el FundGroup a partir del JID que el bot manda al reenviar capturas.
     whatsapp_group_jid = Column(String(64), nullable=True, index=True)
+    # Cuánto del margen cobrado se queda este fondo, salvo que la operación diga otra cosa
+    # (lo cobrado suele ser más: 8% al cliente, 7% al fondo). NULL = todo lo cobrado.
+    default_profit_percentage = Column(Float, nullable=True)
     description = Column(Text, nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -82,6 +85,7 @@ class FundGroup(UUIDMixin, Base):
             "name": self.name,
             "currency": self.currency,
             "whatsapp_group_jid": self.whatsapp_group_jid,
+            "default_profit_percentage": self.default_profit_percentage,
             "description": self.description,
             "is_active": self.is_active,
             "created_at": self.created_at,
@@ -101,6 +105,8 @@ class FundGroupMember(UUIDMixin, Base):
     group_id = Column(Integer, ForeignKey("fund_groups.id", ondelete="CASCADE"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     is_fund_manager = Column(Boolean, default=False, nullable=False)
+    # Qué parte de la ganancia del fondo le toca a este socio (los del grupo suman 100).
+    profit_share_percentage = Column(Float, nullable=True)
     # Número de WhatsApp del socio. Si está seteado (y is_fund_manager), el bot detecta
     # los mensajes de este número como entrantes reportados por el socio (escenario VIA_PARTNER).
     whatsapp_phone = Column(String(32), nullable=True, index=True)
@@ -132,6 +138,7 @@ class FundGroupMember(UUIDMixin, Base):
             "user_uuid": self.user.uuid if self.user else None,
             "username": self.user.username if self.user else None,
             "is_fund_manager": self.is_fund_manager,
+            "profit_share_percentage": self.profit_share_percentage,
             "whatsapp_phone": self.whatsapp_phone,
             "joined_at": self.joined_at,
         }

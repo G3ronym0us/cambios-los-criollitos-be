@@ -134,6 +134,12 @@ class WhatsAppOperation(UUIDMixin, Base):
         viewonly=True,
     )
     currency_pair = relationship("CurrencyPair", lazy="joined")
+    # Quién se queda con cada pedazo del margen cobrado (fondos, cliente).
+    profit_allocations = relationship(
+        "OperationProfitAllocation",
+        back_populates="operation",
+        cascade="all, delete-orphan",
+    )
     transaction = relationship("Transaction", foreign_keys=[transaction_id])
     fund_group = relationship("FundGroup", foreign_keys=[fund_group_id])
     received_by = relationship("User", foreign_keys=[received_by_user_id])

@@ -103,6 +103,36 @@ def operator(db) -> User:
 
 
 @pytest.fixture
+def partner(db) -> User:
+    """El segundo socio del fondo, para probar el reparto de la ganancia."""
+    user = User(
+        username="socio", email="socio@test.local", hashed_password="x",
+        is_active=True, is_verified=True, preferred_settlement_currency="USD",
+    )
+    db.add(user)
+    db.flush()
+    return user
+
+
+@pytest.fixture
+def fund_with_shares(db, fund, operator, partner) -> FundGroup:
+    """
+    El fondo como lo configura el operador: se queda 7 de cada 8 cobrados y lo reparte
+    50/50 entre sus dos socios.
+    """
+    fund.default_profit_percentage = 7.0
+    member = db.query(FundGroupMember).filter(
+        FundGroupMember.group_id == fund.id, FundGroupMember.user_id == operator.id
+    ).first()
+    member.profit_share_percentage = 50.0
+    db.add(FundGroupMember(
+        group_id=fund.id, user_id=partner.id, profit_share_percentage=50.0,
+    ))
+    db.flush()
+    return fund
+
+
+@pytest.fixture
 def bot_user(db) -> User:
     """Usuario de servicio del bot (algunos flujos lo exigen por email)."""
     from app.core.config import settings

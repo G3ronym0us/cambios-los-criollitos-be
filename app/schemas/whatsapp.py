@@ -490,3 +490,56 @@ class BcvRateResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# ===== Reparto del margen de una operación =====
+
+class ProfitAllocationItem(BaseModel):
+    """Un destino del margen: un fondo o el propio cliente, con su porcentaje."""
+    destination_type: str = Field(..., pattern="^(FUND|CLIENT|fund|client)$")
+    fund_group_uuid: Optional[UUID] = None
+    client_uuid: Optional[UUID] = None
+    percentage: float = Field(..., gt=0, le=99)
+    notes: Optional[str] = None
+
+    @validator("fund_group_uuid", always=True)
+    def _fund_needs_group(cls, v, values):
+        if values.get("destination_type", "").upper() == "FUND" and v is None:
+            raise ValueError("Un destino de tipo FUND necesita fund_group_uuid")
+        return v
+
+    @validator("client_uuid", always=True)
+    def _client_needs_client(cls, v, values):
+        if values.get("destination_type", "").upper() == "CLIENT" and v is None:
+            raise ValueError("Un destino de tipo CLIENT necesita client_uuid")
+        return v
+
+
+class ProfitAllocationResponse(BaseModel):
+    uuid: UUID
+    destination_type: str
+    fund_group_uuid: Optional[UUID] = None
+    client_uuid: Optional[UUID] = None
+    destination_name: Optional[str] = None
+    percentage: float
+    amount_usdt: Optional[float] = None
+    approved_by_uuid: Optional[UUID] = None
+    approved_at: Optional[datetime] = None
+    notes: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ProfitAllocationUpdate(BaseModel):
+    allocations: List[ProfitAllocationItem]
+
+
+class ProfitAllocationList(BaseModel):
+    """El reparto de una operación, con lo cobrado como referencia."""
+    operation_uuid: UUID
+    charged_percentage: Optional[float] = None   # lo que se le cobró al cliente
+    allocated_percentage: float                  # la suma de los destinos
+    unallocated_percentage: float                # lo que sobra (negativo: se repartió de más)
+    value_usdt: Optional[float] = None
+    allocations: List[ProfitAllocationResponse] = []

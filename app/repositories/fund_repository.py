@@ -5,8 +5,10 @@ from datetime import datetime
 from uuid import UUID
 
 from app.models.fund import FundGroup, FundGroupMember, FundMovement, FundMovementType
+from app.models.profit_allocation import OperationProfitAllocation, ProfitAllocationDestination
 from app.models.user import User
 from app.models.transaction import Transaction, TransactionProfitSplit, TransactionStatus
+from app.models.whatsapp_operation import WhatsAppOperation
 
 
 class FundRepository:
@@ -21,12 +23,14 @@ class FundRepository:
         currency: str,
         description: Optional[str] = None,
         whatsapp_group_jid: Optional[str] = None,
+        default_profit_percentage: Optional[float] = None,
     ) -> FundGroup:
         group = FundGroup(
             name=name,
             currency=currency.upper(),
             description=description,
             whatsapp_group_jid=whatsapp_group_jid,
+            default_profit_percentage=default_profit_percentage,
         )
         self.db.add(group)
         self.db.commit()
@@ -35,6 +39,15 @@ class FundRepository:
 
     def update_group_whatsapp_jid(self, group: FundGroup, jid: Optional[str]) -> FundGroup:
         group.whatsapp_group_jid = jid
+        self.db.commit()
+        self.db.refresh(group)
+        return group
+
+    def update_group_profit_percentage(
+        self, group: FundGroup, percentage: Optional[float]
+    ) -> FundGroup:
+        """Cuánto del margen cobrado se queda el fondo por defecto. None = todo lo cobrado."""
+        group.default_profit_percentage = percentage
         self.db.commit()
         self.db.refresh(group)
         return group
@@ -61,12 +74,14 @@ class FundRepository:
         user_id: int,
         is_fund_manager: bool = False,
         whatsapp_phone: Optional[str] = None,
+        profit_share_percentage: Optional[float] = None,
     ) -> FundGroupMember:
         member = FundGroupMember(
             group_id=group_id,
             user_id=user_id,
             is_fund_manager=is_fund_manager,
             whatsapp_phone=whatsapp_phone,
+            profit_share_percentage=profit_share_percentage,
         )
         self.db.add(member)
         self.db.commit()
@@ -79,9 +94,12 @@ class FundRepository:
         is_fund_manager: Optional[bool] = None,
         whatsapp_phone: Optional[str] = None,
         clear_whatsapp_phone: bool = False,
+        profit_share_percentage: Optional[float] = None,
     ) -> FundGroupMember:
         if is_fund_manager is not None:
             member.is_fund_manager = is_fund_manager
+        if profit_share_percentage is not None:
+            member.profit_share_percentage = profit_share_percentage
         if clear_whatsapp_phone:
             member.whatsapp_phone = None
         elif whatsapp_phone is not None:
@@ -316,16 +334,38 @@ class FundRepository:
         total_outflow_usdt = float(outflow_result.total_usdt)
         total_position_usdt = total_deposited_usdt - total_outflow_usdt
 
-        # Ganancia acumulada: splits de miembros MENOS splits de agentes externos
-        # en las mismas transacciones COMPLETED.
-        # Replica la columna "Acumulada" del Excel:
-        #   ganancia_neta = sum(member_splits) - sum(non_member_agent_splits)
-        # Subquery: IDs de transacciones donde al menos un miembro del grupo tiene split
+        # Ganancia acumulada, de dos fuentes que no se pisan:
+        #
+        # 1. Lo que las operaciones le asignaron a ESTE fondo (`operation_profit_allocations`).
+        allocated_result = self.db.query(
+            func.coalesce(func.sum(OperationProfitAllocation.amount_usdt), 0).label("total")
+        ).join(
+            WhatsAppOperation,
+            WhatsAppOperation.id == OperationProfitAllocation.whatsapp_operation_id,
+        ).join(
+            Transaction, Transaction.id == WhatsAppOperation.transaction_id
+        ).filter(
+            OperationProfitAllocation.fund_group_id == group_id,
+            OperationProfitAllocation.destination_type == ProfitAllocationDestination.FUND,
+            Transaction.status == TransactionStatus.COMPLETED,
+        ).first()
+
+        # 2. Lo anterior al reparto: splits de miembros MENOS splits de agentes externos en
+        #    las mismas transacciones COMPLETED, la columna "Acumulada" del Excel original.
+        #    Solo cuenta las transacciones SIN reparto, o se sumaría dos veces lo mismo.
+        allocated_tx_subq = (
+            self.db.query(WhatsAppOperation.transaction_id)
+            .join(
+                OperationProfitAllocation,
+                OperationProfitAllocation.whatsapp_operation_id == WhatsAppOperation.id,
+            )
+            .filter(WhatsAppOperation.transaction_id.isnot(None))
+        )
         member_tx_subq = (
             self.db.query(TransactionProfitSplit.transaction_id)
             .filter(TransactionProfitSplit.user_id.in_(member_user_ids))
         )
-        profit_result = self.db.query(
+        legacy_result = self.db.query(
             func.coalesce(
                 func.sum(
                     sa_case(
@@ -341,9 +381,10 @@ class FundRepository:
              Transaction.status == TransactionStatus.COMPLETED,
              TransactionProfitSplit.profit_amount_usdt.isnot(None),
              TransactionProfitSplit.transaction_id.in_(member_tx_subq),
+             TransactionProfitSplit.transaction_id.notin_(allocated_tx_subq),
          ).first()
 
-        total_profit_usdt = float(profit_result.total)
+        total_profit_usdt = float(allocated_result.total) + float(legacy_result.total)
         available_funds_usdt = total_profit_usdt + total_position_usdt
 
         # Posición individual de cada miembro

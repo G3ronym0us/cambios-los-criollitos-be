@@ -12,23 +12,30 @@ class FundGroupCreate(BaseModel):
     description: Optional[str] = None
     # JID del grupo de WhatsApp (...@g.us) para resolver el FundGroup desde el bot.
     whatsapp_group_jid: Optional[str] = Field(None, max_length=64)
+    # Cuánto del margen cobrado se queda el fondo (7 de un 8 cobrado). NULL = todo.
+    default_profit_percentage: Optional[float] = Field(None, ge=0, le=99)
 
 
 class FundGroupUpdate(BaseModel):
-    """Actualización parcial de un grupo (de momento solo el JID de WhatsApp)."""
+    """Actualización parcial de un grupo: JID de WhatsApp y ganancia por defecto."""
     whatsapp_group_jid: Optional[str] = Field(None, max_length=64)
     clear_whatsapp_group_jid: bool = False
+    default_profit_percentage: Optional[float] = Field(None, ge=0, le=99)
+    clear_default_profit_percentage: bool = False
 
 
 class FundGroupMemberCreate(BaseModel):
     user_uuid: UUID
     is_fund_manager: bool = False
+    # Parte de la ganancia del fondo que le toca (los socios del grupo suman 100).
+    profit_share_percentage: Optional[float] = Field(None, ge=0, le=100)
     # Número de WhatsApp del socio: activa la detección automática del escenario VIA_PARTNER.
     whatsapp_phone: Optional[str] = Field(None, max_length=32)
 
 
 class FundGroupMemberUpdate(BaseModel):
     is_fund_manager: Optional[bool] = None
+    profit_share_percentage: Optional[float] = Field(None, ge=0, le=100)
     whatsapp_phone: Optional[str] = Field(None, max_length=32)
     clear_whatsapp_phone: bool = False
 
@@ -38,6 +45,7 @@ class FundGroupMemberResponse(BaseModel):
     user_uuid: UUID
     username: Optional[str] = None
     is_fund_manager: bool
+    profit_share_percentage: Optional[float] = None
     whatsapp_phone: Optional[str] = None
     joined_at: datetime
 
@@ -52,6 +60,7 @@ class FundGroupResponse(BaseModel):
     description: Optional[str] = None
     is_active: bool
     whatsapp_group_jid: Optional[str] = None
+    default_profit_percentage: Optional[float] = None
     created_at: datetime
     members: List[FundGroupMemberResponse] = []
 

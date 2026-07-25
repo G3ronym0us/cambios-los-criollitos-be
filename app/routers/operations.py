@@ -22,6 +22,9 @@ from app.database.connection import get_db
 from app.models.user import User
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from app.schemas.whatsapp import (
+    ProfitAllocationList,
+    ProfitAllocationResponse,
+    ProfitAllocationUpdate,
     WhatsAppBalanceDebit,
     WhatsAppOperationList,
     WhatsAppOperationResponse,
@@ -31,6 +34,7 @@ from app.schemas.whatsapp import (
     WhatsAppOperationValue,
     WhatsAppStatsResponse,
 )
+from app.services.profit_allocation_service import ProfitAllocationService
 from app.services.whatsapp_balance_service import WhatsAppBalanceService
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
 from app.services.whatsapp_quote_service import QuoteServiceError, WhatsAppQuoteService
@@ -238,3 +242,67 @@ async def update_operation_scenario(
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
     return WhatsAppOperationResponse.model_validate(op.dict())
+
+
+@router.get("/{op_uuid}/profit-allocations", response_model=ProfitAllocationList)
+async def get_profit_allocations(
+    op_uuid: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Quién se queda con el margen de esta operación, y cuánto quedó sin asignar."""
+    service = WhatsAppQuoteService(db)
+    op = service.get_by_uuid(op_uuid)
+    if op is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Operación no encontrada")
+    return _profit_allocation_list(db, op)
+
+
+@router.put("/{op_uuid}/profit-allocations", response_model=ProfitAllocationList)
+async def set_profit_allocations(
+    op_uuid: UUID,
+    payload: ProfitAllocationUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """
+    Redefine el reparto: normalmente todo al fondo por su porcentaje, pero admite varios
+    destinos (otro fondo, o devolverle parte al cliente que hizo de intermediario).
+
+    Repartir más de lo cobrado se acepta y queda firmado con quién lo aprobó. Al guardar se
+    recalcula la ganancia de la transacción y el reparto entre socios. Requiere moderador.
+    """
+    service = WhatsAppQuoteService(db)
+    op = service.get_by_uuid(op_uuid)
+    if op is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Operación no encontrada")
+
+    allocation_svc = ProfitAllocationService(db)
+    try:
+        allocation_svc.set_allocations(
+            op,
+            [item.model_dump() for item in payload.allocations],
+            actor=current_user,
+        )
+        service.resync_transaction(op)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+    db.commit()
+    db.refresh(op)
+    return _profit_allocation_list(db, op)
+
+
+def _profit_allocation_list(db: Session, op) -> ProfitAllocationList:
+    allocation_svc = ProfitAllocationService(db)
+    allocations = allocation_svc.allocations(op)
+    return ProfitAllocationList(
+        operation_uuid=op.uuid,
+        charged_percentage=op.applied_percentage,
+        allocated_percentage=round(sum(float(a.percentage or 0) for a in allocations), 4),
+        unallocated_percentage=allocation_svc.unallocated_percentage(op),
+        value_usdt=op.amount_usdt,
+        allocations=[ProfitAllocationResponse(**a.dict()) for a in allocations],
+    )

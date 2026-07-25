@@ -177,16 +177,32 @@ def test_op_from_payment_earns_the_margin_of_the_rate_it_used(service, db, fund,
     assert tx.profit_amount == pytest.approx(8.0)  # 100 USDT * 8%
 
 
-def test_op_from_payment_has_no_margin_when_the_pair_defines_none(service, db, fund, client, operator):
-    """Sin margen configurado en el par no hay ganancia que afirmar: mejor 0 que inventada."""
+def test_op_paid_at_the_pair_rate_earns_nothing(service, db, fund, client, operator):
+    """Pagar al cliente a la tasa del par es margen cero, y cero no deja ganancia."""
     brl = f.outgoing(db, 914.04, "BRL")
     op = _op(db, f.create_op_from_payment(
         service, "outgoing", brl, frm="ZELLE", to="BRL", from_amount=200, to_amount=914.04,
         fund_uuid=fund.uuid, user_uuid=operator.uuid, recorded_by=operator.id)["uuid"])
 
-    assert op.applied_percentage is None
+    assert op.applied_percentage == 0.0
     tx = db.query(Transaction).filter(Transaction.id == op.transaction_id).first()
     assert (tx.profit_amount or 0) == 0
+
+
+def test_paying_the_client_under_the_rate_is_read_as_the_margin(service, db, fund, client, operator):
+    """
+    Lo que pide el operador: que el sistema deduzca el porcentaje de lo que escribió y lo que
+    pagó. 200 ZELLE pagados como 850 BRL, con el par en 4,5702 → 7% cobrado.
+    """
+    brl = f.outgoing(db, 850, "BRL")
+    op = _op(db, f.create_op_from_payment(
+        service, "outgoing", brl, frm="ZELLE", to="BRL", from_amount=200, to_amount=850,
+        fund_uuid=fund.uuid, user_uuid=operator.uuid, recorded_by=operator.id)["uuid"])
+
+    # 850/200 = 4,25 contra 4,5702 → 7,0%
+    assert op.applied_percentage == pytest.approx(7.0, abs=0.05)
+    tx = db.query(Transaction).filter(Transaction.id == op.transaction_id).first()
+    assert tx.profit_amount == pytest.approx(200 * 0.07, abs=0.2)
 
 
 # --------------------------------------------------------------------- reparto de un entrante
@@ -244,3 +260,33 @@ def test_unlinking_only_payment_requires_a_decision(service, db, fund, client, o
 def _item(op_uuid, amount):
     from types import SimpleNamespace
     return SimpleNamespace(operation_uuid=op_uuid, amount=amount)
+
+
+def test_a_fund_in_another_currency_takes_the_value_converted(service, db, client, operator):
+    """
+    Un fondo en BRL que atiende un trato de 21 USDT saca reales, no dólares: el movimiento va
+    en la moneda del fondo. Antes esto era un 400 y la operación no se podía crear.
+    """
+    from app.models.fund import FundGroup, FundGroupMember, FundMovement
+
+    brasil = FundGroup(name="Cambios Brasil", currency="BRL", is_active=True)
+    db.add(brasil)
+    db.flush()
+    db.add(FundGroupMember(group_id=brasil.id, user_id=operator.id, is_fund_manager=True))
+    db.flush()
+
+    # 21 USDT valen 106,64 BRL a la tasa del par (5,078 en el fixture ZELLE-BRL no aplica:
+    # se valora USDT→BRL con la tasa vigente).
+    pix = f.outgoing(db, 106.64, "BRL")
+    res = f.create_op_from_payment(
+        service, "outgoing", pix, frm="USDT", to="BRL", from_amount=21, to_amount=106.64,
+        fund_uuid=brasil.uuid, user_uuid=operator.uuid, recorded_by=operator.id,
+    )
+    op = _op(db, res["uuid"])
+
+    movement = (
+        db.query(FundMovement).filter(FundMovement.transaction_id == op.transaction_id).first()
+    )
+    assert movement is not None
+    assert movement.currency == "BRL"          # la moneda del fondo, no la del trato
+    assert movement.amount_usdt == pytest.approx(21, abs=0.01)

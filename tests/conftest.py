@@ -179,6 +179,8 @@ def pairs(db) -> dict:
         "ZELLE-VES": _pair(db, "ZELLE", "VES", 782.92),
         # Con margen configurado: la tasa cotizada ya lo trae dentro (base 830 - 8%).
         "ZELLE-COP": _pair(db, "ZELLE", "COP", 763.6, percentage=8),
+        # Para valorar en un fondo que no lleva la moneda del trato (fondo BRL, trato USDT).
+        "USDT-BRL": _pair(db, "USDT", "BRL", 5.078),
     }
 
 

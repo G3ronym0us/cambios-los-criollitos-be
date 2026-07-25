@@ -204,10 +204,11 @@ class TestImpliedMargin:
         base = entry.base_rate  # 860
         assert WhatsAppRateResolver.implied_margin(entry, base * 0.95) == pytest.approx(5.0)
 
-    def test_none_when_the_pair_has_no_margin(self, db_session):
+    def test_quoting_at_the_pair_rate_reads_zero(self, db_session):
+        """Sin margen configurado y cotizando a la tasa del par: 0%, que es la verdad."""
         _add_rate(db_session, "ZELLE", "VES", 791.2)
         entry = WhatsAppRateResolver(db_session).get_rate_entry_for_pair("ZELLE", "VES")
-        assert WhatsAppRateResolver.implied_margin(entry, 791.2) is None
+        assert WhatsAppRateResolver.implied_margin(entry, 791.2) == 0.0
 
     def test_none_when_out_of_a_commercial_range(self, db_session):
         _add_rate(db_session, "ZELLE", "VES", 791.2, percentage=8.0)
@@ -221,3 +222,27 @@ class TestImpliedMargin:
         entry = WhatsAppRateResolver(db_session).get_rate_entry_for_pair("ZELLE", "VES")
         assert WhatsAppRateResolver.implied_margin(None, 791.2) is None
         assert WhatsAppRateResolver.implied_margin(entry, 0) is None
+
+
+class TestImpliedMarginWithoutConfiguredMargin:
+    """
+    Un par sin margen configurado (la tasa cruda de Binance, p. ej. USDT-BRL) igual permite
+    leer lo que se cobró: lo que se le pagó al cliente contra la tasa del par.
+    """
+
+    def test_paying_under_the_pair_rate_is_the_margin(self, db_session):
+        _add_rate(db_session, "USDT", "BRL", 5.078)  # sin percentage
+        entry = WhatsAppRateResolver(db_session).get_rate_entry_for_pair("USDT", "BRL")
+        assert entry.base_percentage is None
+        # 21 USDT pagados como 100 BRL → 4,7619 por USDT
+        assert WhatsAppRateResolver.implied_margin(entry, 100 / 21) == pytest.approx(6.23, abs=0.01)
+
+    def test_paying_at_the_pair_rate_is_zero_not_unknown(self, db_session):
+        _add_rate(db_session, "USDT", "BRL", 5.078)
+        entry = WhatsAppRateResolver(db_session).get_rate_entry_for_pair("USDT", "BRL")
+        assert WhatsAppRateResolver.implied_margin(entry, 5.078) == 0.0
+
+    def test_a_rate_that_is_not_from_this_pair_still_reads_nothing(self, db_session):
+        _add_rate(db_session, "USDT", "BRL", 5.078)
+        entry = WhatsAppRateResolver(db_session).get_rate_entry_for_pair("USDT", "BRL")
+        assert WhatsAppRateResolver.implied_margin(entry, 800.0) is None

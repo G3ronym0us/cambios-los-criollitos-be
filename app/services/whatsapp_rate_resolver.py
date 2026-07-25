@@ -110,11 +110,14 @@ class WhatsAppRateResolver:
         queda `to_amount / from_amount`. Se compara contra la tasa base del par en esas mismas
         unidades, así que sirve igual para pares directos que inversos.
 
-        Devuelve None cuando no hay margen que leer —el par no lo define (BCV, manual, cruce
-        por USDT)— o cuando el resultado se sale del rango de un margen comercial: ahí la tasa
-        no salió de este par y afirmar una ganancia sería inventarla.
+        No hace falta que el par tenga un margen configurado: si su tasa es 5,078 y al cliente
+        se le pagaron 21 USDT a 4,76, ese 6,2% se cobró igual. Lo único que hace falta es una
+        tasa base contra la cual comparar; sin par resuelto (BCV, tasa suelta) no la hay.
+
+        Devuelve None también cuando el resultado se sale del rango de un margen comercial: ahí
+        la tasa no salió de este par y afirmar una ganancia sería inventarla.
         """
-        if entry is None or entry.base_percentage is None:
+        if entry is None:
             return None
         if not effective_rate or effective_rate <= 0:
             return None

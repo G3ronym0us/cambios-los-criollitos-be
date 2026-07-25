@@ -944,11 +944,20 @@ class WhatsAppPaymentService:
         if base == settlement_currency(currency):
             rate = round(value / value_usdt, 6) if value_usdt else 1.0
             return round(value, 2), base, round(value_usdt, 2), rate
-        raise QuoteServiceError(
-            "fund_currency_mismatch",
-            f"El fondo está en {group.currency} y la operación vale en {currency}",
-            400,
-        )
+
+        # El fondo lleva otra moneda que el valor: un fondo en BRL que atiende un trato de 21
+        # USDT saca reales, no dólares. El movimiento va en la moneda del fondo, convertido a
+        # la tasa del día de la operación. Antes era un 400 que impedía crear la operación.
+        at = op.valuation_at or op.quoted_at or datetime.now(timezone.utc)
+        converted, _ = valuation.historical_convert(self.db, value, currency, base, at)
+        if converted is None:
+            raise QuoteServiceError(
+                "fund_rate_unavailable",
+                f"No hay tasa para valorar {currency} en {group.currency}",
+                400,
+            )
+        rate = round(converted / value_usdt, 6) if value_usdt else 1.0
+        return round(converted, 2), base, round(value_usdt, 2), rate
 
     def _sync_fund_movement(self, op: WhatsAppOperation) -> None:
         """Reajusta el movimiento EXCHANGE del fondo cuando cambia el valor de la operación."""

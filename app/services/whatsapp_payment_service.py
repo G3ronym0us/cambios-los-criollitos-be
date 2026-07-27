@@ -13,7 +13,7 @@ from typing import Optional
 from uuid import UUID
 
 from sqlalchemy import exists, or_
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.models.whatsapp_client import WhatsAppClient
 from app.models.whatsapp_operation import (
@@ -54,6 +54,29 @@ _SETTLEMENT_CURRENCY = {"ZELLE": "USD", "PAYPAL": "USD"}
 def settlement_currency(symbol: Optional[str]) -> str:
     up = (symbol or "").upper()
     return _SETTLEMENT_CURRENCY.get(up, up)
+
+
+def _implicit_allocation_dict(op, amount: float) -> dict:
+    """
+    El reparto que el vínculo directo implica, con la misma forma que
+    `WhatsAppPaymentAllocation.dict()` pero sin fila detrás: `uuid` viene en None para que
+    quien lo consuma sepa que todavía no está materializado.
+    """
+    cp = op.currency_pair
+    return {
+        "uuid": None,
+        "amount": round(amount, 2),
+        "operation_uuid": op.uuid,
+        "operation_status": op.status.value if op.status else None,
+        "pair_symbol": cp.pair_symbol if cp else None,
+        "from_amount": op.from_amount,
+        "from_currency": cp.from_currency.symbol if cp and cp.from_currency else None,
+        "to_amount": op.to_amount,
+        "to_currency": cp.to_currency.symbol if cp and cp.to_currency else None,
+        "rate_used": op.rate_used,
+        "created_by_username": None,
+        "created_at": None,
+    }
 
 
 class WhatsAppPaymentService:
@@ -274,6 +297,11 @@ class WhatsAppPaymentService:
         """
         Agrega a cada entrante cuánto de él está repartido entre operaciones y cuánto queda
         sin asignar: es el aviso de "el pago dice 220 y la op 200" en el listado.
+
+        Un pago con vínculo directo y sin reparto explícito NO está sin asignar: el FK es la
+        relación primaria y vale por sí sola (ver `_sync_primary_operation`). Es además el
+        estado normal de todo lo que crea el bot, así que leer solo la tabla de reparto hacía
+        que un pago perfectamente colocado se anunciara como "60 sin asignar".
         """
         ids = [it["id"] for it in items]
         rows = (
@@ -286,11 +314,34 @@ class WhatsAppPaymentService:
         for row in rows:
             assigned[row.incoming_payment_id] = assigned.get(row.incoming_payment_id, 0) + row.amount
             counts[row.incoming_payment_id] = counts.get(row.incoming_payment_id, 0) + 1
+
+        # Los que no tienen reparto: se carga en lote el pago con su op y su par para poder
+        # derivar el implícito sin una consulta por fila.
+        implicit_ids = [i for i in ids if i not in assigned]
+        implicit: dict[int, float] = {}
+        if implicit_ids:
+            payments = (
+                self.db.query(WhatsAppIncomingPayment)
+                .options(
+                    selectinload(WhatsAppIncomingPayment.operation).selectinload(
+                        WhatsAppOperation.currency_pair
+                    )
+                )
+                .filter(WhatsAppIncomingPayment.id.in_(implicit_ids))
+                .all()
+            )
+            for payment in payments:
+                if payment.operation is not None:
+                    implicit[payment.id] = self._default_allocation_amount(
+                        payment, payment.operation
+                    )
+
         for it in items:
             total = round(it.get("amount") or 0, 2)
-            done = round(assigned.get(it["id"], 0), 2)
+            done = round(assigned.get(it["id"], implicit.get(it["id"], 0)), 2)
             credited = self._credited_to_balance(it["id"]) if total else 0.0
             it["allocated_amount"] = done
+            # El implícito no es una fila: el contador sigue siendo el de repartos explícitos.
             it["allocations_count"] = counts.get(it["id"], 0)
             it["unassigned_amount"] = round(total - done - credited, 2) if total else 0.0
 
@@ -636,16 +687,32 @@ class WhatsAppPaymentService:
         """
         payment = self._get_or_404("incoming", payment_id)
         allocations = list(payment.allocations)
-        assigned = round(sum(a.amount for a in allocations), 2)
         credited = self._credited_to_balance(payment_id)
         total = round(payment.amount or 0, 2)
 
+        # Sin reparto explícito pero con vínculo directo, el pago SÍ respalda a esa operación:
+        # se muestra el reparto implícito para que este panel diga lo mismo que el listado.
+        # No es una fila en la BD; se materializa si el operador guarda desde aquí.
+        implicit: list[tuple[int, dict]] = []
+        if not allocations and payment.operation is not None:
+            amount = self._default_allocation_amount(payment, payment.operation)
+            if amount > 0:
+                implicit.append(
+                    (
+                        payment.operation.id,
+                        _implicit_allocation_dict(payment.operation, amount),
+                    )
+                )
+
+        assigned = round(
+            sum(a.amount for a in allocations) + sum(d["amount"] for _, d in implicit), 2
+        )
+
         items = []
-        for allocation in allocations:
-            item = allocation.dict()
+        for op_id, item in [(a.whatsapp_operation_id, a.dict()) for a in allocations] + implicit:
             outgoing = (
                 self.db.query(WhatsAppOutgoingPayment)
-                .filter(WhatsAppOutgoingPayment.whatsapp_operation_id == allocation.whatsapp_operation_id)
+                .filter(WhatsAppOutgoingPayment.whatsapp_operation_id == op_id)
                 .all()
             )
             item["paid_with"] = [

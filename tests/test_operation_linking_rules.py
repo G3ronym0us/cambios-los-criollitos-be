@@ -98,3 +98,112 @@ def test_convert_outgoing_to_incoming_keeps_operation_and_date(service, db, fund
     res = service.convert_outgoing_to_incoming(out.id)
     assert str(res["operation_uuid"]) == str(op.uuid)
     assert res["created_at"].replace(tzinfo=timezone.utc) == when
+
+
+# ---------------------------------------------------------------------------
+# Reparto implícito: el vínculo directo ya asigna el pago
+#
+# El FK es la relación primaria y vale por sí sola (`_sync_primary_operation`); el reparto
+# explícito solo hace falta cuando UN pago respalda VARIAS ops. Leer únicamente la tabla de
+# reparto hacía que todo lo que crea el bot —FK sin reparto— se anunciara como "sin asignar".
+# ---------------------------------------------------------------------------
+
+
+def _bot_creates_incoming(service, db, op_uuid, amount, currency="ZELLE", phone="13174961478"):
+    """El camino del bot: POST /whatsapp/payments/incoming con la op ya resuelta."""
+    from app.schemas.whatsapp import WhatsAppPaymentCreate
+
+    created = service.create_payment(
+        "incoming",
+        WhatsAppPaymentCreate(
+            client_phone=phone,
+            raw_text="comprobante",
+            operation_uuid=op_uuid,
+            amount=amount,
+            currency=currency,
+        ),
+    )
+    db.flush()
+    return created
+
+
+def _listed(service, payment_id):
+    return next(p for p in service.list_payments_page("incoming", limit=100)["items"]
+                if p["id"] == payment_id)
+
+
+def test_a_directly_linked_payment_is_not_reported_as_unassigned(service, db, fund, client, operator):
+    """El pago 161 de producción: bien vinculado por el bot y aun así decía '60 sin asignar'."""
+    seed = f.incoming(db, 220, "ZELLE")
+    op = _op(db, f.create_op_from_payment(
+        service, "incoming", seed, frm="ZELLE", to="BRL", from_amount=60, to_amount=274.21,
+        fund_uuid=fund.uuid, user_uuid=operator.uuid, recorded_by=operator.id)["uuid"])
+    # La op nace con su comprobante; se desvincula para dejarla libre y que el bot le cuelgue
+    # el suyo, que es la secuencia real (cotización primero, comprobante después).
+    service.set_operation("incoming", seed.id, None, orphan_action="KEEP")
+
+    created = _bot_creates_incoming(service, db, op.uuid, 60)
+    item = _listed(service, created["id"])
+
+    assert item["allocated_amount"] == 60
+    assert item["unassigned_amount"] == 0
+    # No es una fila de reparto: el contador sigue en cero.
+    assert item["allocations_count"] == 0
+
+
+def test_a_payment_larger_than_its_operation_still_shows_the_real_surplus(
+    service, db, fund, client, operator
+):
+    """220 respaldando una op de 200 → sobran 20, que es el aviso que sí hay que dar."""
+    seed = f.incoming(db, 220, "ZELLE")
+    op = _op(db, f.create_op_from_payment(
+        service, "incoming", seed, frm="ZELLE", to="BRL", from_amount=200, to_amount=914.04,
+        fund_uuid=fund.uuid, user_uuid=operator.uuid, recorded_by=operator.id)["uuid"])
+    service.set_operation("incoming", seed.id, None, orphan_action="KEEP")
+
+    created = _bot_creates_incoming(service, db, op.uuid, 220)
+    item = _listed(service, created["id"])
+
+    assert item["allocated_amount"] == 200
+    assert item["unassigned_amount"] == 20
+
+
+def test_a_payment_without_operation_is_fully_unassigned(service, db, fund, client, operator):
+    """El de Dionis: 100 ZELLE sin operación ninguna. Sigue estando sin asignar entero."""
+    created = _bot_creates_incoming(service, db, None, 100)
+    item = _listed(service, created["id"])
+
+    assert item["allocated_amount"] == 0
+    assert item["unassigned_amount"] == 100
+
+
+def test_the_allocation_panel_agrees_with_the_list(service, db, fund, client, operator):
+    """Las dos pantallas leían la misma relación y decían cosas distintas."""
+    seed = f.incoming(db, 220, "ZELLE")
+    op = _op(db, f.create_op_from_payment(
+        service, "incoming", seed, frm="ZELLE", to="BRL", from_amount=200, to_amount=914.04,
+        fund_uuid=fund.uuid, user_uuid=operator.uuid, recorded_by=operator.id)["uuid"])
+    service.set_operation("incoming", seed.id, None, orphan_action="KEEP")
+
+    created = _bot_creates_incoming(service, db, op.uuid, 220)
+    summary = service.allocation_summary(created["id"])
+
+    assert summary["assigned"] == 200
+    assert summary["unassigned"] == 20
+    assert len(summary["allocations"]) == 1
+    # Sin fila detrás todavía: se materializa si el operador guarda desde el panel.
+    assert summary["allocations"][0]["uuid"] is None
+    assert str(summary["allocations"][0]["operation_uuid"]) == str(op.uuid)
+
+
+def test_an_explicit_split_still_wins_over_the_implicit_one(service, db, fund, client, operator):
+    """Con reparto explícito manda el reparto: el implícito solo cubre su ausencia."""
+    seed = f.incoming(db, 220, "ZELLE")
+    op = _op(db, f.create_op_from_payment(
+        service, "incoming", seed, frm="ZELLE", to="BRL", from_amount=200, to_amount=914.04,
+        fund_uuid=fund.uuid, user_uuid=operator.uuid, recorded_by=operator.id)["uuid"])
+
+    item = _listed(service, seed.id)
+    assert item["allocations_count"] == 1
+    assert item["allocated_amount"] == 200
+    assert item["unassigned_amount"] == 20

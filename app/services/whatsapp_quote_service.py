@@ -25,6 +25,7 @@ from app.models.user import User
 from app.models.whatsapp_balance import WhatsAppBalanceEntry
 from app.models.whatsapp_client import WhatsAppClient
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
+from app.models.whatsapp_operation_message import WhatsAppOperationMessage
 from app.models.whatsapp_operation import (
     WhatsAppAmountSide,
     WhatsAppDeliveryStatus,
@@ -1211,3 +1212,49 @@ class WhatsAppQuoteService:
         if op is None:
             raise QuoteServiceError("not_found", f"Operation {op_uuid} no encontrada", 404)
         return op
+
+    # ---------- De qué mensaje nació una operación ----------
+
+    def record_source_message(
+        self, op_uuid: UUID, wa_message_id: str, client_phone: str
+    ) -> WhatsAppOperationMessage:
+        """
+        Deja constancia de que `wa_message_id` —el mensaje del cliente— originó esta operación.
+        Reenganchar el mismo id reapunta la fila: el mensaje sigue siendo uno solo.
+        """
+        op = self._get_op_or_404(op_uuid)
+        row = (
+            self.db.query(WhatsAppOperationMessage)
+            .filter(WhatsAppOperationMessage.wa_message_id == wa_message_id)
+            .first()
+        )
+        if row is None:
+            row = WhatsAppOperationMessage(wa_message_id=wa_message_id)
+            self.db.add(row)
+        row.whatsapp_operation_id = op.id
+        row.client_phone = client_phone
+        self.db.commit()
+        self.db.refresh(row)
+        return row
+
+    def find_by_source_messages(
+        self, wa_message_ids: list[str]
+    ) -> Optional[WhatsAppOperationMessage]:
+        """
+        La operación que originó alguno de estos mensajes. El orden de la lista manda: el bot
+        prueba varios ids candidatos del mismo mensaje borrado (la key del protocolo y la que
+        la librería alcanzó a capturar) y quiere el primero que exista.
+        """
+        wanted = [i for i in wa_message_ids if i]
+        if not wanted:
+            return None
+        rows = (
+            self.db.query(WhatsAppOperationMessage)
+            .filter(WhatsAppOperationMessage.wa_message_id.in_(wanted))
+            .all()
+        )
+        by_id = {r.wa_message_id: r for r in rows}
+        for candidate in wanted:
+            if candidate in by_id:
+                return by_id[candidate]
+        return None

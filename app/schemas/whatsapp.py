@@ -246,6 +246,26 @@ class WhatsAppStatsResponse(BaseModel):
     completed_today: int
 
 
+# ===== De qué mensaje nació la operación =====
+
+class WhatsAppSourceMessage(BaseModel):
+    """El mensaje del cliente que originó una cotización."""
+    wa_message_id: str = Field(..., min_length=1, max_length=255)
+    client_phone: str = Field(..., min_length=3, max_length=64)
+
+
+class WhatsAppSourceMessageLookup(BaseModel):
+    """Ids candidatos de un mismo mensaje; gana el primero que exista."""
+    wa_message_ids: List[str] = Field(..., min_length=1, max_length=10)
+
+
+class WhatsAppSourceMessageResponse(BaseModel):
+    """La operación que originó el mensaje, o todo en null si ninguno figura."""
+    operation_uuid: Optional[UUID] = None
+    client_phone: Optional[str] = None
+    wa_message_id: Optional[str] = None
+
+
 # ===== Payments (comprobantes OCR) =====
 
 class WhatsAppPaymentCreate(BaseModel):

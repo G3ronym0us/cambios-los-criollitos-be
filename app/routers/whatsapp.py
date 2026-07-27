@@ -17,6 +17,9 @@ from app.models.whatsapp_operation import WhatsAppOperationScenario
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.schemas.whatsapp import (
+    WhatsAppSourceMessage,
+    WhatsAppSourceMessageLookup,
+    WhatsAppSourceMessageResponse,
     BcvRateResponse,
     WhatsAppBalanceCredit,
     WhatsAppBalanceDebit,
@@ -244,6 +247,46 @@ def get_operation(
     if op is None:
         raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Operation no encontrada"})
     return WhatsAppOperationResponse.model_validate(op.dict())
+
+
+@router.post("/operations/{op_uuid}/message", response_model=WhatsAppSourceMessageResponse, status_code=status.HTTP_201_CREATED)
+def record_source_message(
+    op_uuid: UUID,
+    payload: WhatsAppSourceMessage,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    """
+    Deja constancia de qué mensaje del cliente originó esta cotización. Sostiene tres cosas:
+    informar el revoke de ese mensaje, decidir si una corrección reemplaza a la cotización
+    anterior, y etiquetar VIA_PARTNER la op de ESE mensaje (y no «la activa del teléfono»,
+    que se desalinea cuando un socio dispara varias en el mismo segundo).
+    """
+    service = WhatsAppQuoteService(db)
+    try:
+        row = service.record_source_message(op_uuid, payload.wa_message_id, payload.client_phone)
+    except QuoteServiceError as exc:
+        _handle_service_error(exc)
+    return WhatsAppSourceMessageResponse(
+        operation_uuid=row.operation.uuid, client_phone=row.client_phone,
+        wa_message_id=row.wa_message_id,
+    )
+
+
+@router.post("/operations/by-message", response_model=WhatsAppSourceMessageResponse)
+def find_operation_by_source_message(
+    payload: WhatsAppSourceMessageLookup,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    """Qué operación nació de alguno de estos ids de mensaje. Sin coincidencia, todo null."""
+    row = WhatsAppQuoteService(db).find_by_source_messages(payload.wa_message_ids)
+    if row is None:
+        return WhatsAppSourceMessageResponse()
+    return WhatsAppSourceMessageResponse(
+        operation_uuid=row.operation.uuid, client_phone=row.client_phone,
+        wa_message_id=row.wa_message_id,
+    )
 
 
 @router.get("/operations", response_model=WhatsAppOperationList)

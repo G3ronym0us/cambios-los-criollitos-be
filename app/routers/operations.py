@@ -34,6 +34,13 @@ from app.schemas.whatsapp import (
     WhatsAppOperationValue,
     WhatsAppStatsResponse,
 )
+from app.schemas.operation_match import (
+    OperationRankRequest,
+    OperationRankResponse,
+    OperationScoreResponse,
+    SuggestionResponse,
+)
+from app.services.operation_match_service import OperationMatchService
 from app.services.profit_allocation_service import ProfitAllocationService
 from app.services.whatsapp_balance_service import WhatsAppBalanceService
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
@@ -87,6 +94,32 @@ async def list_operations(
         d["has_outgoing_payment"] = op.id in out_taken
         items.append(WhatsAppOperationResponse.model_validate(d))
     return WhatsAppOperationList(operations=items, total=len(items))
+
+
+@router.post("/match", response_model=OperationRankResponse)
+async def rank_operations_for_payment(
+    payload: OperationRankRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Puntúa las operaciones recientes contra un comprobante, para que el selector de "vincular
+    pago" las ordene y marque la más probable. Misma implementación que usa el matcher
+    automático del bot (`app/services/operation_match_service.py`), con la política del
+    operador: aquí se sugiere y él confirma, así que es más permisiva que la del bot.
+    """
+    service = OperationMatchService(db)
+    scored, suggestion = service.rank_for_payment(
+        payload.payment_id, payload.table, limit=payload.limit
+    )
+    return OperationRankResponse(
+        suggestion=(
+            SuggestionResponse(uuid=suggestion.uuid, confident=suggestion.confident)
+            if suggestion
+            else None
+        ),
+        candidates=[OperationScoreResponse(**vars(s)) for s in scored],
+    )
 
 
 @router.get("/stats", response_model=WhatsAppStatsResponse)

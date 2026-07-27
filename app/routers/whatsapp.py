@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.core.bot_auth import BotPrincipal, get_bot_principal
 from app.database.connection import get_db
 from app.models.whatsapp_client import WhatsAppClient
+from app.models.whatsapp_operation import WhatsAppOperationScenario
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.schemas.whatsapp import (
@@ -41,7 +42,18 @@ from app.schemas.whatsapp import (
     WhatsAppPersonalExpense,
     WhatsAppStatsResponse,
 )
+from app.schemas.operation_match import (
+    ForwardedMatchRequest,
+    ForwardedMatchResponse,
+    OutgoingMatchRequest,
+    OutgoingMatchResponse,
+)
 from app.services.bcv_service import fetch_bcv_rate, get_cached_bcv_rate
+from app.services.operation_match_service import (
+    ForwardedCriteria,
+    OperationMatchService,
+    OutgoingCriteria,
+)
 from app.services.whatsapp_balance_service import WhatsAppBalanceService
 from app.services.fund_pending_deposit_service import FundPendingDepositService
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
@@ -275,6 +287,81 @@ def list_operations(
         d["has_outgoing_payment"] = op.id in out_taken
         items.append(WhatsAppOperationResponse.model_validate(d))
     return WhatsAppOperationList(operations=items, total=len(items))
+
+
+# ---------- Matching ----------
+
+@router.post("/operations/match", response_model=OutgoingMatchResponse)
+def match_operation_for_payment(
+    payload: OutgoingMatchRequest,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    """
+    Qué operación corresponde a un comprobante recién leído, de cualquiera de los dos lados.
+    El bot vincula sola la que devuelva este endpoint, así que la política es conservadora:
+    ante cualquier ambigüedad responde null y el comprobante queda suelto para que lo vincule
+    el operador desde el front.
+
+    Antes esta lógica vivía en el bot (`selectOperationForOutgoing`) y del lado entrante no
+    existía —se usaba la op abierta más reciente del cliente, sin comparar monto ni mirar si
+    ya tenía comprobante—. Ver `app/services/operation_match_service.py`.
+    """
+    scenario = None
+    if payload.scenario:
+        try:
+            scenario = WhatsAppOperationScenario(payload.scenario.upper())
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "validation", "message": f"scenario inválido: {payload.scenario}"},
+            )
+
+    criteria = OutgoingCriteria(
+        amount=payload.amount,
+        currency=payload.currency,
+        identification=payload.identification,
+        phone_to=payload.phone_to,
+        bank_to=payload.bank_to,
+        window_hours=payload.window_hours,
+    )
+    op = OperationMatchService(db).auto_match(
+        criteria,
+        table=payload.table,
+        phone=payload.client_phone,
+        group_jid=payload.group_jid,
+        scenario=scenario,
+        limit=payload.limit,
+    )
+    if op is None:
+        return OutgoingMatchResponse()
+    return OutgoingMatchResponse(operation_uuid=str(op.uuid), operation=op.dict())
+
+
+@router.post("/payments/incoming/match-forwarded", response_model=ForwardedMatchResponse)
+def match_forwarded_incoming(
+    payload: ForwardedMatchRequest,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    """
+    Qué pago entrante es el Zelle que el operador acaba de reenviar a un grupo — el mismo
+    comprobante saliendo como asiento contable. Tolerancia ±0,1% y ventana de 60 min, y nunca
+    un entrante ya reenviado a otro grupo.
+    """
+    criteria = ForwardedCriteria(
+        provider=payload.provider,
+        amount=payload.amount,
+        currency=payload.currency,
+        reference=payload.reference,
+        identification=payload.identification,
+        phone_to=payload.phone_to,
+        window_minutes=payload.window_minutes,
+    )
+    match = OperationMatchService(db).auto_match_forwarded_incoming(criteria)
+    if match is None:
+        return ForwardedMatchResponse()
+    return ForwardedMatchResponse(payment_id=match.id, payment=match.dict())
 
 
 # ---------- Clients ----------

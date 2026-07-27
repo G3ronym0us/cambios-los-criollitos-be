@@ -3,11 +3,12 @@ Servicio de pagos de WhatsApp (comprobantes OCR). Espejo de las funciones de
 `whatsapp-bot/src/operations.ts` (save/list/update/link/personal/irrelevant/
 create-op-from-payment/corrected).
 
-El matching difuso (findOperationByOutgoingPayment / findIncomingForwardedToGroup)
-se queda en el bot; aquí solo persistimos y resolvemos vínculos.
+El emparejamiento vive en `operation_match_service.py`; aquí persistimos comprobantes y
+resolvemos sus vínculos con las operaciones.
 """
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
@@ -135,6 +136,12 @@ class WhatsAppPaymentService:
 
     def create_payment(self, table: str, payload) -> dict:
         Model = self._model(table)
+        if table == "incoming":
+            repeated = self._already_received(payload)
+            if repeated is not None:
+                out = self._with_name(repeated)
+                out["duplicate_of_id"] = repeated.id
+                return out
         op_id = self._resolve_op_id(payload.operation_uuid)
         kwargs = dict(
             client_phone=payload.client_phone,
@@ -161,7 +168,58 @@ class WhatsAppPaymentService:
             WhatsAppQuoteService(self.db).upsert_client(payload.client_phone)
         self.db.commit()
         self.db.refresh(row)
-        return self._with_name(row)
+        out = self._with_name(row)
+        if table == "incoming":
+            out["duplicate_of_id"] = None
+        return out
+
+    # Ventana en la que dos capturas iguales del mismo cliente se consideran la misma. Es
+    # generosa porque el parecido no es de monto: es el texto exacto de una misma imagen.
+    DUPLICATE_WINDOW = timedelta(days=7)
+
+    @staticmethod
+    def _receipt_fingerprint(text: Optional[str]) -> str:
+        """El texto del OCR sin espacios ni mayúsculas: dos lecturas de la MISMA captura."""
+        return re.sub(r"\s+", " ", (text or "")).strip().lower()
+
+    def _already_received(self, payload) -> Optional[WhatsAppIncomingPayment]:
+        """
+        El comprobante que el cliente ya había mandado, si es que este es un reenvío.
+
+        Un cliente que vuelve a mandar la captura que ya mandó no está pagando dos veces, pero
+        antes cada reenvío se guardaba como un pago nuevo y, al no calzar con ninguna operación
+        libre, el monto se trataba como una cotización nueva: un trato fantasma por dinero que
+        nunca se movió.
+
+        Se reconoce por la referencia del banco cuando la hay —identifica la transferencia— y
+        si no, por el texto del OCR junto al monto: dos pagos distintos producen capturas
+        distintas (llevan su hora), así que un texto idéntico es la misma imagen otra vez.
+        """
+        since = datetime.now(timezone.utc) - self.DUPLICATE_WINDOW
+        base = self.db.query(WhatsAppIncomingPayment).filter(
+            WhatsAppIncomingPayment.client_phone == payload.client_phone,
+            WhatsAppIncomingPayment.created_at >= since,
+        )
+
+        reference = (payload.reference or "").strip()
+        if reference:
+            return (
+                base.filter(WhatsAppIncomingPayment.reference.ilike(reference))
+                .order_by(WhatsAppIncomingPayment.id.desc())
+                .first()
+            )
+
+        fingerprint = self._receipt_fingerprint(payload.raw_text)
+        if not fingerprint:
+            return None
+        recent = base.order_by(WhatsAppIncomingPayment.id.desc()).limit(50).all()
+        for previous in recent:
+            if (
+                previous.amount == payload.amount
+                and self._receipt_fingerprint(previous.raw_text) == fingerprint
+            ):
+                return previous
+        return None
 
     def _payments_base_query(self, Model):
         """Query base con joins a cliente (display_name/uuid) y a la op (status)."""

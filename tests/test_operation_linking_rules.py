@@ -109,7 +109,10 @@ def test_convert_outgoing_to_incoming_keeps_operation_and_date(service, db, fund
 # ---------------------------------------------------------------------------
 
 
-def _bot_creates_incoming(service, db, op_uuid, amount, currency="ZELLE", phone="13174961478"):
+def _bot_creates_incoming(
+    service, db, op_uuid, amount, currency="ZELLE", phone="13174961478",
+    raw_text="comprobante", reference=None,
+):
     """El camino del bot: POST /whatsapp/payments/incoming con la op ya resuelta."""
     from app.schemas.whatsapp import WhatsAppPaymentCreate
 
@@ -117,10 +120,11 @@ def _bot_creates_incoming(service, db, op_uuid, amount, currency="ZELLE", phone=
         "incoming",
         WhatsAppPaymentCreate(
             client_phone=phone,
-            raw_text="comprobante",
+            raw_text=raw_text,
             operation_uuid=op_uuid,
             amount=amount,
             currency=currency,
+            reference=reference,
         ),
     )
     db.flush()
@@ -207,3 +211,84 @@ def test_an_explicit_split_still_wins_over_the_implicit_one(service, db, fund, c
     assert item["allocations_count"] == 1
     assert item["allocated_amount"] == 200
     assert item["unassigned_amount"] == 20
+
+
+# ── El mismo comprobante mandado dos veces ───────────────────────────────────
+#
+# El cliente reenvía la captura que ya mandó. En producción eso creó un pago nuevo que no
+# calzaba con ninguna operación libre, y el monto repetido se trató como una cotización: un
+# trato fantasma por dinero que nunca se movió (pagos 161/162, op 2618, julio de 2026).
+
+_ZELLE_TEXT = "Estamos enviando tu dinero ahora.\nJEANLOUYS AZOCAR\n$60.00\nazocarjean98@gmail.com"
+
+
+def test_the_same_receipt_sent_twice_is_recognised_not_stored_again(
+    service, db, fund, client, operator
+):
+    first = _bot_creates_incoming(service, db, None, 60, raw_text=_ZELLE_TEXT)
+    again = _bot_creates_incoming(service, db, None, 60, raw_text=_ZELLE_TEXT)
+
+    assert again["id"] == first["id"]
+    assert again["duplicate_of_id"] == first["id"]
+    assert first["duplicate_of_id"] is None
+
+
+def test_a_resent_receipt_does_not_touch_the_operation_of_the_first_one(
+    service, db, fund, client, operator
+):
+    """El reenvío no se cuelga de nada ni desplaza el vínculo que ya tenía el original."""
+    seed = f.incoming(db, 220, "ZELLE")
+    op = _op(db, f.create_op_from_payment(
+        service, "incoming", seed, frm="ZELLE", to="BRL", from_amount=60, to_amount=274.21,
+        fund_uuid=fund.uuid, user_uuid=operator.uuid, recorded_by=operator.id)["uuid"])
+    service.set_operation("incoming", seed.id, None, orphan_action="KEEP")
+
+    first = _bot_creates_incoming(service, db, op.uuid, 60, raw_text=_ZELLE_TEXT)
+    again = _bot_creates_incoming(service, db, None, 60, raw_text=_ZELLE_TEXT)
+
+    assert again["id"] == first["id"]
+    assert str(again["operation_uuid"]) == str(op.uuid)
+
+
+def test_the_bank_reference_alone_identifies_the_transfer(service, db, fund, client, operator):
+    """Con referencia no hace falta que el OCR lea igual: la transferencia es la misma."""
+    first = _bot_creates_incoming(
+        service, db, None, 15, raw_text="una lectura", reference="WFCT22GC5Z5K"
+    )
+    again = _bot_creates_incoming(
+        service, db, None, 15, raw_text="otra lectura distinta", reference="wfct22gc5z5k"
+    )
+
+    assert again["duplicate_of_id"] == first["id"]
+
+
+def test_two_real_payments_of_the_same_amount_are_both_kept(service, db, fund, client, operator):
+    """Dos pagos de verdad por el mismo monto: las capturas llevan su hora, no son iguales."""
+    first = _bot_creates_incoming(service, db, None, 60, raw_text="8:56 am ... $60.00")
+    other = _bot_creates_incoming(service, db, None, 60, raw_text="10:31 am ... $60.00")
+
+    assert other["id"] != first["id"]
+    assert other["duplicate_of_id"] is None
+
+
+def test_the_same_screenshot_from_another_client_is_not_a_duplicate(
+    service, db, fund, client, operator
+):
+    """Dos clientes distintos pueden mandar capturas iguales; no es el mismo dinero."""
+    first = _bot_creates_incoming(service, db, None, 60, raw_text=_ZELLE_TEXT)
+    other = _bot_creates_incoming(
+        service, db, None, 60, raw_text=_ZELLE_TEXT, phone="584128721024"
+    )
+
+    assert other["id"] != first["id"]
+
+
+def test_an_outgoing_receipt_is_never_deduplicated(service, db, fund, client, operator):
+    """El operador sí paga dos veces lo mismo (dos partes de un trato): salientes intactos."""
+    from app.schemas.whatsapp import WhatsAppPaymentCreate
+
+    def outgoing():
+        return service.create_payment("outgoing", WhatsAppPaymentCreate(
+            client_phone="13174961478", raw_text="mismo texto", amount=100, currency="VES"))
+
+    assert outgoing()["id"] != outgoing()["id"]

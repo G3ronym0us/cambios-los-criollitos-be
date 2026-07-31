@@ -1,3 +1,5 @@
+import uuid as _uuid
+
 from sqlalchemy import (
     Boolean, Column, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint,
 )
@@ -20,6 +22,12 @@ class WhatsAppClientAccount(UUIDMixin, Base):
     __tablename__ = "whatsapp_client_accounts"
 
     id = Column(Integer, primary_key=True, index=True)
+    # La migración crea esta columna como varchar(36) (mismo precedente que FundGroup,
+    # FundGroupMember, FundMovement, FundPendingDeposit, OperationProfitAllocation y
+    # WhatsAppPaymentAllocation), así que acá se pisa el `uuid` de tipo UUID que trae
+    # UUIDMixin: si se deja el de la mixin, SQLAlchemy liga el filtro con un cast
+    # `::UUID` y Postgres tira `operator does not exist: character varying = uuid`.
+    uuid = Column(String(36), unique=True, nullable=False, default=lambda: str(_uuid.uuid4()), index=True)
     client_id = Column(
         Integer, ForeignKey("whatsapp_clients.id", ondelete="CASCADE"), nullable=False, index=True
     )

@@ -100,6 +100,20 @@ class WhatsAppOperation(UUIDMixin, Base):
     # Notas: payment_info extraída por el bot (cédula, banco, teléfono, etc.)
     notes = Column(Text, nullable=True)
 
+    # ── Beneficiario (libreta de cuentas del cliente) ─────────────────────────
+    # `beneficiary_alias` es el nombre que dijo el cliente ("a yelitza"), exista o no la
+    # cuenta: es lo que permite aprenderla después, cuando lleguen los datos o el
+    # comprobante saliente. `beneficiary_ambiguous` distingue "no había ninguna cuenta con
+    # ese nombre" (se puede aprender) de "había varias" (no se aprende, desambigua el
+    # operador en el panel).
+    beneficiary_alias = Column(String(120), nullable=True)
+    beneficiary_account_id = Column(
+        Integer,
+        ForeignKey("whatsapp_client_accounts.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    beneficiary_ambiguous = Column(Boolean, nullable=False, server_default="false")
+
     # Operación que quedó sin ningún comprobante vinculado y el operador decidió conservar
     # igual (al desvincular su último pago). Queda quién lo aceptó, cuándo y por qué: una op
     # completada sin pago que la respalde no puede pasar en silencio.

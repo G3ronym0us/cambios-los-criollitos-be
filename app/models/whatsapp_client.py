@@ -44,6 +44,11 @@ class WhatsAppClient(UUIDMixin, Base):
 
     preferred_pair = relationship("CurrencyPair", foreign_keys=[preferred_pair_id])
     operations = relationship("WhatsAppOperation", back_populates="client")
+    accounts = relationship(
+        "WhatsAppClientAccount",
+        back_populates="client",
+        cascade="all, delete-orphan",
+    )
 
     def __repr__(self):
         return f"<WhatsAppClient(phone={self.phone}, name={self.display_name})>"

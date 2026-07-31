@@ -57,8 +57,10 @@ from app.services.operation_match_service import (
     OperationMatchService,
     OutgoingCriteria,
 )
+from app.schemas.client_account import AccountResolveResponse
 from app.services.whatsapp_balance_service import WhatsAppBalanceService
 from app.services.fund_pending_deposit_service import FundPendingDepositService
+from app.services.whatsapp_client_account_service import WhatsAppClientAccountService
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
 from app.services.whatsapp_quote_service import QuoteServiceError, WhatsAppQuoteService
 
@@ -419,6 +421,24 @@ def get_client(
     if client is None:
         raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Cliente no encontrado"})
     return WhatsAppClientResponse.model_validate(client.dict())
+
+
+@router.get("/clients/{phone}/accounts/resolve", response_model=AccountResolveResponse)
+def resolve_client_account(
+    phone: str,
+    alias: str,
+    currency: str,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    """
+    Resuelve el nombre que el cliente escribió ("a yelitza") contra su libreta.
+
+    MATCH sólo si empareja exactamente una cuenta de esa moneda: pagarle a la persona
+    equivocada es caro, así que ante dos candidatas el bot no inyecta nada.
+    """
+    service = WhatsAppClientAccountService(db)
+    return service.resolve(phone, alias, currency)
 
 
 @router.put("/clients/{phone}", response_model=WhatsAppClientResponse)

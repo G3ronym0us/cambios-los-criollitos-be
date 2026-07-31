@@ -63,6 +63,11 @@ class WhatsAppOperationCreate(BaseModel):
     # `amount` ya contiene el monto efectivo a cotizar (normalmente VES).
     bcv_usd: Optional[float] = Field(None, gt=0)
     notes: Optional[str] = None  # payment_info del bot (cédula, banco, etc.)
+    # Beneficiario nombrado en el mensaje ("465000 a yelitza"). El bot manda el nombre
+    # crudo; `beneficiary_ambiguous` viene en true cuando la resolución encontró varias
+    # cuentas con ese nombre, para que el backend no aprenda una tercera después.
+    beneficiary_alias: Optional[str] = Field(None, max_length=120)
+    beneficiary_ambiguous: bool = False
 
     @validator('from_currency', 'to_currency')
     def upper_currency(cls, v: str) -> str:
@@ -153,6 +158,9 @@ class WhatsAppOperationResponse(BaseModel):
     # Marcas de vínculo con pagos (inyectadas por el router de operaciones).
     has_incoming_payment: bool = False
     has_outgoing_payment: bool = False
+    beneficiary_alias: Optional[str] = None
+    beneficiary_account_uuid: Optional[UUID] = None
+    beneficiary_ambiguous: bool = False
 
     class Config:
         from_attributes = True

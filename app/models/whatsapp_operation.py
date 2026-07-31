@@ -158,6 +158,7 @@ class WhatsAppOperation(UUIDMixin, Base):
     fund_group = relationship("FundGroup", foreign_keys=[fund_group_id])
     received_by = relationship("User", foreign_keys=[received_by_user_id])
     no_payments_ack_by = relationship("User", foreign_keys=[no_payments_ack_by_user_id])
+    beneficiary_account = relationship("WhatsAppClientAccount", foreign_keys=[beneficiary_account_id])
 
     def __repr__(self):
         return (
@@ -212,6 +213,11 @@ class WhatsAppOperation(UUIDMixin, Base):
             "delivery_status": self.delivery_status.value if self.delivery_status else None,
             "delivered_at": self.delivered_at,
             "notes": self.notes,
+            "beneficiary_alias": self.beneficiary_alias,
+            "beneficiary_account_uuid": (
+                self.beneficiary_account.uuid if self.beneficiary_account else None
+            ),
+            "beneficiary_ambiguous": self.beneficiary_ambiguous,
             "no_payments_ack_by_username": (
                 self.no_payments_ack_by.username if self.no_payments_ack_by else None
             ),

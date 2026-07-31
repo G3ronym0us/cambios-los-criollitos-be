@@ -35,6 +35,7 @@ from app.models.whatsapp_operation import (
 )
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.repositories.transaction_repository import TransactionRepository
+from app.repositories.whatsapp_client_account_repository import WhatsAppClientAccountRepository
 from app.schemas.transaction import ProfitSplitCreate, TransactionCreate
 from app.schemas.whatsapp import (
     WhatsAppOperationApprove,
@@ -243,10 +244,19 @@ class WhatsAppQuoteService:
                 else WhatsAppOperationStatus.QUOTED
             ),
             notes=payload.notes,
+            beneficiary_alias=payload.beneficiary_alias,
+            beneficiary_ambiguous=payload.beneficiary_ambiguous,
             quoted_at=now,
             approved_at=now if has_payment_data else None,
             expires_at=now + timedelta(minutes=QUOTE_TTL_MINUTES),
         )
+        # Si las notas vinieron de una cuenta de la libreta, dejar la operación apuntando a
+        # ella: es lo que impide que el aprendizaje la vuelva a crear más tarde.
+        if payload.beneficiary_alias and payload.notes:
+            account_repo = WhatsAppClientAccountRepository(self.db)
+            existing = account_repo.get_by_payment_info(client.id, payload.notes)
+            if existing is not None:
+                op.beneficiary_account_id = existing.id
         self.db.add(op)
         self.db.commit()
         self.db.refresh(op)

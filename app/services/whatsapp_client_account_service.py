@@ -141,3 +141,45 @@ class WhatsAppClientAccountService:
         if block is None:
             return None
         return self.learn(op, block, source="RECEIPT")
+
+    def default_payment_fields(self, client: WhatsAppClient) -> "tuple[Optional[str], Optional[str]]":
+        """
+        Compatibilidad: `default_payment_info`/`default_payment_currency` ya no se leen de
+        `whatsapp_clients` sino de la cuenta predeterminada. Se siguen exponiendo con el
+        mismo nombre para que un bot desplegado antes que este backend no se rompa.
+        """
+        account = self.repo.get_default(client.id)
+        if account is None:
+            return None, None
+        return account.payment_info, account.currency
+
+    def set_default_account(
+        self, client: WhatsAppClient, payment_info: Optional[str], currency: Optional[str]
+    ) -> None:
+        """
+        Crea, reemplaza o borra la cuenta predeterminada (la de `alias=NULL`). Es el camino
+        que usa la UI vieja de "datos de pago del cliente".
+        """
+        current = self.repo.get_default(client.id)
+        block = (payment_info or "").strip()
+        if not block:
+            if current is not None:
+                self.repo.delete(current)
+            return
+        if not currency:
+            return
+        if current is not None:
+            current.payment_info = block
+            current.currency = currency.upper()
+            current.is_confirmed = True
+            self.db.commit()
+            return
+        self.repo.create(
+            client_id=client.id,
+            alias=None,
+            payment_info=block,
+            currency=currency,
+            source="MANUAL",
+            is_confirmed=True,
+            is_default=True,
+        )

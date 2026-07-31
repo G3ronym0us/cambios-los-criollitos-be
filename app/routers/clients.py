@@ -21,6 +21,7 @@ from app.schemas.client import ClientList, ClientResponse, ClientUpdate
 from app.schemas.whatsapp import ClientLoanRepaymentCreate, WhatsAppBalanceAdjust
 from app.services.client_loan_service import ClientLoanService
 from app.services.whatsapp_balance_service import WhatsAppBalanceService
+from app.services.whatsapp_client_account_service import WhatsAppClientAccountService
 from app.services.whatsapp_quote_service import QuoteServiceError
 
 router = APIRouter(prefix="/clients", tags=["Clients"])
@@ -152,8 +153,16 @@ async def update_client(
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Par de monedas no encontrado")
             client.preferred_pair_id = pair.id
 
+    # `default_payment_info`/`default_payment_currency` ya no son columnas: se resuelven
+    # contra la cuenta predeterminada de la libreta (whatsapp_client_accounts).
+    default_info = data.pop("default_payment_info", None)
+    default_currency = data.pop("default_payment_currency", None)
+
     for field, value in data.items():
         setattr(client, field, value)
+
+    if "default_payment_info" in payload.model_fields_set:
+        WhatsAppClientAccountService(db).set_default_account(client, default_info, default_currency)
 
     db.commit()
     db.refresh(client)

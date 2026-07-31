@@ -480,9 +480,9 @@ def upsert_client(
     if payload.is_usdt_authorized is not None:
         client.is_usdt_authorized = payload.is_usdt_authorized
     if "default_payment_info" in payload.model_fields_set:
-        client.default_payment_info = payload.default_payment_info
-    if "default_payment_currency" in payload.model_fields_set:
-        client.default_payment_currency = payload.default_payment_currency
+        WhatsAppClientAccountService(db).set_default_account(
+            client, payload.default_payment_info, payload.default_payment_currency
+        )
 
     db.commit()
     db.refresh(client)

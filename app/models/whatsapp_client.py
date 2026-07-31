@@ -63,8 +63,14 @@ class WhatsAppClient(UUIDMixin, Base):
             "is_tracked": self.is_tracked,
             "is_blocked": self.is_blocked,
             "is_usdt_authorized": self.is_usdt_authorized,
-            "default_payment_info": self.default_payment_info,
-            "default_payment_currency": self.default_payment_currency,
+            # Derivados de la cuenta predeterminada de la libreta (whatsapp_client_accounts).
+            # Las columnas homónimas quedan sin uso hasta que una migración posterior las borre.
+            "default_payment_info": next(
+                (a.payment_info for a in self.accounts if a.is_default), None
+            ),
+            "default_payment_currency": next(
+                (a.currency for a in self.accounts if a.is_default), None
+            ),
             "last_seen_at": self.last_seen_at,
             "created_at": self.created_at,
             "updated_at": self.updated_at,

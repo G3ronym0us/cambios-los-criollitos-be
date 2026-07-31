@@ -48,6 +48,7 @@ from app.schemas.whatsapp import (
 from app.services import valuation
 from app.services.bcv_service import get_cached_bcv_rate
 from app.services.profit_allocation_service import ProfitAllocationService
+from app.services.whatsapp_client_account_service import WhatsAppClientAccountService
 from app.services.whatsapp_rate_resolver import WhatsAppRateResolver, apply_rounding
 
 
@@ -251,7 +252,8 @@ class WhatsAppQuoteService:
             expires_at=now + timedelta(minutes=QUOTE_TTL_MINUTES),
         )
         # Si las notas vinieron de una cuenta de la libreta, dejar la operación apuntando a
-        # ella: es lo que impide que el aprendizaje la vuelva a crear más tarde.
+        # ella; si son datos nuevos para un nombre nuevo, aprenderla acá mismo (no habrá
+        # attach_notes posterior que lo dispare).
         if payload.beneficiary_alias and payload.notes:
             account_repo = WhatsAppClientAccountRepository(self.db)
             existing = account_repo.get_by_payment_info(client.id, payload.notes)
@@ -260,6 +262,7 @@ class WhatsAppQuoteService:
         self.db.add(op)
         self.db.commit()
         self.db.refresh(op)
+        WhatsAppClientAccountService(self.db).learn(op, op.notes, source="MESSAGE")
         return op
 
     # ---------- Aprobar / Cancelar ----------
@@ -434,6 +437,10 @@ class WhatsAppQuoteService:
             op.status = WhatsAppOperationStatus.PENDING
             op.approved_at = datetime.now(timezone.utc)
             self._sync_linked_transaction(op)
+
+        # Datos que llegaron después de cotizar "a <nombre>": es el momento de aprender la
+        # cuenta del beneficiario.
+        WhatsAppClientAccountService(self.db).learn(op, notes, source="MESSAGE")
 
         self.db.commit()
         self.db.refresh(op)

@@ -36,6 +36,7 @@ from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.repositories.fund_repository import FundRepository
 from app.services import valuation
 from app.schemas.whatsapp import WhatsAppOperationComplete
+from app.services.whatsapp_client_account_service import WhatsAppClientAccountService
 from app.services.whatsapp_quote_service import (
     QuoteServiceError,
     WhatsAppQuoteService,
@@ -168,6 +169,18 @@ class WhatsAppPaymentService:
             WhatsAppQuoteService(self.db).upsert_client(payload.client_phone)
         self.db.commit()
         self.db.refresh(row)
+        # El intermediario nunca mandó los datos, pero el pago ya se hizo: el comprobante
+        # es la mejor fuente posible de la cuenta del beneficiario. El bot suele crear el
+        # saliente ya vinculado a la op (`operation_uuid` en el payload), sin pasar nunca
+        # por set_operation, así que este es el único disparador para ese camino.
+        if table == "outgoing" and row.whatsapp_operation_id is not None:
+            target_op = (
+                self.db.query(WhatsAppOperation)
+                .filter(WhatsAppOperation.id == row.whatsapp_operation_id)
+                .first()
+            )
+            if target_op is not None:
+                WhatsAppClientAccountService(self.db).learn_from_outgoing(target_op, row)
         out = self._with_name(row)
         if table == "incoming":
             out["duplicate_of_id"] = None
@@ -969,6 +982,9 @@ class WhatsAppPaymentService:
         completed_by_delivery = False
         if table == "outgoing" and op is not None:
             self._apply_settlement(row, op, settled_amount)
+            # El intermediario nunca mandó los datos, pero el pago ya se hizo: el comprobante
+            # es la mejor fuente posible de la cuenta del beneficiario.
+            WhatsAppClientAccountService(self.db).learn_from_outgoing(op, row)
             if complete_outgoing:
                 completed_by_delivery = self._sync_status_from_delivery(op, completing_user)
 

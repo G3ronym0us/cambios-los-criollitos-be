@@ -138,10 +138,11 @@ class WhatsAppPaymentService:
     def create_payment(self, table: str, payload) -> dict:
         Model = self._model(table)
         if table == "incoming":
-            repeated = self._already_received(payload)
+            repeated, side = self._already_received(payload)
             if repeated is not None:
                 out = self._with_name(repeated)
                 out["duplicate_of_id"] = repeated.id
+                out["duplicate_side"] = side
                 return out
         op_id = self._resolve_op_id(payload.operation_uuid)
         kwargs = dict(
@@ -184,6 +185,7 @@ class WhatsAppPaymentService:
         out = self._with_name(row)
         if table == "incoming":
             out["duplicate_of_id"] = None
+            out["duplicate_side"] = None
         return out
 
     # Ventana en la que dos capturas iguales del mismo cliente se consideran la misma. Es
@@ -195,44 +197,53 @@ class WhatsAppPaymentService:
         """El texto del OCR sin espacios ni mayúsculas: dos lecturas de la MISMA captura."""
         return re.sub(r"\s+", " ", (text or "")).strip().lower()
 
-    def _already_received(self, payload) -> Optional[WhatsAppIncomingPayment]:
+    def _already_received(self, payload) -> tuple[Optional[object], Optional[str]]:
         """
-        El comprobante que el cliente ya había mandado, si es que este es un reenvío.
+        El comprobante que este cliente ya había mandado, si es que este es un reenvío, junto
+        al lado en el que estaba: `"incoming"` si lo mandó él, `"outgoing"` si es el que le
+        mandamos nosotros.
 
         Un cliente que vuelve a mandar la captura que ya mandó no está pagando dos veces, pero
         antes cada reenvío se guardaba como un pago nuevo y, al no calzar con ninguna operación
         libre, el monto se trataba como una cotización nueva: un trato fantasma por dinero que
         nunca se movió.
 
+        El lado SALIENTE cuenta igual (caso Dionis, 2026-08-01): el intermediario reenvía el
+        comprobante que le pasamos —a veces de días atrás— para señalar a quién hay que pagarle
+        esta vez, y su monto no tiene nada que ver con el nuevo encargo. Sin esto se guardaba un
+        entrante fantasma por dinero que nunca entró y, peor, el bot cotizaba ese monto.
+
         Se reconoce por la referencia del banco cuando la hay —identifica la transferencia— y
         si no, por el texto del OCR junto al monto: dos pagos distintos producen capturas
         distintas (llevan su hora), así que un texto idéntico es la misma imagen otra vez.
         """
         since = datetime.now(timezone.utc) - self.DUPLICATE_WINDOW
-        base = self.db.query(WhatsAppIncomingPayment).filter(
-            WhatsAppIncomingPayment.client_phone == payload.client_phone,
-            WhatsAppIncomingPayment.created_at >= since,
-        )
-
         reference = (payload.reference or "").strip()
-        if reference:
-            return (
-                base.filter(WhatsAppIncomingPayment.reference.ilike(reference))
-                .order_by(WhatsAppIncomingPayment.id.desc())
-                .first()
-            )
-
         fingerprint = self._receipt_fingerprint(payload.raw_text)
-        if not fingerprint:
-            return None
-        recent = base.order_by(WhatsAppIncomingPayment.id.desc()).limit(50).all()
-        for previous in recent:
-            if (
-                previous.amount == payload.amount
-                and self._receipt_fingerprint(previous.raw_text) == fingerprint
-            ):
-                return previous
-        return None
+
+        for Model, side in ((WhatsAppIncomingPayment, "incoming"), (WhatsAppOutgoingPayment, "outgoing")):
+            base = self.db.query(Model).filter(
+                Model.client_phone == payload.client_phone,
+                Model.created_at >= since,
+            )
+            if reference:
+                previous = (
+                    base.filter(Model.reference.ilike(reference))
+                    .order_by(Model.id.desc())
+                    .first()
+                )
+                if previous is not None:
+                    return previous, side
+                continue
+            if not fingerprint:
+                continue
+            for previous in base.order_by(Model.id.desc()).limit(50).all():
+                if (
+                    previous.amount == payload.amount
+                    and self._receipt_fingerprint(previous.raw_text) == fingerprint
+                ):
+                    return previous, side
+        return None, None
 
     def _payments_base_query(self, Model):
         """Query base con joins a cliente (display_name/uuid) y a la op (status)."""
@@ -539,12 +550,20 @@ class WhatsAppPaymentService:
         """
         Tasa contra la que se juzga este pago: la cotizada en la operación si su moneda de
         salida coincide con la del comprobante; si no, la activa del par correspondiente.
+
+        Va SIEMPRE en "unidades del comprobante por unidad de valor" —la misma convención que
+        `settled_rate`—, para que dividir el monto pagado entre ella dé lo que cubre del valor.
         """
         cp = op.currency_pair
         quoted_to = cp.to_currency.symbol if cp and cp.to_currency else None
         payment_currency = (payment.currency or "").upper()
         if quoted_to and payment_currency == quoted_to.upper() and op.rate_used:
-            return float(op.rate_used)
+            # Con inversa, `rate_used` va al revés (to = from / rate: COP por bolívar en un
+            # COP-VES). Sin darlo vuelta, el comprobante cubriría una fracción del valor y la
+            # operación quedaría con un pendiente fantasma.
+            return (
+                float(1 / op.rate_used) if op.inverse_percentage else float(op.rate_used)
+            )
 
         _, value_currency = self.operation_value(op)
         if not payment_currency or not value_currency:

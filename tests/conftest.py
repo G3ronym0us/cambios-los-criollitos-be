@@ -181,6 +181,8 @@ def pairs(db) -> dict:
         "ZELLE-COP": _pair(db, "ZELLE", "COP", 763.6, percentage=8),
         # Para valorar en un fondo que no lleva la moneda del trato (fondo BRL, trato USDT).
         "USDT-BRL": _pair(db, "USDT", "BRL", 5.078),
+        # Cruce fiat-fiat: el par de los clientes colombianos (caso Dionis).
+        "COP-VES": _pair(db, "COP", "VES", 0.2455),
     }
 
 

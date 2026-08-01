@@ -283,6 +283,48 @@ def test_the_same_screenshot_from_another_client_is_not_a_duplicate(
     assert other["id"] != first["id"]
 
 
+def test_the_receipt_we_sent_bounced_back_is_not_incoming_money(
+    service, db, fund, client, operator
+):
+    """
+    El caso Dionis: el intermediario reenvía el comprobante que le mandamos —el de días
+    atrás— para señalar a quién pagarle ahora. No entró dinero; el monto de esa captura no
+    es el del nuevo encargo, así que ni se guarda como entrante ni puede cotizarse.
+    """
+    from app.schemas.whatsapp import WhatsAppPaymentCreate
+
+    pagado = service.create_payment("outgoing", WhatsAppPaymentCreate(
+        client_phone="13174961478", raw_text="Transferencias a terceros 4.908,00 Bs",
+        amount=4908, currency="VES", reference="059138714935"))
+
+    rebote = _bot_creates_incoming(
+        service, db, None, 4908, currency="VES",
+        raw_text="Transferencias a terceros 4.908,00 Bs", reference="059138714935",
+    )
+
+    assert rebote["duplicate_of_id"] == pagado["id"]
+    assert rebote["duplicate_side"] == "outgoing"
+
+
+def test_a_real_incoming_still_gets_stored_when_nothing_matches_it(
+    service, db, fund, client, operator
+):
+    """El guard mira la MISMA transferencia, no cualquier monto que coincida."""
+    from app.schemas.whatsapp import WhatsAppPaymentCreate
+
+    service.create_payment("outgoing", WhatsAppPaymentCreate(
+        client_phone="13174961478", raw_text="Transferencias a terceros 4.908,00 Bs",
+        amount=4908, currency="VES", reference="059138714935"))
+
+    real = _bot_creates_incoming(
+        service, db, None, 4908, currency="VES",
+        raw_text="Pago movil 4.908,00 Bs", reference="059199999999",
+    )
+
+    assert real["duplicate_of_id"] is None
+    assert real["duplicate_side"] is None
+
+
 def test_an_outgoing_receipt_is_never_deduplicated(service, db, fund, client, operator):
     """El operador sí paga dos veces lo mismo (dos partes de un trato): salientes intactos."""
     from app.schemas.whatsapp import WhatsAppPaymentCreate

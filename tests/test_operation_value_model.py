@@ -72,6 +72,30 @@ def test_coverage_suggests_amount_from_rate(service, db, fund, client, operator)
     assert cov["full_amount_difference"] == pytest.approx(-91.4, abs=0.1)
 
 
+def test_coverage_reads_an_inverse_quote_in_the_right_direction(service, db, fund, client, operator):
+    """
+    El caso Dionis (COP-VES): la op del bot guarda la tasa INVERSA —4,0738 COP por bolívar,
+    `to = from / rate`—. Tomada tal cual, el comprobante de 4908 VES cubría 1204,76 COP de un
+    valor de 19.994,33 y dejaba un pendiente fantasma del 94%.
+    """
+    inc = f.incoming(db, 19994.33, "COP")
+    op = _op(db, f.create_op_from_payment(
+        service, "incoming", inc, frm="COP", to="VES", from_amount=19994.33, to_amount=4908,
+        fund_uuid=fund.uuid, user_uuid=operator.uuid, recorded_by=operator.id)["uuid"])
+    # Como la registra el bot al cotizar: rate = COP por bolívar, con la inversa puesta.
+    op.rate_used = 19994.33 / 4908
+    op.inverse_percentage = True
+    db.flush()
+    pago = f.outgoing(db, 4908, "VES")
+
+    cov = service.coverage_preview(pago.id, op.uuid)
+    assert cov["reference_rate"] == pytest.approx(4908 / 19994.33, rel=1e-9)
+    assert cov["suggested_settled_amount"] == pytest.approx(19994.33, abs=0.01)
+    assert cov["pending"] == pytest.approx(19994.33, abs=0.01)
+    # Cubre el pendiente entero: ni tasa efectiva distinta de la cotizada ni diferencia.
+    assert cov["full_amount_difference"] == pytest.approx(0, abs=0.01)
+
+
 def test_two_payouts_cover_the_value_and_complete(service, db, fund, client, operator):
     """El caso Naldin: 914,04 BRL cubre 200, 15.658,4 VES cubre 20 → completa sola."""
     inc = f.incoming(db, 220, "ZELLE")

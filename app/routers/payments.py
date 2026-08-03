@@ -11,6 +11,7 @@ de comprobantes (OCR) y el matching los hace el bot vía `/whatsapp/payments/*`
   posible cadena source_payment_id desde un incoming).
 """
 
+from datetime import date
 from typing import Literal
 from uuid import UUID
 
@@ -30,7 +31,10 @@ from app.schemas.whatsapp import (
     WhatsAppPersonalExpense,
     ClientLoanCreate,
 )
+from app.core.timezones import day_bounds
+from app.schemas.operation_match import PaymentSuggestionsRequest
 from app.services.client_loan_service import ClientLoanService
+from app.services.operation_match_service import OperationMatchService
 from app.services.whatsapp_balance_service import WhatsAppBalanceService
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
 from app.services.whatsapp_quote_service import QuoteServiceError
@@ -77,6 +81,54 @@ async def create_client_loan(
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
 
+@router.get("/{table}/stats")
+async def get_payments_stats(
+    table: Literal["incoming", "outgoing"],
+    search: str | None = Query(None),
+    out_class: str = Query("ALL"),
+    # `date`, no `datetime`: el front manda días de calendario (yyyy-mm-dd) y pydantic
+    # rechaza esa forma si el tipo es datetime.
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Agregados de la bandeja: cuántos comprobantes esperan una decisión, cuánto dinero de
+    ellos no respalda todavía ninguna operación, y el ritmo del día.
+
+    Acepta los mismos filtros que el listado salvo `attention`: la cifra de «por atender»
+    es justamente la que ese filtro selecciona.
+    """
+    service = WhatsAppPaymentService(db)
+    start, end = day_bounds(date_from, date_to)
+    try:
+        return service.payments_stats(
+            table,
+            search=search,
+            out_class=out_class,
+            date_from=start,
+            date_to=end,
+        )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.post("/{table}/suggestions")
+async def suggest_operations_for_payments(
+    table: Literal["incoming", "outgoing"],
+    payload: PaymentSuggestionsRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Operación sugerida para una tanda de comprobantes, para que el listado la muestre en
+    cada fila sin pedirla una por una. Misma puntuación que el selector de vincular.
+    """
+    service = OperationMatchService(db)
+    return {"items": service.suggest_for_payments(payload.payment_ids, table)}
+
+
 @router.get("/{table}")
 async def list_payments(
     table: Literal["incoming", "outgoing"],
@@ -85,11 +137,17 @@ async def list_payments(
     search: str | None = Query(None),
     out_class: str = Query("ALL"),
     unlinked_only: bool = Query(False),
+    attention: Literal["ALL", "ATTENTION", "RECONCILED"] = Query("ALL"),
+    # `date`, no `datetime`: el front manda días de calendario (yyyy-mm-dd) y pydantic
+    # rechaza esa forma si el tipo es datetime.
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Página de pagos (paginada + búsqueda/clasificación server-side). Devuelve {items, total}."""
     service = WhatsAppPaymentService(db)
+    start, end = day_bounds(date_from, date_to)
     try:
         return service.list_payments_page(
             table,
@@ -98,6 +156,9 @@ async def list_payments(
             search,
             out_class,
             unlinked_only,
+            attention=attention,
+            date_from=start,
+            date_to=end,
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)

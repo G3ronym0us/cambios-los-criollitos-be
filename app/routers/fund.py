@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from typing import Optional, List
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID
 
 from app.database.connection import get_db
@@ -20,6 +20,7 @@ from app.models.user import User
 from app.services.fund_pending_deposit_service import FundPendingDepositService
 from app.services.whatsapp_quote_service import QuoteServiceError
 from app.core.dependencies import get_current_user, get_moderator_user, get_root_user
+from app.core.timezones import day_bounds
 
 router = APIRouter(prefix="/funds", tags=["Funds"])
 
@@ -202,8 +203,10 @@ async def get_group_balance(
 async def list_group_movements(
     group_uuid: UUID,
     movement_type: Optional[str] = Query(None, description="Filtrar por tipo: DEPOSIT, EXCHANGE, PERSONAL, ADJUSTMENT"),
-    date_from: Optional[datetime] = Query(None),
-    date_to: Optional[datetime] = Query(None),
+    # `date` y no `datetime`: el front manda días de calendario (yyyy-mm-dd) y pydantic v2
+    # rechaza esa forma si el tipo es datetime — con datetime este filtro respondía 422.
+    date_from: Optional[date] = Query(None),
+    date_to: Optional[date] = Query(None),
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
@@ -226,12 +229,13 @@ async def list_group_movements(
                 detail=f"Invalid movement_type '{movement_type}'. Valid: DEPOSIT, EXCHANGE, PERSONAL, ADJUSTMENT",
             )
 
+    start, end = day_bounds(date_from, date_to)
     skip = (page - 1) * per_page
     movements, total = fund_repo.get_movements(
         group_id=group.id,
         movement_type=type_enum,
-        date_from=date_from,
-        date_to=date_to,
+        date_from=start,
+        date_to=end,
         skip=skip,
         limit=per_page,
     )
@@ -243,8 +247,8 @@ async def list_group_movements(
     totals = fund_repo.get_movements_totals(
         group_id=group.id,
         movement_type=type_enum,
-        date_from=date_from,
-        date_to=date_to,
+        date_from=start,
+        date_to=end,
     )
     total_pages = (total + per_page - 1) // per_page
     return FundMovementList(
@@ -355,8 +359,8 @@ async def get_movement(
 async def locate_movement(
     movement_uuid: UUID,
     movement_type: Optional[str] = Query(None),
-    date_from: Optional[datetime] = Query(None),
-    date_to: Optional[datetime] = Query(None),
+    date_from: Optional[date] = Query(None),
+    date_to: Optional[date] = Query(None),
     per_page: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_moderator_user),
@@ -380,9 +384,12 @@ async def locate_movement(
                 detail=f"Invalid movement_type '{movement_type}'",
             )
 
+    # Los mismos límites que el listado: si aquí se filtrara distinto, la página que se
+    # devuelve no sería la página en la que el movimiento está realmente.
+    start, end = day_bounds(date_from, date_to)
     page = fund_repo.locate_movement(
         movement, per_page=per_page, movement_type=type_enum,
-        date_from=date_from, date_to=date_to,
+        date_from=start, date_to=end,
     )
     return FundMovementLocation(
         movement_uuid=movement.uuid,

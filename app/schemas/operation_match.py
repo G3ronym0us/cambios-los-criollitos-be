@@ -83,3 +83,9 @@ class SuggestionResponse(BaseModel):
 class OperationRankResponse(BaseModel):
     suggestion: Optional[SuggestionResponse] = None
     candidates: list[OperationScoreResponse]
+
+
+class PaymentSuggestionsRequest(BaseModel):
+    """Sugerencia para una tanda de comprobantes: una página del listado de pagos."""
+
+    payment_ids: list[int] = Field(..., max_length=200)

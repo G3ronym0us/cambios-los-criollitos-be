@@ -13,9 +13,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import exists, or_
+from sqlalchemy import and_, case, exists, func, or_, select
 from sqlalchemy.orm import Session, joinedload, selectinload
 
+from app.core.timezones import CARACAS_TZ
+from app.models.currency import Currency
+from app.models.currency_pair import CurrencyPair
 from app.models.whatsapp_client import WhatsAppClient
 from app.models.whatsapp_operation import (
     WhatsAppAmountSide,
@@ -56,6 +59,19 @@ _SETTLEMENT_CURRENCY = {"ZELLE": "USD", "PAYPAL": "USD"}
 def settlement_currency(symbol: Optional[str]) -> str:
     up = (symbol or "").upper()
     return _SETTLEMENT_CURRENCY.get(up, up)
+
+
+def _settlement_sql(column):
+    """`settlement_currency` en SQL, para comparar monedas dentro de una consulta."""
+    upper = func.upper(column)
+    return case((upper.in_(tuple(_SETTLEMENT_CURRENCY)), "USD"), else_=upper)
+
+
+# Redondeos de OCR y de tasa: por debajo de esto un pago se considera cuadrado.
+AMOUNT_EPSILON = 0.01
+
+# Los tres estados del filtro de la bandeja.
+ATTENTION_FILTERS = ("ALL", "ATTENTION", "RECONCILED")
 
 
 def _implicit_allocation_dict(op, amount: float) -> dict:
@@ -272,16 +288,113 @@ class WhatsAppPaymentService:
         rows = self._payments_base_query(Model).order_by(Model.created_at.desc()).limit(limit).all()
         return [self._row_to_dict(*r) for r in rows]
 
-    def list_payments_page(
+    def _attention_condition(self, Model, table: str):
+        """
+        Qué cuenta como «por atender»: comprobantes cuyo dinero todavía no respalda nada.
+
+        Es la misma pregunta que responde el listado fila por fila, pero expresada en SQL
+        para poder filtrar y contar sin traerse la tabla entera. Un entrante está por
+        atender si el OCR no leyó el monto, si no tiene destino de ningún tipo (ni
+        operación, ni depósito a fondo, ni crédito de saldo), o si tiene destino pero le
+        sobra dinero. Un saliente, si no está clasificado ni vinculado.
+        """
+        if table == "outgoing":
+            return or_(
+                Model.amount.is_(None),
+                and_(
+                    Model.whatsapp_operation_id.is_(None),
+                    Model.is_personal_expense.is_(False),
+                    Model.is_irrelevant.is_(False),
+                    ~exists().where(ClientLoan.outgoing_payment_id == Model.id),
+                ),
+            )
+
+        # `correlate(Model)` es obligatorio: la query del listado ya trae unida la operación,
+        # y sin esto SQLAlchemy correlaciona también esa tabla y deja la subconsulta sin FROM.
+        allocated = (
+            select(func.coalesce(func.sum(WhatsAppPaymentAllocation.amount), 0.0))
+            .where(WhatsAppPaymentAllocation.incoming_payment_id == Model.id)
+            .correlate(Model)
+            .scalar_subquery()
+        )
+        credited = (
+            select(func.coalesce(func.sum(WhatsAppBalanceEntry.amount), 0.0))
+            .where(
+                WhatsAppBalanceEntry.incoming_payment_id == Model.id,
+                WhatsAppBalanceEntry.entry_type == WhatsAppBalanceEntryType.CREDIT,
+            )
+            .correlate(Model)
+            .scalar_subquery()
+        )
+        has_allocation = (
+            select(WhatsAppPaymentAllocation.id)
+            .where(WhatsAppPaymentAllocation.incoming_payment_id == Model.id)
+            .correlate(Model)
+            .exists()
+        )
+        has_deposit = (
+            select(FundMovement.id)
+            .where(FundMovement.incoming_payment_id == Model.id)
+            .correlate(Model)
+            .exists()
+        )
+
+        # Vínculo directo sin filas de reparto: el implícito de `_default_allocation_amount`.
+        # Solo puede sobrar dinero si la op liquida en la moneda del pago; si no son
+        # comparables se le asigna todo y no hay nada pendiente.
+        op_from_amount = (
+            select(WhatsAppOperation.from_amount)
+            .where(WhatsAppOperation.id == Model.whatsapp_operation_id)
+            .correlate(Model)
+            .scalar_subquery()
+        )
+        op_from_symbol = (
+            select(Currency.symbol)
+            .select_from(WhatsAppOperation)
+            .join(CurrencyPair, CurrencyPair.id == WhatsAppOperation.currency_pair_id)
+            .join(Currency, Currency.id == CurrencyPair.from_currency_id)
+            .where(WhatsAppOperation.id == Model.whatsapp_operation_id)
+            .correlate(Model)
+            .scalar_subquery()
+        )
+
+        return or_(
+            Model.amount.is_(None),
+            and_(
+                Model.whatsapp_operation_id.is_(None),
+                ~has_deposit,
+                ~has_allocation,
+                credited <= 0,
+            ),
+            and_(
+                Model.amount.isnot(None),
+                has_allocation,
+                allocated + credited < Model.amount - AMOUNT_EPSILON,
+            ),
+            and_(
+                Model.amount.isnot(None),
+                Model.currency.isnot(None),
+                Model.whatsapp_operation_id.isnot(None),
+                ~has_allocation,
+                op_from_amount.isnot(None),
+                op_from_symbol.isnot(None),
+                _settlement_sql(op_from_symbol) == _settlement_sql(Model.currency),
+                op_from_amount + credited < Model.amount - AMOUNT_EPSILON,
+            ),
+        )
+
+    def _filtered_payments_query(
         self,
         table: str,
-        limit: int = 50,
-        offset: int = 0,
+        *,
         search: Optional[str] = None,
         out_class: str = "ALL",
         unlinked_only: bool = False,
-    ) -> dict:
-        """Página de pagos para el front: búsqueda + clasificación server-side. Devuelve {items, total}."""
+        attention: str = "ALL",
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None,
+    ):
+        """Query base + todos los filtros de la bandeja. La comparten listado y stats."""
         Model = self._model(table)
         q = self._payments_base_query(Model)
 
@@ -331,6 +444,44 @@ class WhatsAppPaymentService:
             elif out_class == "LOAN":
                 q = q.filter(exists().where(ClientLoan.outgoing_payment_id == Model.id))
 
+        # Rango semiabierto [date_from, date_to). El router traduce el día final elegido a la
+        # medianoche siguiente, así que aquí `date_to` ya es el borde exclusivo.
+        if date_from:
+            q = q.filter(Model.created_at >= date_from)
+        if date_to:
+            q = q.filter(Model.created_at < date_to)
+
+        if attention == "ATTENTION":
+            q = q.filter(self._attention_condition(Model, table))
+        elif attention == "RECONCILED":
+            q = q.filter(~self._attention_condition(Model, table))
+
+        return q
+
+    def list_payments_page(
+        self,
+        table: str,
+        limit: int = 50,
+        offset: int = 0,
+        search: Optional[str] = None,
+        out_class: str = "ALL",
+        unlinked_only: bool = False,
+        attention: str = "ALL",
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None,
+    ) -> dict:
+        """Página de pagos para el front: búsqueda + clasificación server-side. Devuelve {items, total}."""
+        Model = self._model(table)
+        q = self._filtered_payments_query(
+            table,
+            search=search,
+            out_class=out_class,
+            unlinked_only=unlinked_only,
+            attention=attention,
+            date_from=date_from,
+            date_to=date_to,
+        )
+
         total = q.count()
         rows = q.order_by(Model.created_at.desc()).limit(limit).offset(offset).all()
         items = [self._row_to_dict(*r) for r in rows]
@@ -340,6 +491,74 @@ class WhatsAppPaymentService:
         if table == "outgoing" and items:
             self._attach_loans(items)
         return {"items": items, "total": total}
+
+    def payments_stats(
+        self,
+        table: str,
+        *,
+        search: Optional[str] = None,
+        out_class: str = "ALL",
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None,
+        scan_limit: int = 1000,
+    ) -> dict:
+        """
+        Agregados de la franja de atención: cuántos comprobantes esperan una decisión,
+        cuánto dinero de ellos no respalda nada, y el ritmo del día.
+
+        Respeta los mismos filtros que el listado salvo el propio de atención — es lo que
+        permite que la tarjeta funcione como acceso al filtro.
+
+        El monto sin asignar no se puede sumar en SQL (el reparto implícito depende del par
+        de la operación), así que se recorre solo el conjunto por atender, acotado a
+        `scan_limit` filas.
+        """
+        Model = self._model(table)
+        base = self._filtered_payments_query(
+            table, search=search, out_class=out_class, date_from=date_from, date_to=date_to
+        )
+        attention_clause = self._attention_condition(Model, table)
+        attention_q = base.filter(attention_clause)
+
+        needs_attention = attention_q.count()
+
+        unassigned: list[dict] = []
+        truncated = False
+        if table == "incoming" and needs_attention:
+            rows = (
+                attention_q.order_by(Model.created_at.desc()).limit(scan_limit).all()
+            )
+            truncated = needs_attention > len(rows)
+            items = [self._row_to_dict(*r) for r in rows]
+            self._attach_allocations(items)
+            by_currency: dict[str, dict] = {}
+            for it in items:
+                amount = it.get("unassigned_amount") or 0
+                if amount <= AMOUNT_EPSILON:
+                    continue
+                symbol = (it.get("currency") or "?").upper()
+                slot = by_currency.setdefault(
+                    symbol, {"currency": symbol, "amount": 0.0, "count": 0}
+                )
+                slot["amount"] = round(slot["amount"] + amount, 2)
+                slot["count"] += 1
+            unassigned = sorted(by_currency.values(), key=lambda s: -s["amount"])
+
+        start_of_day = datetime.now(CARACAS_TZ).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        today_q = base.filter(Model.created_at >= start_of_day)
+        received_today = today_q.count()
+        reconciled_today = today_q.filter(~attention_clause).count()
+
+        return {
+            "table": table,
+            "needs_attention": needs_attention,
+            "unassigned": unassigned,
+            "unassigned_truncated": truncated,
+            "received_today": received_today,
+            "reconciled_today": reconciled_today,
+        }
 
     def _attach_loans(self, items: list[dict]) -> None:
         ids = [item["id"] for item in items]
@@ -418,13 +637,32 @@ class WhatsAppPaymentService:
                         payment, payment.operation
                     )
 
+        # Lo acreditado al saldo, en una sola consulta: pedirlo por fila hacía 50 viajes por
+        # página, y `payments_stats` recorre bastantes más.
+        credited_by_payment: dict[int, float] = {}
+        credited_rows = (
+            self.db.query(
+                WhatsAppBalanceEntry.incoming_payment_id,
+                func.coalesce(func.sum(WhatsAppBalanceEntry.amount), 0.0),
+            )
+            .filter(
+                WhatsAppBalanceEntry.incoming_payment_id.in_(ids),
+                WhatsAppBalanceEntry.entry_type == WhatsAppBalanceEntryType.CREDIT,
+            )
+            .group_by(WhatsAppBalanceEntry.incoming_payment_id)
+            .all()
+        )
+        for payment_id, amount in credited_rows:
+            credited_by_payment[payment_id] = round(amount, 2)
+
         for it in items:
             total = round(it.get("amount") or 0, 2)
             done = round(assigned.get(it["id"], implicit.get(it["id"], 0)), 2)
-            credited = self._credited_to_balance(it["id"]) if total else 0.0
+            credited = credited_by_payment.get(it["id"], 0.0) if total else 0.0
             it["allocated_amount"] = done
             # El implícito no es una fila: el contador sigue siendo el de repartos explícitos.
             it["allocations_count"] = counts.get(it["id"], 0)
+            it["credited_to_balance"] = credited
             it["unassigned_amount"] = round(total - done - credited, 2) if total else 0.0
 
     def list_payments_for_operation(self, op_uuid: UUID) -> dict:

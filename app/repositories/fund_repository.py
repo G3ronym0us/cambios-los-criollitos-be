@@ -197,6 +197,12 @@ class FundRepository:
         skip: int = 0,
         limit: int = 50,
     ):
+        """
+        Página de movimientos. El rango de fechas es SEMIABIERTO `[date_from, date_to)`:
+        el router traduce el día final elegido a la medianoche siguiente (`core.timezones.day_bounds`),
+        así que `date_to` ya es el borde exclusivo. Mismo criterio en `get_movements_totals`
+        y `locate_movement`, que tienen que filtrar idéntico o la página calculada no cuadra.
+        """
         query = self.db.query(FundMovement)\
             .options(
                 joinedload(FundMovement.user),
@@ -213,7 +219,7 @@ class FundRepository:
         if date_from:
             query = query.filter(FundMovement.movement_date >= date_from)
         if date_to:
-            query = query.filter(FundMovement.movement_date <= date_to)
+            query = query.filter(FundMovement.movement_date < date_to)
 
         total = query.count()
         movements = (
@@ -247,7 +253,7 @@ class FundRepository:
         if date_from:
             query = query.filter(FundMovement.movement_date >= date_from)
         if date_to:
-            query = query.filter(FundMovement.movement_date <= date_to)
+            query = query.filter(FundMovement.movement_date < date_to)
 
         # ¿Sobrevive a los filtros? Si no, no tiene página.
         if not query.filter(FundMovement.id == movement.id).scalar():
@@ -361,7 +367,7 @@ class FundRepository:
             if date_from:
                 query = query.filter(FundMovement.movement_date >= date_from)
             if date_to:
-                query = query.filter(FundMovement.movement_date <= date_to)
+                query = query.filter(FundMovement.movement_date < date_to)
             if query_name == "movements":
                 by_type = query
             else:

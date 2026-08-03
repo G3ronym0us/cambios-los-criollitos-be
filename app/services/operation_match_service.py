@@ -588,3 +588,64 @@ class OperationMatchService:
         now = datetime.now(timezone.utc)
         scored = rank_candidates(candidates, criteria, table, now)
         return scored, pick_suggestion(scored)
+
+    def suggest_for_payments(
+        self, payment_ids: Sequence[int], table: str, *, limit: int = 500
+    ) -> list[dict]:
+        """
+        La operación sugerida para varios comprobantes de una vez, para pintarla en el
+        listado sin una petición por fila.
+
+        Es `rank_for_payment` repetida, pero cargando las candidatas UNA sola vez: la parte
+        cara es la consulta, no la puntuación (que es aritmética en memoria). Devuelve solo
+        los comprobantes que tienen sugerencia, con lo justo para dibujar la celda.
+        """
+        if not payment_ids:
+            return []
+
+        model = (
+            WhatsAppIncomingPayment if table == "incoming" else WhatsAppOutgoingPayment
+        )
+        payments = self.db.query(model).filter(model.id.in_(payment_ids)).all()
+        if not payments:
+            return []
+
+        candidates = self._load_operations(limit=limit)
+        if not candidates:
+            return []
+        by_uuid = {c.uuid: c for c in candidates}
+        now = datetime.now(timezone.utc)
+
+        out: list[dict] = []
+        for payment in payments:
+            criteria = OutgoingCriteria(
+                amount=payment.amount,
+                currency=payment.currency,
+                identification=payment.identification,
+                phone_to=payment.phone_to,
+                bank_to=payment.bank_to,
+                created_at=_aware(payment.created_at),
+            )
+            scored = rank_candidates(candidates, criteria, table, now)
+            suggestion = pick_suggestion(scored)
+            if suggestion is None:
+                continue
+            cand = by_uuid.get(suggestion.uuid)
+            best = next((s for s in scored if s.uuid == suggestion.uuid), None)
+            if cand is None or best is None:
+                continue
+            out.append(
+                {
+                    "payment_id": payment.id,
+                    "operation_uuid": cand.uuid,
+                    "confident": suggestion.confident,
+                    "score": round(best.score, 4),
+                    "delta": best.delta,
+                    "from_amount": cand.from_amount,
+                    "from_currency": cand.from_currency,
+                    "to_amount": cand.to_amount,
+                    "to_currency": cand.to_currency,
+                    "status": cand.status,
+                }
+            )
+        return out

@@ -1752,7 +1752,7 @@ class BankEmailService:
             self.db.commit()
         return inserted, warnings
 
-    def ingest_mailbox(self, box: MailboxConfig) -> tuple[int, list[str]]:
+    def ingest_mailbox(self, box: MailboxConfig) -> tuple[int, list[RejectedEmail]]:
         """Lee un buzón y lo ingiere. Propaga MailboxUnavailable a propósito."""
         headers = fetch_recent_headers(box)
         return self.ingest_headers(headers, mailbox_label=box.label)

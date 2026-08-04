@@ -16,7 +16,7 @@ from email.utils import parsedate_to_datetime, parseaddr
 from typing import Optional
 
 from app.core.config import MailboxConfig
-from app.services.bank_email_parsers import RawEmailHeaders
+from app.services.bank_email_parsers import TEMPLATES, RawEmailHeaders
 
 IMAP_HOST = "imap.gmail.com"
 IMAP_PORT = 993
@@ -85,12 +85,19 @@ def fetch_recent_headers(box: MailboxConfig, *, since_days: int = 1) -> list[Raw
         conn.login(box.email, box.password)
         conn.select("INBOX", readonly=True)
 
-        status, data = conn.search(None, "SINCE", since)
-        if status != "OK":
-            raise MailboxUnavailable(f"SEARCH devolvió {status} en {box.label}")
+        # Una búsqueda por banco en vez de traerse la bandeja entera: el buzón del
+        # operador recibe ~90 correos al día y solo un puñado son notificaciones de pago.
+        # Sin este filtro cada vuelta hacía un FETCH por correo y tardaba ~56 s, rozando
+        # el intervalo de 60 s del poller.
+        nums: list[bytes] = []
+        for template in TEMPLATES:
+            status, data = conn.search(None, "SINCE", since, "FROM", template.from_address)
+            if status != "OK":
+                raise MailboxUnavailable(f"SEARCH devolvió {status} en {box.label}")
+            nums.extend((data[0] or b"").split())
 
         results: list[RawEmailHeaders] = []
-        for num in (data[0] or b"").split():
+        for num in dict.fromkeys(nums):  # sin duplicados, conservando el orden
             status, payload = conn.fetch(num, "(BODY.PEEK[HEADER])")
             if status != "OK" or not payload or not isinstance(payload[0], tuple):
                 continue

@@ -8,6 +8,7 @@ Un lock en Redis evita que dos vueltas solapadas consuman el mismo correo dos ve
 """
 
 import asyncio
+import uuid
 from datetime import datetime, timezone
 
 from redis import Redis
@@ -20,7 +21,12 @@ from app.services.bank_email_service import BankEmailService
 from app.services.bot_notifier import notify_operator
 
 LOCK_KEY = "bank_email_poll_lock"
-LOCK_TTL_SECONDS = 55
+
+#: Muy por encima de lo que tarda una vuelta. El lock se borra en el `finally`; el TTL es
+#: solo la red de seguridad para si el worker muere. Ponerlo cerca del intervalo del beat
+#: es un bug: si la vuelta tarda más que el TTL (pasó con 2 buzones: 56 s contra 55 s),
+#: el lock caduca sola, entra una segunda vuelta y las dos consumen los mismos correos.
+LOCK_TTL_SECONDS = 600
 
 #: Cuánto se congela la escalera cuando un buzón no se pudo leer. Un poco más que el
 #: intervalo del poller, para que se descongele sola en cuanto el buzón vuelva.
@@ -41,7 +47,10 @@ def poll_bank_emails():
         return "sin buzones configurados"
 
     redis = Redis.from_url(settings.REDIS_URL)
-    if not redis.set(LOCK_KEY, "1", nx=True, ex=LOCK_TTL_SECONDS):
+    # Token propio: al soltar el lock hay que comprobar que sigue siendo el nuestro, o una
+    # vuelta lenta le borraría el lock a la que entró después de que el suyo caducara.
+    token = uuid.uuid4().hex
+    if not redis.set(LOCK_KEY, token, nx=True, ex=LOCK_TTL_SECONDS):
         return "otra vuelta en curso"
 
     db = SessionLocal()
@@ -81,9 +90,22 @@ def poll_bank_emails():
     finally:
         db.close()
         try:
-            redis.delete(LOCK_KEY)
+            _release_lock(redis, token)
         except Exception:
             pass
+
+
+#: Borra el lock solo si sigue siendo el nuestro (compare-and-delete atómico).
+_RELEASE_LOCK_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+end
+return 0
+"""
+
+
+def _release_lock(redis: Redis, token: str) -> None:
+    redis.eval(_RELEASE_LOCK_LUA, 1, LOCK_KEY, token)
 
 
 def _notify(text: str) -> bool:

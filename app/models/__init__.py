@@ -25,6 +25,11 @@ from .client_loan import (
 )
 from .push_subscription import PushSubscription
 from .profit_allocation import OperationProfitAllocation, ProfitAllocationDestination
+from .bank_email import (
+    BankEmailNotification,
+    BankEmailVerification,
+    BankEmailVerificationStatus,
+)
 
 __all__ = ["User", "ExchangeRate", "Transaction", "Currency", "CurrencyPair",
            "FundGroup", "FundGroupMember", "FundMovement", "RateAlert",
@@ -34,4 +39,6 @@ __all__ = ["User", "ExchangeRate", "Transaction", "Currency", "CurrencyPair",
            "WhatsAppBalanceEntry", "WhatsAppBalanceEntryType", "ClientLoan",
            "ClientLoanPreferredValue", "ClientLoanRepayment", "ClientLoanStatus",
            "PushSubscription", "OperationProfitAllocation",
-           "ProfitAllocationDestination"]
+           "ProfitAllocationDestination",
+           "BankEmailNotification", "BankEmailVerification",
+           "BankEmailVerificationStatus"]

@@ -9,6 +9,7 @@ celery_app = Celery(
     include=[
         "app.tasks.scraping_tasks",
         "app.tasks.bcv_tasks",
+        "app.tasks.bank_email_tasks",
     ],
 )
 
@@ -22,6 +23,10 @@ celery_app.conf.beat_schedule = {
     "refresh-bcv-every-5-minutes": {
         "task": "app.tasks.bcv_tasks.refresh_bcv_rate",
         "schedule": 300.0,
+    },
+    "poll-bank-emails-every-minute": {
+        "task": "app.tasks.bank_email_tasks.poll_bank_emails",
+        "schedule": 60.0,
     },
 }
 

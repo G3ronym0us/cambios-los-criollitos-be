@@ -1134,7 +1134,9 @@ Expected: `[]`
 
 - [ ] **Step 5: Documentar la variable**
 
-Agregar a `.env.example` (y a `.env` local con los valores reales, que NO se commitea):
+Agregar a `.env.dev.example` (y a `.env` local con los valores reales, que NO se commitea).
+**Ojo:** `.gitignore` ignora `.env*` con una sola excepción, `!.env.dev.example` — ese es
+el archivo de ejemplo del repo. No forzar otro con `git add -f`.
 
 ```
 # Confirmación de Zelle por correo. JSON con un objeto por cuenta alquilada.
@@ -1146,7 +1148,7 @@ ZELLE_MAILBOXES=[{"label":"Jean","email":"azocarjean98@gmail.com","password":"xx
 
 ```bash
 cd backend
-git add app/core/config.py tests/test_bank_email_config.py .env.example
+git add app/core/config.py tests/test_bank_email_config.py .env.dev.example
 git commit -m "feat: add ZELLE_MAILBOXES configuration for bank email confirmation"
 ```
 

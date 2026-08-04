@@ -221,7 +221,22 @@ class Settings(BaseSettings):
             return [origin.strip() for origin in v if origin.strip()]
         else:
             raise ValueError('CORS_ORIGINS must be a string or list')
-    
+
+    @validator('ZELLE_MAILBOXES', pre=True)
+    def keep_mailboxes_as_json(cls, v):
+        """
+        Devolver el valor como TEXTO, aunque pydantic ya lo haya parseado.
+
+        pydantic-settings parsea solo cualquier valor del .env que parezca JSON antes de
+        validar; el `json_loads` de la clase Config es de pydantic v1 y v2 lo ignora (de
+        ahí el UserWarning al arrancar). Sin esto, `ZELLE_MAILBOXES` llega como lista y
+        revienta contra el tipo `str`. Se vuelve a serializar para que `parse_mailboxes`
+        reciba siempre texto y sea el único lugar que valida los campos.
+        """
+        if v is None or isinstance(v, str):
+            return v
+        return json.dumps(v)
+
     # =================
     # PROPIEDADES CALCULADAS
     # =================

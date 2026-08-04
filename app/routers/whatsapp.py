@@ -3,7 +3,7 @@ Router para el bot de WhatsApp. Todos los endpoints requieren X-Bot-Token
 (o JWT humano para inspección desde el frontend, si aplica más adelante).
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -44,6 +44,7 @@ from app.schemas.whatsapp import (
     WhatsAppPaymentUpdate,
     WhatsAppPersonalExpense,
     WhatsAppStatsResponse,
+    EmailVerificationResponse,
 )
 from app.schemas.operation_match import (
     ForwardedMatchRequest,
@@ -51,6 +52,7 @@ from app.schemas.operation_match import (
     OutgoingMatchRequest,
     OutgoingMatchResponse,
 )
+from app.services.bank_email_service import BankEmailService
 from app.services.bcv_service import fetch_bcv_rate, get_cached_bcv_rate
 from app.services.operation_match_service import (
     ForwardedCriteria,
@@ -407,6 +409,28 @@ def match_forwarded_incoming(
     if match is None:
         return ForwardedMatchResponse()
     return ForwardedMatchResponse(payment_id=match.id, payment=match.dict())
+
+
+@router.post(
+    "/payments/incoming/{payment_id}/verify-by-email",
+    response_model=EmailVerificationResponse,
+)
+def verify_incoming_by_email(
+    payment_id: int,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    """
+    ¿Llegó al correo del banco un pago del mismo monto que este comprobante?
+
+    Lo llama el bot cuando el operador reenvía una captura de Zelle al grupo. Si el correo
+    ya estaba, responde `confirmed` con el texto para el operador; si no, deja la
+    verificación pendiente y el poller avisa cuando aparezca (o cuando venza).
+    """
+    result = BankEmailService(db).request_verification(
+        payment_id, now=datetime.now(timezone.utc)
+    )
+    return EmailVerificationResponse(**result)
 
 
 # ---------- Clients ----------

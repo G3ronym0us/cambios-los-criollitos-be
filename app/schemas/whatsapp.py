@@ -571,3 +571,16 @@ class ProfitAllocationList(BaseModel):
     unallocated_percentage: float                # lo que sobra (negativo: se repartió de más)
     value_usdt: Optional[float] = None
     allocations: List[ProfitAllocationResponse] = []
+
+
+class EmailVerificationResponse(BaseModel):
+    """
+    Resultado de verificar un pago entrante contra los correos de los bancos.
+
+    `confirmed` trae el texto listo para que el bot lo pegue en el mensaje al operador;
+    `pending` significa que se sigue buscando en segundo plano; `skipped`, que el pago no
+    era verificable (sin monto).
+    """
+
+    status: str  # "confirmed" | "pending" | "skipped"
+    message: Optional[str] = None

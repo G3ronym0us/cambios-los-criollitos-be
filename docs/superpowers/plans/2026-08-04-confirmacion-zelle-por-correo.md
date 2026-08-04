@@ -547,13 +547,25 @@ valor ni copiar uno de otro archivo** — si hay más de una cabeza, parar y avi
 
 - [ ] **Step 4: Crear la migración**
 
-Crear `alembic/versions/a4b5c6d7e8f9_add_bank_email_tables.py` (reemplazar
-`<HEAD_ANTERIOR>` por el id del paso anterior):
+Primero elegir un id propio para la revisión nueva y **verificar que no exista ya**:
+
+```bash
+cd backend
+python -c "import uuid; print(uuid.uuid4().hex[:12])"   # ej. 31ac3d9074b1
+grep -rl "<ID_NUEVO>" alembic/versions/                  # tiene que no devolver nada
+```
+
+Este repo tiene 59 migraciones con ids "bonitos" (`a4b5c6d7e8f9`, `z3a4b5c6d7e8`…), así
+que inventar uno a ojo colisiona fácil — y dos archivos con la misma revisión dejan el
+grafo de Alembic ambiguo (`UserWarning: Revision X is present more than once`).
+
+Crear `alembic/versions/<ID_NUEVO>_add_bank_email_tables.py` (reemplazar `<ID_NUEVO>` por
+el id verificado y `<HEAD_ANTERIOR>` por el del Step 3):
 
 ```python
 """add bank email notifications and verifications
 
-Revision ID: a4b5c6d7e8f9
+Revision ID: <ID_NUEVO>
 Revises: <HEAD_ANTERIOR>
 Create Date: 2026-08-04
 """
@@ -562,7 +574,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "a4b5c6d7e8f9"
+revision = "<ID_NUEVO>"
 down_revision = "<HEAD_ANTERIOR>"
 branch_labels = None
 depends_on = None
@@ -651,9 +663,11 @@ Expected: la tabla existe con el índice único sobre `message_id`.
 
 ```bash
 cd backend
-git add app/models/bank_email.py app/models/__init__.py alembic/versions/a4b5c6d7e8f9_add_bank_email_tables.py
+git add app/models/bank_email.py app/models/__init__.py alembic/versions/<ID_NUEVO>_add_bank_email_tables.py
 git commit -m "feat: add bank email notification and verification tables"
 ```
+
+> Ejecutado el 2026-08-04: id `31ac3d9074b1`, sobre la cabeza `3e4f5a6b7c8d`.
 
 ---
 

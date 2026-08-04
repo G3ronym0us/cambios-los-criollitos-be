@@ -1,7 +1,47 @@
+import json
 import os
+from dataclasses import dataclass
 from typing import Optional, List, Union
 from pydantic_settings import BaseSettings
 from pydantic import validator, Field
+
+
+@dataclass(frozen=True)
+class MailboxConfig:
+    """Un buzón de una cuenta alquilada. `label` es lo que ve el operador en el aviso."""
+
+    label: str
+    email: str
+    password: str
+
+
+def parse_mailboxes(raw: Optional[str]) -> list["MailboxConfig"]:
+    """
+    Parsea ZELLE_MAILBOXES. Vacío = feature apagada (no rompe el arranque).
+
+    Se valida acá y no al usarlo: un typo en el .env tiene que fallar fuerte y claro,
+    no convertirse en confirmaciones que nunca llegan.
+    """
+    if not raw or not raw.strip():
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"ZELLE_MAILBOXES no es JSON válido: {e}") from e
+
+    if not isinstance(data, list):
+        raise ValueError("ZELLE_MAILBOXES debe ser una lista de objetos")
+
+    boxes: list[MailboxConfig] = []
+    for i, item in enumerate(data):
+        for field in ("label", "email", "password"):
+            if not isinstance(item, dict) or not item.get(field):
+                raise ValueError(f"ZELLE_MAILBOXES[{i}]: falta el campo '{field}'")
+        boxes.append(
+            MailboxConfig(label=item["label"], email=item["email"], password=item["password"])
+        )
+    return boxes
+
 
 class Settings(BaseSettings):
     """Configuración principal de la aplicación."""
@@ -116,6 +156,13 @@ class Settings(BaseSettings):
     BOT_NOTIFY_URL: Optional[str] = None           # Base URL del dashboard del bot (ej. http://localhost:3457) para avisos al operador
 
     # =================
+    # BUZONES DE LAS CUENTAS ALQUILADAS (confirmación de Zelle por correo)
+    # =================
+    # JSON: [{"label":"Jean","email":"...@gmail.com","password":"<app password de Gmail>"}]
+    # Vacío = confirmación por correo apagada.
+    ZELLE_MAILBOXES: Optional[str] = None
+
+    # =================
     # ACTUALIZACIÓN EXTERNA DE TASAS (script del operador)
     # =================
     # Para monedas cuyo P2P no se puede leer desde el servidor (ej. BRL: Binance dejó
@@ -197,7 +244,12 @@ class Settings(BaseSettings):
     def celery_broker_url_computed(self) -> str:
         """URL del broker de Celery (usa Redis por defecto)."""
         return self.CELERY_BROKER_URL or self.REDIS_URL
-    
+
+    @property
+    def mailboxes_computed(self) -> list[MailboxConfig]:
+        """Buzones de las cuentas alquiladas ya parseados (lista vacía = feature apagada)."""
+        return parse_mailboxes(self.ZELLE_MAILBOXES)
+
     @property
     def celery_result_backend_computed(self) -> str:
         """Backend de resultados de Celery (usa Redis por defecto)."""

@@ -1,12 +1,12 @@
 import asyncio
 
-import aiohttp
 from sqlalchemy.orm import Session
 from typing import List
 from app.repositories.rate_alert_repository import RateAlertRepository
 from app.core.redis_pubsub import publish_alert
 from app.core.config import settings
 from app.services import web_push_service
+from app.services.bot_notifier import notify_operator
 
 
 class AlertService:
@@ -82,15 +82,6 @@ class AlertService:
             print(f"⚠️ Web push falló: {e}")
 
     async def _post_to_bot(self, url: str, text: str) -> None:
-        try:
-            timeout = aiohttp.ClientTimeout(total=5)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    url,
-                    json={"text": text},
-                    headers={"X-Bot-Token": settings.BOT_API_KEY},
-                ) as resp:
-                    if resp.status != 200:
-                        print(f"⚠️ Notificación al bot falló: HTTP {resp.status}")
-        except Exception as e:
-            print(f"⚠️ Notificación al bot falló: {e}")
+        # `url` se ignora: bot_notifier arma el endpoint desde BOT_NOTIFY_URL. Se conserva
+        # el parámetro para no tocar los llamadores.
+        await notify_operator(text)

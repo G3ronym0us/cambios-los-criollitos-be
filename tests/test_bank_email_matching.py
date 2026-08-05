@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from app.services.bank_email_matching import (
+    build_mailbox_down_message,
     ESCALATION_MINUTES,
     NotificationCandidate,
     build_confirmed_message,
@@ -16,6 +17,7 @@ from app.services.bank_email_matching import (
     is_final_step,
     pick_email_confirmation,
     schedule_next,
+    should_alert_mailbox_down,
 )
 
 NOW = datetime(2026, 8, 4, 18, 30, tzinfo=timezone.utc)
@@ -155,3 +157,37 @@ def test_ultimo_escalon_avisa_que_cierra():
     text = build_escalation_message(3, amount=Decimal("30.00"), client_phone="584121234567")
     assert "1 h" in text
     assert "cierro" in text.lower()
+
+
+# ---------- buzón caído ----------
+
+def test_un_fallo_suelto_no_avisa():
+    # Un timeout contra Gmail se cura solo en la vuelta siguiente; avisar de eso es
+    # entrenar al operador para ignorar las alertas.
+    assert should_alert_mailbox_down(1, is_auth_failure=False) is False
+
+
+def test_dos_fallos_seguidos_tampoco():
+    assert should_alert_mailbox_down(2, is_auth_failure=False) is False
+
+
+def test_al_tercer_fallo_avisa():
+    assert should_alert_mailbox_down(3, is_auth_failure=False) is True
+
+
+def test_credenciales_rechazadas_avisan_de_una():
+    # No se arregla sola: cada minuto que pasa es un pago sin verificar.
+    assert should_alert_mailbox_down(1, is_auth_failure=True) is True
+
+
+def test_mensaje_de_credenciales_pide_regenerar():
+    text = build_mailbox_down_message("Mariana", "auth", is_auth_failure=True)
+    assert "Mariana" in text
+    assert "contraseña de aplicación" in text
+
+
+def test_mensaje_transitorio_no_culpa_a_las_credenciales():
+    text = build_mailbox_down_message("Mariana", "The read operation timed out", is_auth_failure=False)
+    assert "credenciales" not in text.lower()
+    assert "timed out" in text
+    assert "reintentando" in text

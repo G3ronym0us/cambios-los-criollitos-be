@@ -16,7 +16,11 @@ from redis import Redis
 from app.celery_app import celery_app
 from app.core.config import settings
 from app.database.connection import SessionLocal
-from app.services.bank_email_imap import MailboxUnavailable
+from app.services.bank_email_imap import MailboxAuthFailed, MailboxUnavailable
+from app.services.bank_email_matching import (
+    build_mailbox_down_message,
+    should_alert_mailbox_down,
+)
 from app.services.bank_email_service import BankEmailService
 from app.services.bot_notifier import notify_operator
 
@@ -38,6 +42,10 @@ WARNED_TTL_SECONDS = 86400
 
 #: Igual para el buzón caído: un aviso por hora alcanza para enterarse.
 MAILBOX_ALERT_TTL_SECONDS = 3600
+
+#: La racha de fallos caduca sola si el poller deja de correr, para no arrastrar un
+#: contador viejo y avisar al primer fallo de mañana.
+FAILURE_COUNTER_TTL_SECONDS = 900
 
 
 @celery_app.task(name="app.tasks.bank_email_tasks.poll_bank_emails")
@@ -65,6 +73,8 @@ def poll_bank_emails():
             try:
                 count, rejected = service.ingest_mailbox(box)
                 ingested += count
+                # Respondió: se olvida la racha de fallos y se rearma el aviso.
+                redis.delete(f"bank_email_fails:{box.label}", f"bank_email_mailbox_down:{box.label}")
                 for item in rejected:
                     # Una sola vez por correo, aunque siga en la bandeja mañana.
                     if redis.set(f"bank_email_warned:{item.message_id}", "1",
@@ -74,10 +84,19 @@ def poll_bank_emails():
             except MailboxUnavailable as e:
                 any_failure = True
                 print(f"⚠️ {e}")
-                if redis.set(f"bank_email_mailbox_down:{box.label}", "1",
-                             nx=True, ex=MAILBOX_ALERT_TTL_SECONDS):
-                    if _notify(f"🚨 No puedo leer el correo de {box.label} — revisar credenciales"):
-                        sent += 1
+
+                # Fallos SEGUIDOS: el contador se borra en cuanto el buzón responde, así
+                # que un timeout suelto nunca llega al umbral.
+                fails_key = f"bank_email_fails:{box.label}"
+                fails = redis.incr(fails_key)
+                redis.expire(fails_key, FAILURE_COUNTER_TTL_SECONDS)
+
+                is_auth = isinstance(e, MailboxAuthFailed)
+                if should_alert_mailbox_down(fails, is_auth_failure=is_auth):
+                    if redis.set(f"bank_email_mailbox_down:{box.label}", "1",
+                                 nx=True, ex=MAILBOX_ALERT_TTL_SECONDS):
+                        if _notify(build_mailbox_down_message(box.label, str(e), is_auth_failure=is_auth)):
+                            sent += 1
 
         if any_failure:
             # Sin poder mirar, no se acusa a ningún pago de no existir.

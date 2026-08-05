@@ -19,15 +19,25 @@ from app.services.whatsapp_quote_service import QuoteServiceError
 
 ENTITY_PHONE_PREFIX = "entity:"
 
+# `whatsapp_clients.phone` es String(32) porque nació para teléfonos. La clave de una
+# entidad es solo eso, una clave —el nombre de verdad vive en `display_name`—, así que el
+# slug se recorta para caber dejando sitio al sufijo de desempate («-2», «-99»).
+MAX_SLUG_LENGTH = 32 - len(ENTITY_PHONE_PREFIX) - 3
+
 
 def is_entity_client_phone(phone: Optional[str]) -> bool:
     return bool(phone) and phone.startswith(ENTITY_PHONE_PREFIX)
 
 
 def slugify(name: str) -> str:
-    """«Bodegón X, C.A.» → «bodegon-x-c-a»."""
+    """«Bodegón X, C.A.» → «bodegon-x-c-a». Recortado, sin cortar una palabra a la mitad."""
     plain = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
-    return re.sub(r"[^a-z0-9]+", "-", plain.lower()).strip("-")
+    slug = re.sub(r"[^a-z0-9]+", "-", plain.lower()).strip("-")
+    if len(slug) <= MAX_SLUG_LENGTH:
+        return slug
+    cut = slug[:MAX_SLUG_LENGTH]
+    trimmed = cut.rsplit("-", 1)[0] if "-" in cut[1:] else cut
+    return trimmed.strip("-")
 
 
 class ClientEntityService:

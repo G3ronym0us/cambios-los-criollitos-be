@@ -18,6 +18,16 @@ def test_slug_strips_accents_and_symbols():
     assert slugify("Bodegón X, C.A.") == "bodegon-x-c-a"
 
 
+def test_long_name_fits_in_the_phone_column(db):
+    """`phone` es String(32): un nombre largo se recorta en vez de reventar al insertar."""
+    entity = ClientEntityService(db).create("Distribuidora Los Criollitos C.A.")
+
+    assert entity.phone == "entity:distribuidora-los"
+    assert len(entity.phone) <= 32
+    # El nombre completo no se pierde: la clave se recorta, la ficha no.
+    assert entity.display_name == "Distribuidora Los Criollitos C.A."
+
+
 def test_create_entity_builds_synthetic_phone(db):
     entity = ClientEntityService(db).create("Bodegón X")
 

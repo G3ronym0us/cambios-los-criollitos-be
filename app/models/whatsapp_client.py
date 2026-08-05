@@ -38,6 +38,11 @@ class WhatsAppClient(UUIDMixin, Base):
     default_payment_info = Column(Text, nullable=True)
     default_payment_currency = Column(String(10), nullable=True)
 
+    # Grupo de WhatsApp por el que llegan los comprobantes de esta entidad. Solo lo usan
+    # los clientes-entidad (`entity:{slug}`): sirve para proponer el deudor cuando un pago
+    # saliente se mandó al grupo del negocio en vez de a un teléfono.
+    linked_group_jid = Column(String(64), nullable=True, unique=True, index=True)
+
     last_seen_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -71,6 +76,7 @@ class WhatsAppClient(UUIDMixin, Base):
             "default_payment_currency": next(
                 (a.currency for a in self.accounts if a.is_default), None
             ),
+            "linked_group_jid": self.linked_group_jid,
             "last_seen_at": self.last_seen_at,
             "created_at": self.created_at,
             "updated_at": self.updated_at,

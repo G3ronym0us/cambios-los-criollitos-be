@@ -33,10 +33,11 @@ class ClientLoan(UUIDMixin, Base):
 
     id = Column(Integer, primary_key=True, index=True)
     client_id = Column(Integer, ForeignKey("whatsapp_clients.id"), nullable=False, index=True)
+    # Vacío cuando el préstamo se dio de alta a mano, sin comprobante que lo respalde.
     outgoing_payment_id = Column(
         Integer,
         ForeignKey("whatsapp_outgoing_payments.id", ondelete="RESTRICT"),
-        nullable=False,
+        nullable=True,
         unique=True,
         index=True,
     )

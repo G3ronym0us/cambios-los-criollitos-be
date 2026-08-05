@@ -36,7 +36,7 @@
 - Consumes: nada (primera tarea).
 - Produces: `WhatsAppClient.linked_group_jid: Optional[str]` (expuesto en `WhatsAppClient.dict()` como `linked_group_jid`); `ClientLoan.outgoing_payment_id: Optional[int]`.
 
-- [ ] **Step 1: Escribir el test que falla**
+- [x] **Step 1: Escribir el test que falla**
 
 Crear `backend/tests/test_client_loans.py`:
 
@@ -86,12 +86,12 @@ def test_client_stores_linked_group_jid(db):
     assert entity.dict()["linked_group_jid"] == "120363000000000000@g.us"
 ```
 
-- [ ] **Step 2: Correr el test y verificar que falla**
+- [x] **Step 2: Correr el test y verificar que falla**
 
 Run: `cd backend && pytest tests/test_client_loans.py -v`
 Expected: FAIL — `TypeError: 'linked_group_jid' is an invalid keyword argument for WhatsAppClient` y `IntegrityError: null value in column "outgoing_payment_id"`.
 
-- [ ] **Step 3: Agregar la columna al modelo de cliente**
+- [x] **Step 3: Agregar la columna al modelo de cliente**
 
 En `backend/app/models/whatsapp_client.py`, después de `default_payment_currency` (línea 39):
 
@@ -108,7 +108,7 @@ Y en `dict()`, junto a `default_payment_currency`:
             "linked_group_jid": self.linked_group_jid,
 ```
 
-- [ ] **Step 4: Aflojar `outgoing_payment_id`**
+- [x] **Step 4: Aflojar `outgoing_payment_id`**
 
 En `backend/app/models/client_loan.py`, líneas 36-42:
 
@@ -123,7 +123,7 @@ En `backend/app/models/client_loan.py`, líneas 36-42:
     )
 ```
 
-- [ ] **Step 5: Escribir la migración**
+- [x] **Step 5: Escribir la migración**
 
 Crear `backend/alembic/versions/b5c6d7e8f9a0_entity_clients_and_manual_loans.py`:
 
@@ -166,12 +166,12 @@ def downgrade():
     op.drop_column("whatsapp_clients", "linked_group_jid")
 ```
 
-- [ ] **Step 6: Correr los tests y verificar que pasan**
+- [x] **Step 6: Correr los tests y verificar que pasan**
 
 Run: `cd backend && pytest tests/test_client_loans.py -v`
 Expected: PASS (2 tests).
 
-- [ ] **Step 7: Aplicar la migración en local y verificar**
+- [x] **Step 7: Aplicar la migración en local y verificar**
 
 Run:
 ```bash
@@ -181,7 +181,7 @@ psql postgresql://tasas_user:tasas_password@localhost:5433/tasas_db -c "\d whats
 ```
 Expected: `outgoing_payment_id` sin `not null`; `linked_group_jid` presente. Los préstamos existentes siguen ahí (`SELECT count(*) FROM client_loans;` no cambia).
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 cd backend

@@ -208,7 +208,7 @@ git commit -m "feat: allow entity clients and loans without a receipt"
   - `ClientEntityService(db).create(display_name: str, linked_group_jid: Optional[str]) -> WhatsAppClient`
   - `POST /clients` con body `{display_name, linked_group_jid?}` → `ClientResponse` (201)
 
-- [ ] **Step 1: Escribir el test que falla**
+- [x] **Step 1: Escribir el test que falla**
 
 Crear `backend/tests/test_client_entities.py`:
 
@@ -275,12 +275,12 @@ def test_entity_name_is_required(db):
     assert exc.value.code == "invalid_entity_name"
 ```
 
-- [ ] **Step 2: Correr el test y verificar que falla**
+- [x] **Step 2: Correr el test y verificar que falla**
 
 Run: `cd backend && pytest tests/test_client_entities.py -v`
 Expected: FAIL con `ModuleNotFoundError: No module named 'app.services.client_entity_service'`.
 
-- [ ] **Step 3: Escribir el servicio**
+- [x] **Step 3: Escribir el servicio**
 
 Crear `backend/app/services/client_entity_service.py`:
 
@@ -368,12 +368,12 @@ class ClientEntityService:
         return phone
 ```
 
-- [ ] **Step 4: Correr los tests y verificar que pasan**
+- [x] **Step 4: Correr los tests y verificar que pasan**
 
 Run: `cd backend && pytest tests/test_client_entities.py -v`
 Expected: PASS (6 tests).
 
-- [ ] **Step 5: Exponer el campo y el alta en los schemas**
+- [x] **Step 5: Exponer el campo y el alta en los schemas**
 
 En `backend/app/schemas/client.py`, dentro de `ClientResponse` (después de `default_payment_currency`):
 
@@ -401,7 +401,7 @@ class ClientCreate(BaseModel):
     linked_group_jid: Optional[str] = None
 ```
 
-- [ ] **Step 6: Escribir el endpoint**
+- [x] **Step 6: Escribir el endpoint**
 
 En `backend/app/routers/clients.py`, agregar el import:
 
@@ -427,7 +427,7 @@ async def create_entity_client(
     return ClientResponse(**entity.dict(), balance=0.0)
 ```
 
-- [ ] **Step 7: Verificar el endpoint a mano**
+- [x] **Step 7: Verificar el endpoint a mano**
 
 Run: `cd backend && uvicorn app.main:app --port 8000 --reload` y en otra terminal:
 ```bash
@@ -436,7 +436,7 @@ curl -s -X POST localhost:8000/clients -H "Authorization: Bearer $TOKEN" \
 ```
 Expected: 201 con `"phone": "entity:bodegon-x"`. Repetir el mismo POST → segundo con `entity:bodegon-x-2`.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 cd backend

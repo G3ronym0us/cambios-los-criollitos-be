@@ -25,6 +25,8 @@ class ClientResponse(BaseModel):
     # Cuenta de pago predeterminada del cliente (bloque de datos + moneda fiat).
     default_payment_info: Optional[str] = None
     default_payment_currency: Optional[str] = None
+    # Grupo de WhatsApp vinculado; solo lo llevan los clientes-entidad.
+    linked_group_jid: Optional[str] = None
     # Saldo a favor en USD (ledger whatsapp_balance_entries); 0 si no tiene.
     balance: float = 0.0
     last_seen_at: Optional[datetime] = None
@@ -45,6 +47,8 @@ class ClientUpdate(BaseModel):
     # Cuenta de pago predeterminada; enviar null para borrarla.
     default_payment_info: Optional[str] = None
     default_payment_currency: Optional[str] = None
+    # Grupo vinculado de una entidad; enviar null para desvincular.
+    linked_group_jid: Optional[str] = None
 
 
 class ClientList(BaseModel):
@@ -52,3 +56,12 @@ class ClientList(BaseModel):
     total: int
     skip: int
     limit: int
+
+
+class ClientCreate(BaseModel):
+    """
+    Alta manual de un cliente-entidad (un negocio sin teléfono en el bot). Los clientes
+    normales no se crean por aquí: nacen del tráfico del bot.
+    """
+    display_name: str
+    linked_group_jid: Optional[str] = None

@@ -17,8 +17,9 @@ from app.database.connection import get_db
 from app.models.user import User
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.repositories.whatsapp_client_repository import WhatsAppClientRepository
-from app.schemas.client import ClientList, ClientResponse, ClientUpdate
+from app.schemas.client import ClientCreate, ClientList, ClientResponse, ClientUpdate
 from app.schemas.whatsapp import ClientLoanRepaymentCreate, WhatsAppBalanceAdjust
+from app.services.client_entity_service import ClientEntityService
 from app.services.client_loan_service import ClientLoanService
 from app.services.whatsapp_balance_service import WhatsAppBalanceService
 from app.services.whatsapp_client_account_service import WhatsAppClientAccountService
@@ -60,6 +61,20 @@ async def add_client_loan_repayment(
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.post("", response_model=ClientResponse, status_code=status.HTTP_201_CREATED)
+async def create_entity_client(
+    payload: ClientCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),  # mutación: moderador+
+):
+    """Da de alta un negocio sin teléfono propio como cliente-entidad."""
+    try:
+        entity = ClientEntityService(db).create(payload.display_name, payload.linked_group_jid)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+    return ClientResponse(**entity.dict(), balance=0.0)
 
 
 @router.get("", response_model=ClientList)

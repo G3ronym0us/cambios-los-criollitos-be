@@ -76,6 +76,7 @@ async def create_client_loan(
             bcv_amount=payload.bcv_amount,
             notes=payload.notes,
             created_by_user_id=current_user.id,
+            client_uuid=payload.client_uuid,
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)

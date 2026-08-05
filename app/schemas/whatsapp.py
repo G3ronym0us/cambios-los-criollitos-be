@@ -368,6 +368,8 @@ class ClientLoanCreate(BaseModel):
     usdt_amount: Optional[float] = Field(None, gt=0)
     bcv_amount: Optional[float] = Field(None, gt=0)
     notes: Optional[str] = None
+    # Deudor explícito. Obligatorio cuando el comprobante se mandó a un grupo.
+    client_uuid: Optional[UUID] = None
 
     @validator("preferred_value")
     def validate_preferred_value(cls, value: str) -> str:

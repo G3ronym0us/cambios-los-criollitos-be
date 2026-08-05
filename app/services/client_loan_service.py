@@ -18,7 +18,7 @@ from app.models.whatsapp_client import WhatsAppClient
 from app.models.whatsapp_payment import WhatsAppOutgoingPayment
 from app.services import valuation
 from app.services.bcv_service import get_cached_bcv_rate
-from app.services.whatsapp_quote_service import QuoteServiceError
+from app.services.whatsapp_quote_service import QuoteServiceError, is_unassigned_client_phone
 from app.services.whatsapp_rate_resolver import WhatsAppRateResolver
 
 
@@ -172,6 +172,17 @@ class ClientLoanService:
             else:
                 bcv_amount = float(fiat_amount) / bcv_rate
 
+        requires_borrower = is_unassigned_client_phone(payment.client_phone)
+        suggested_client = None
+        if requires_borrower:
+            entity = (
+                self.db.query(WhatsAppClient)
+                .filter(WhatsAppClient.linked_group_jid == payment.client_phone)
+                .first()
+            )
+            if entity is not None:
+                suggested_client = {"uuid": entity.uuid, "display_name": entity.display_name}
+
         return {
             "payment_id": payment.id,
             "detected_amount": float(payment.amount),
@@ -186,6 +197,8 @@ class ClientLoanService:
             "bcv_rate_at": bcv_rate_at,
             "valuation_at": valuation_at,
             "warnings": warnings,
+            "requires_borrower": requires_borrower,
+            "suggested_client": suggested_client,
         }
 
     def _loan_by_uuid(self, loan_uuid: UUID) -> ClientLoan:
@@ -199,6 +212,43 @@ class ClientLoanService:
             raise QuoteServiceError("loan_not_found", "Préstamo no encontrado", 404)
         return loan
 
+    def _resolve_borrower(self, payment, client_uuid: Optional[UUID]) -> WhatsAppClient:
+        """
+        A nombre de quién queda el préstamo. Cuando el comprobante se mandó al grupo del
+        negocio (o el cliente todavía es anónimo) el teléfono no dice nada: el operador
+        tiene que decir el deudor. Un `client_uuid` explícito manda siempre.
+        """
+        if client_uuid is not None:
+            client = (
+                self.db.query(WhatsAppClient)
+                .filter(WhatsAppClient.uuid == str(client_uuid))
+                .first()
+            )
+            if client is None:
+                raise QuoteServiceError("client_not_found", "El deudor indicado no existe", 404)
+        else:
+            if is_unassigned_client_phone(payment.client_phone):
+                raise QuoteServiceError(
+                    "loan_borrower_required",
+                    "Indica a nombre de quién queda el préstamo",
+                    400,
+                )
+            client = (
+                self.db.query(WhatsAppClient)
+                .filter(WhatsAppClient.phone == payment.client_phone)
+                .first()
+            )
+            if client is None:
+                raise QuoteServiceError("client_not_found", "El pago no tiene un cliente válido", 404)
+
+        if is_unassigned_client_phone(client.phone):
+            raise QuoteServiceError(
+                "loan_client_invalid",
+                "Un cliente anónimo no puede ser el deudor de un préstamo",
+                400,
+            )
+        return client
+
     def create_from_outgoing(
         self,
         payment_id: int,
@@ -210,6 +260,7 @@ class ClientLoanService:
         bcv_amount: Optional[float] = None,
         notes: Optional[str] = None,
         created_by_user_id: Optional[int] = None,
+        client_uuid: Optional[UUID] = None,
     ) -> dict:
         payment = (
             self.db.query(WhatsAppOutgoingPayment)
@@ -218,8 +269,7 @@ class ClientLoanService:
         )
         if payment is None:
             raise QuoteServiceError("not_found", f"Pago outgoing/{payment_id} no encontrado", 404)
-        if payment.client_phone.endswith("@g.us"):
-            raise QuoteServiceError("invalid_client", "No se puede registrar un préstamo a un grupo", 400)
+        client = self._resolve_borrower(payment, client_uuid)
         if payment.whatsapp_operation_id is not None:
             raise QuoteServiceError(
                 "payment_has_operation",
@@ -299,10 +349,6 @@ class ClientLoanService:
                 changed(bcv_amount, suggested_bcv),
             )
         )
-
-        client = self.db.query(WhatsAppClient).filter(WhatsAppClient.phone == payment.client_phone).first()
-        if client is None:
-            raise QuoteServiceError("client_not_found", "El pago no tiene un cliente válido", 404)
 
         loan = ClientLoan(
             client_id=client.id,

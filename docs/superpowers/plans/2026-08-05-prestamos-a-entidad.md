@@ -461,7 +461,7 @@ git commit -m "feat: create entity clients from the operator panel"
   - `preview_outgoing()` devuelve además `"requires_borrower": bool` y `"suggested_client": {"uuid": str, "display_name": str} | None`
   - Códigos de error nuevos: `loan_borrower_required` (400), `loan_client_invalid` (400)
 
-- [ ] **Step 1: Escribir los tests que fallan**
+- [x] **Step 1: Escribir los tests que fallan**
 
 Agregar a `backend/tests/test_client_loans.py` (los imports de arriba ya existen; agregar los que faltan):
 
@@ -576,12 +576,12 @@ def test_preview_suggests_the_entity_linked_to_the_group(db, ves_rates, entity):
     assert preview["suggested_client"] == {"uuid": entity.uuid, "display_name": "Bodegón X"}
 ```
 
-- [ ] **Step 2: Correr los tests y verificar que fallan**
+- [x] **Step 2: Correr los tests y verificar que fallan**
 
 Run: `cd backend && pytest tests/test_client_loans.py -v`
 Expected: FAIL — el primero con `invalid_client` ("No se puede registrar un préstamo a un grupo") en vez de `loan_borrower_required`; los demás con `TypeError: create_from_outgoing() got an unexpected keyword argument 'client_uuid'` y `KeyError: 'requires_borrower'`.
 
-- [ ] **Step 3: Resolver el deudor en el servicio**
+- [x] **Step 3: Resolver el deudor en el servicio**
 
 En `backend/app/services/client_loan_service.py`, agregar al import del quote service:
 
@@ -630,7 +630,7 @@ Agregar el método justo antes de `create_from_outgoing`:
         return client
 ```
 
-- [ ] **Step 4: Cambiar el bloqueo por la resolución del deudor**
+- [x] **Step 4: Cambiar el bloqueo por la resolución del deudor**
 
 En `create_from_outgoing`, agregar el parámetro a la firma (después de `payment_id`):
 
@@ -661,7 +661,7 @@ por:
 
 **Importante:** mover esa línea al principio del método, justo después de comprobar que el pago existe y antes de calcular equivalencias — así un deudor inválido falla antes de consultar tasas.
 
-- [ ] **Step 5: Sugerir la entidad en el preview**
+- [x] **Step 5: Sugerir la entidad en el preview**
 
 En `preview_outgoing`, antes del `return`:
 
@@ -685,7 +685,7 @@ Y dos claves nuevas en el dict devuelto:
             "suggested_client": suggested_client,
 ```
 
-- [ ] **Step 6: Pasar el deudor desde el router y el schema**
+- [x] **Step 6: Pasar el deudor desde el router y el schema**
 
 En `backend/app/schemas/whatsapp.py`, dentro de `ClientLoanCreate` (después de `preferred_value`):
 
@@ -702,12 +702,12 @@ En `backend/app/routers/payments.py`, dentro de `create_client_loan`, agregar el
             client_uuid=payload.client_uuid,
 ```
 
-- [ ] **Step 7: Correr los tests y verificar que pasan**
+- [x] **Step 7: Correr los tests y verificar que pasan**
 
 Run: `cd backend && pytest tests/test_client_loans.py -v`
 Expected: PASS (7 tests).
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 cd backend

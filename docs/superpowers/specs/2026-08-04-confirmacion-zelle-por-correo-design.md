@@ -250,12 +250,24 @@ Se avisa en vez de callar porque una confirmación equivocada haría entregar Bs
 **Buzón ilegible (credencial revocada, red caída).** Es la falla más peligrosa: si la
 escalera siguiera corriendo, llegarían "🚨 SIN CONFIRMAR" de pagos buenos y el operador
 dejaría de creerle al sistema. Por eso, cuando un buzón falla, las verificaciones
-pendientes **congelan su escalera** (`frozen_until`) en vez de avanzar, y tras ~5 minutos
-de fallos seguidos se avisa distinto:
+pendientes **congelan su escalera** (`frozen_until`) en vez de avanzar.
 
-```
-🚨 No puedo leer el correo de Mariana — revisar credenciales
-```
+El aviso distingue dos causas, porque confundirlas cuesta caro en las dos direcciones.
+Un timeout contra Gmail se cura solo en la vuelta siguiente; avisar de eso entrena al
+operador a ignorar las alertas. Una contraseña revocada no se arregla sola y cada minuto
+que pasa es un pago sin verificar.
+
+- **Fallo transitorio**: se avisa recién al tercer intento seguido (≈3 min), y el
+  contador se borra en cuanto el buzón responde.
+  ```
+  ⚠️ No pude leer el correo de Mariana en los últimos 3 intentos: The read operation
+     timed out. Sigo reintentando; si se recupera no hace falta hacer nada.
+  ```
+- **Credenciales rechazadas** (`MailboxAuthFailed`): se avisa al primer fallo.
+  ```
+  🚨 Gmail rechazó las credenciales de Mariana — hay que regenerar la contraseña de
+     aplicación. Los Zelle de esa cuenta no se están verificando.
+  ```
 
 El sistema nunca declara "no confirmado" cuando en realidad no pudo mirar.
 

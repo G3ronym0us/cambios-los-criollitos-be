@@ -108,3 +108,34 @@ def build_escalation_message(step: int, *, amount: Decimal, client_phone: str) -
         f"{icon} ${_fmt(amount)} sigue sin aparecer en los correos ({label}) — "
         f"comprobante de {client_phone}"
     )
+
+
+#: Fallos seguidos de un buzón antes de molestar al operador. El poller corre cada minuto,
+#: así que son ~3 min de estar realmente caído. Avisar al primer fallo convierte cualquier
+#: parpadeo de red contra Gmail en una falsa alarma de credenciales.
+MAILBOX_FAILURE_ALERT_THRESHOLD = 3
+
+
+def should_alert_mailbox_down(consecutive_failures: int, *, is_auth_failure: bool) -> bool:
+    """
+    ¿Toca avisar de que un buzón no se puede leer?
+
+    Las credenciales rechazadas avisan de una: no se arreglan solas y cada minuto que pasa
+    es un pago sin verificar. Lo demás (timeouts, cortes de red) espera al umbral.
+    """
+    if is_auth_failure:
+        return consecutive_failures >= 1
+    return consecutive_failures >= MAILBOX_FAILURE_ALERT_THRESHOLD
+
+
+def build_mailbox_down_message(label: str, reason: str, *, is_auth_failure: bool) -> str:
+    if is_auth_failure:
+        return (
+            f"🚨 *Gmail rechazó las credenciales de {label}* — hay que regenerar la "
+            f"contraseña de aplicación. Los Zelle de esa cuenta no se están verificando."
+        )
+    return (
+        f"⚠️ *No pude leer el correo de {label}* en los últimos "
+        f"{MAILBOX_FAILURE_ALERT_THRESHOLD} intentos: {reason}. "
+        f"Sigo reintentando; si se recupera no hace falta hacer nada."
+    )

@@ -27,6 +27,16 @@ class MailboxUnavailable(Exception):
     """No se pudo leer el buzón (credenciales, red, Gmail caído)."""
 
 
+class MailboxAuthFailed(MailboxUnavailable):
+    """
+    Gmail rechazó las credenciales.
+
+    Se distingue del resto porque NO se arregla sola: un timeout de red se cura en la
+    vuelta siguiente y no vale la pena molestar al operador, una contraseña revocada
+    necesita que alguien la regenere.
+    """
+
+
 def _decode(value: Optional[str]) -> str:
     if not value:
         return ""
@@ -82,7 +92,11 @@ def fetch_recent_headers(box: MailboxConfig, *, since_days: int = 1) -> list[Raw
     conn = None
     try:
         conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=IMAP_TIMEOUT_SECONDS)
-        conn.login(box.email, box.password)
+        try:
+            conn.login(box.email, box.password)
+        except imaplib.IMAP4.error as e:
+            # Gmail responde NO con AUTHENTICATIONFAILED; imaplib lo convierte en error.
+            raise MailboxAuthFailed(f"Gmail rechazó las credenciales de {box.label}: {e}") from e
         conn.select("INBOX", readonly=True)
 
         # Una búsqueda por banco en vez de traerse la bandeja entera: el buzón del

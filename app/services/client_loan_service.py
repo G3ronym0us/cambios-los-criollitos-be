@@ -538,6 +538,60 @@ class ClientLoanService:
             "repayments": [entry.dict() for entry in loan.repayments],
         }
 
+    def _outstanding_in_usdt(self, currency: str, amount: float) -> Optional[float]:
+        """
+        Cuánto valen hoy en USDT `amount` unidades de una referencia. Devuelve None si
+        falta la tasa: preferimos no dar una cifra a dar una inventada.
+        """
+        if amount <= LOAN_EPSILON:
+            return 0.0
+        if currency == "USDT":
+            return float(amount)
+        try:
+            if currency == "USD_BCV":
+                # La deuda está en dólares a tasa oficial: se pasa por bolívares, que es
+                # donde esa referencia tiene precio.
+                rate = get_cached_bcv_rate(self.db)
+                if rate is None or rate <= 0:
+                    return None
+                converted, _ = self._convert(float(amount) * float(rate), "VES", "USDT")
+                return converted
+            converted, _ = self._convert(float(amount), currency, "USDT")
+            return converted
+        except QuoteServiceError:
+            return None
+
+    def _totals(self, loans: list[ClientLoan]) -> dict:
+        by_reference: dict[str, float] = {}
+        for loan in loans:
+            if loan.status not in (ClientLoanStatus.OPEN, ClientLoanStatus.PARTIAL):
+                continue
+            outstanding = loan.outstanding_amount
+            if outstanding <= LOAN_EPSILON:
+                continue
+            key = loan.preferred_currency
+            by_reference[key] = by_reference.get(key, 0.0) + outstanding
+
+        warnings: list[str] = []
+        usdt_total: Optional[float] = 0.0
+        for currency, amount in by_reference.items():
+            converted = self._outstanding_in_usdt(currency, amount)
+            if converted is None:
+                label = "USD (BCV)" if currency == "USD_BCV" else currency
+                warnings.append(f"No hay tasa para convertir {label} a USDT")
+                usdt_total = None
+            elif usdt_total is not None:
+                usdt_total += converted
+
+        return {
+            "by_reference": [
+                {"currency": currency, "amount": round(amount, 8)}
+                for currency, amount in sorted(by_reference.items())
+            ],
+            "usdt_total": round(usdt_total, 8) if usdt_total is not None else None,
+            "warnings": warnings,
+        }
+
     def list_for_client(self, client_uuid: UUID) -> dict:
         client = self.db.query(WhatsAppClient).filter(WhatsAppClient.uuid == str(client_uuid)).first()
         if client is None:
@@ -549,7 +603,11 @@ class ClientLoanService:
             .order_by(ClientLoan.created_at.desc())
             .all()
         )
-        return {"client_uuid": client.uuid, "loans": [self.serialize(loan) for loan in loans]}
+        return {
+            "client_uuid": client.uuid,
+            "loans": [self.serialize(loan) for loan in loans],
+            "totals": self._totals(loans),
+        }
 
     def add_repayment(
         self,

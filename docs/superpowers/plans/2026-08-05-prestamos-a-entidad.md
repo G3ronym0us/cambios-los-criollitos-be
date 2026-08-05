@@ -1148,7 +1148,7 @@ git commit -m "feat: register loans without a receipt"
 - Consumes: `ClientLoanService._convert(amount, from, to) -> tuple[float, float]` (ya existe; lanza `QuoteServiceError` si falta tasa); `get_cached_bcv_rate(db)` (ya importado).
 - Produces: `list_for_client()` devuelve `{"client_uuid", "loans", "totals": {"by_reference": [{"currency": str, "amount": float}], "usdt_total": float | None, "warnings": [str]}}`
 
-- [ ] **Step 1: Escribir los tests que fallan**
+- [x] **Step 1: Escribir los tests que fallan**
 
 Agregar a `backend/tests/test_client_loans.py`:
 
@@ -1208,12 +1208,12 @@ def test_paid_loans_do_not_count_towards_the_total(db, ves_rates, entity):
     assert totals["usdt_total"] == pytest.approx(0.0)
 ```
 
-- [ ] **Step 2: Correr los tests y verificar que fallan**
+- [x] **Step 2: Correr los tests y verificar que fallan**
 
 Run: `cd backend && pytest tests/test_client_loans.py -v -k totals`
 Expected: FAIL con `KeyError: 'totals'`.
 
-- [ ] **Step 3: Implementar los totales**
+- [x] **Step 3: Implementar los totales**
 
 En `backend/app/services/client_loan_service.py`, agregar antes de `list_for_client`:
 
@@ -1283,12 +1283,17 @@ Y cambiar el `return` de `list_for_client`:
         }
 ```
 
-- [ ] **Step 4: Correr toda la suite de préstamos**
+- [x] **Step 4: Correr toda la suite de préstamos**
 
 Run: `cd backend && pytest tests/test_client_loans.py tests/test_client_entities.py -v`
 Expected: PASS (21 tests).
 
-- [ ] **Step 5: Commit**
+> Nota: en la ejecución real dieron 22, no 21 — `test_client_entities.py` ya traía un séptimo
+> test (`test_long_name_fits_in_the_phone_column`) agregado en el commit `0224b80` ("fix: keep
+> entity keys inside the phone column width"), ajeno a este plan. Los 3 tests nuevos de esta
+> tarea pasan igual; no se tocó ese test preexistente.
+
+- [x] **Step 5: Commit**
 
 ```bash
 cd backend

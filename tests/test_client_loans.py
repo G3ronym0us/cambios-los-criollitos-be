@@ -255,3 +255,60 @@ def test_repayment_closes_a_manual_bcv_loan(db, ves_rates, entity):
 
     assert after["outstanding_amount"] == pytest.approx(0.0)
     assert after["status"] == "PAID"
+
+
+def test_totals_group_by_reference_and_sum_in_usdt(db, ves_rates, entity):
+    service = ClientLoanService(db)
+    at = datetime.now(timezone.utc) - timedelta(hours=2)
+    service.create_manual(
+        client_uuid=entity.uuid, preferred_value="BCV", fiat_currency="VES",
+        fiat_amount=5000, valuation_at=at,
+    )
+    service.create_manual(
+        client_uuid=entity.uuid, preferred_value="USDT", fiat_currency="VES",
+        fiat_amount=2500, valuation_at=at,
+    )
+
+    totals = service.list_for_client(entity.uuid)["totals"]
+
+    by_reference = {row["currency"]: row["amount"] for row in totals["by_reference"]}
+    assert by_reference["USD_BCV"] == pytest.approx(12.5)
+    assert by_reference["USDT"] == pytest.approx(5.0)
+    # 12.5 USD BCV → 5000 VES → 10 USDT, más los 5 USDT del segundo préstamo.
+    assert totals["usdt_total"] == pytest.approx(15.0)
+    assert totals["warnings"] == []
+
+
+def test_totals_survive_a_missing_rate(db, ves_rates, entity):
+    service = ClientLoanService(db)
+    at = datetime.now(timezone.utc) - timedelta(hours=2)
+    service.create_manual(
+        client_uuid=entity.uuid, preferred_value="FIAT", fiat_currency="VES",
+        fiat_amount=5000, valuation_at=at,
+    )
+    # Se cae la tasa activa VES/USDT: el subtotal sigue, el total en USDT no se puede.
+    db.query(ExchangeRate).update({ExchangeRate.is_active: False})
+    db.flush()
+
+    totals = service.list_for_client(entity.uuid)["totals"]
+
+    assert totals["by_reference"] == [{"currency": "VES", "amount": pytest.approx(5000.0)}]
+    assert totals["usdt_total"] is None
+    assert len(totals["warnings"]) == 1
+
+
+def test_paid_loans_do_not_count_towards_the_total(db, ves_rates, entity):
+    service = ClientLoanService(db)
+    at = datetime.now(timezone.utc) - timedelta(hours=2)
+    loan = service.create_manual(
+        client_uuid=entity.uuid, preferred_value="BCV", fiat_currency="VES",
+        fiat_amount=5000, valuation_at=at,
+    )
+    # `serialize()` devuelve `loan["uuid"]` ya como `UUID` (no string): pasarlo tal cual,
+    # como en `test_repayment_closes_a_manual_bcv_loan`.
+    service.add_repayment(loan["uuid"], 12.5)
+
+    totals = service.list_for_client(entity.uuid)["totals"]
+
+    assert totals["by_reference"] == []
+    assert totals["usdt_total"] == pytest.approx(0.0)

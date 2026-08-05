@@ -387,6 +387,28 @@ class ClientLoanCreate(BaseModel):
         return value.strip().upper() if value else None
 
 
+class ClientLoanManualCreate(BaseModel):
+    """Préstamo dado de alta a mano, sin comprobante que lo respalde."""
+    preferred_value: str = Field(..., description="FIAT | USDT | BCV")
+    fiat_currency: str = Field(..., min_length=2, max_length=10)
+    fiat_amount: float = Field(..., gt=0)
+    valuation_at: datetime
+    usdt_amount: Optional[float] = Field(None, gt=0)
+    bcv_amount: Optional[float] = Field(None, gt=0)
+    notes: Optional[str] = None
+
+    @validator("preferred_value")
+    def validate_preferred_value(cls, value: str) -> str:
+        value = value.upper()
+        if value not in {"FIAT", "USDT", "BCV"}:
+            raise ValueError("preferred_value must be FIAT, USDT or BCV")
+        return value
+
+    @validator("fiat_currency")
+    def normalize_fiat_currency(cls, value: str) -> str:
+        return value.strip().upper()
+
+
 class ClientLoanRepaymentCreate(BaseModel):
     """Abono expresado en la referencia preferida del préstamo."""
     preferred_amount: float = Field(..., gt=0)

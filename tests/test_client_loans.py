@@ -176,3 +176,82 @@ def test_preview_suggests_the_entity_linked_to_the_group(db, ves_rates, entity):
 
     assert preview["requires_borrower"] is True
     assert preview["suggested_client"] == {"uuid": entity.uuid, "display_name": "Bodegón X"}
+
+
+def test_manual_valuation_uses_historical_rates(db, ves_rates, entity):
+    at = datetime.now(timezone.utc) - timedelta(hours=2)
+
+    preview = ClientLoanService(db).preview_manual(entity.uuid, 5000, "VES", at)
+
+    assert preview["usdt_amount"] == pytest.approx(10.0)   # 5000 / 500
+    assert preview["bcv_amount"] == pytest.approx(12.5)    # 5000 / 400
+    assert preview["warnings"] == []
+
+
+def test_manual_loan_is_created_without_a_receipt(db, ves_rates, entity, operator):
+    at = datetime.now(timezone.utc) - timedelta(hours=2)
+
+    loan = ClientLoanService(db).create_manual(
+        client_uuid=entity.uuid,
+        preferred_value="BCV",
+        fiat_currency="VES",
+        fiat_amount=5000,
+        valuation_at=at,
+        notes="Factura de luz",
+        created_by_user_id=operator.id,
+    )
+
+    assert loan["outgoing_payment_id"] is None
+    assert loan["preferred_currency"] == "USD_BCV"
+    assert loan["outstanding_amount"] == pytest.approx(12.5)
+    assert loan["manual_values"] is False
+
+
+def test_manual_loan_flags_corrected_equivalences(db, ves_rates, entity):
+    at = datetime.now(timezone.utc) - timedelta(hours=2)
+
+    loan = ClientLoanService(db).create_manual(
+        client_uuid=entity.uuid,
+        preferred_value="USDT",
+        fiat_currency="VES",
+        fiat_amount=5000,
+        valuation_at=at,
+        usdt_amount=9.0,  # el operador corrige el equivalente sugerido (10.0)
+    )
+
+    assert loan["manual_values"] is True
+    assert loan["usdt_amount"] == pytest.approx(9.0)
+
+
+def test_manual_loan_rejects_a_future_date(db, ves_rates, entity):
+    at = datetime.now(timezone.utc) + timedelta(days=1)
+
+    with pytest.raises(QuoteServiceError) as exc:
+        ClientLoanService(db).create_manual(
+            client_uuid=entity.uuid,
+            preferred_value="FIAT",
+            fiat_currency="VES",
+            fiat_amount=5000,
+            valuation_at=at,
+        )
+
+    assert exc.value.code == "invalid_valuation_date"
+
+
+def test_repayment_closes_a_manual_bcv_loan(db, ves_rates, entity):
+    service = ClientLoanService(db)
+    at = datetime.now(timezone.utc) - timedelta(hours=2)
+    loan = service.create_manual(
+        client_uuid=entity.uuid,
+        preferred_value="BCV",
+        fiat_currency="VES",
+        fiat_amount=5000,
+        valuation_at=at,
+    )
+
+    # `serialize()` devuelve `loan.uuid` tal cual: ya es un `UUID` (columna `as_uuid=True`),
+    # no un string — envolverlo en `UUID(...)` de nuevo revienta.
+    after = service.add_repayment(loan["uuid"], 12.5)
+
+    assert after["outstanding_amount"] == pytest.approx(0.0)
+    assert after["status"] == "PAID"

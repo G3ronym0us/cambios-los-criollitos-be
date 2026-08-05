@@ -734,7 +734,7 @@ git commit -m "feat: name the borrower when a loan receipt was sent to a group"
   - `POST /clients/{uuid}/loans` (201)
   - Código de error nuevo: `invalid_valuation_date` (400)
 
-- [ ] **Step 1: Escribir los tests que fallan**
+- [x] **Step 1: Escribir los tests que fallan**
 
 Agregar a `backend/tests/test_client_loans.py`:
 
@@ -818,12 +818,12 @@ def test_repayment_closes_a_manual_bcv_loan(db, ves_rates, entity):
 
 Agregar `from uuid import UUID` a los imports del test.
 
-- [ ] **Step 2: Correr los tests y verificar que fallan**
+- [x] **Step 2: Correr los tests y verificar que fallan**
 
 Run: `cd backend && pytest tests/test_client_loans.py -v`
 Expected: FAIL con `AttributeError: 'ClientLoanService' object has no attribute 'preview_manual'`.
 
-- [ ] **Step 3: Extraer la validación y la persistencia compartidas**
+- [x] **Step 3: Extraer la validación y la persistencia compartidas**
 
 En `backend/app/services/client_loan_service.py`, agregar dos métodos privados antes de `create_from_outgoing`:
 
@@ -940,12 +940,12 @@ Y reemplazar el bloque de validación de `preferred`/`fiat_currency` (líneas 23
         preferred, fiat_currency = self._validate_reference(preferred_value, fiat_currency)
 ```
 
-- [ ] **Step 4: Correr los tests existentes para verificar que el refactor no rompió nada**
+- [x] **Step 4: Correr los tests existentes para verificar que el refactor no rompió nada**
 
 Run: `cd backend && pytest tests/test_client_loans.py -v -k "not manual"`
 Expected: PASS (los 7 tests de las tareas 1 y 3).
 
-- [ ] **Step 5: Escribir el alta manual**
+- [x] **Step 5: Escribir el alta manual**
 
 Agregar al final de `ClientLoanService`:
 
@@ -1040,12 +1040,12 @@ Agregar al final de `ClientLoanService`:
         )
 ```
 
-- [ ] **Step 6: Correr los tests y verificar que pasan**
+- [x] **Step 6: Correr los tests y verificar que pasan**
 
 Run: `cd backend && pytest tests/test_client_loans.py -v`
 Expected: PASS (12 tests).
 
-- [ ] **Step 7: Exponer los endpoints**
+- [x] **Step 7: Exponer los endpoints**
 
 En `backend/app/schemas/whatsapp.py`, después de `ClientLoanCreate`:
 
@@ -1117,7 +1117,7 @@ async def create_manual_loan(
 
 **Ojo con el orden de rutas:** `/{client_uuid}/loans/valuation` debe declararse antes que cualquier ruta `/{client_uuid}/loans/{loan_uuid}/...` para que FastAPI no interprete `valuation` como un uuid. Ponerlo justo después de `get_client_loans` cumple.
 
-- [ ] **Step 8: Verificar los endpoints a mano**
+- [x] **Step 8: Verificar los endpoints a mano**
 
 Run:
 ```bash
@@ -1128,7 +1128,7 @@ curl -s -G localhost:8000/clients/$ENTITY_UUID/loans/valuation \
 ```
 Expected: JSON con `usdt_amount`, `bcv_amount` y `warnings`.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 cd backend

@@ -6,6 +6,7 @@ Expone los clientes del bot (`whatsapp_clients`) bajo `/clients` — sin el pref
 router `/whatsapp/*` (X-Bot-Token) sigue siendo de uso exclusivo del bot.
 """
 
+from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
@@ -18,7 +19,7 @@ from app.models.user import User
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.repositories.whatsapp_client_repository import WhatsAppClientRepository
 from app.schemas.client import ClientCreate, ClientList, ClientResponse, ClientUpdate
-from app.schemas.whatsapp import ClientLoanRepaymentCreate, WhatsAppBalanceAdjust
+from app.schemas.whatsapp import ClientLoanManualCreate, ClientLoanRepaymentCreate, WhatsAppBalanceAdjust
 from app.services.client_entity_service import ClientEntityService
 from app.services.client_loan_service import ClientLoanService
 from app.services.whatsapp_balance_service import WhatsAppBalanceService
@@ -36,6 +37,46 @@ async def get_client_loans(
 ):
     try:
         return ClientLoanService(db).list_for_client(client_uuid)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.get("/{client_uuid}/loans/valuation")
+async def preview_manual_loan_valuation(
+    client_uuid: UUID,
+    amount: float = Query(..., gt=0),
+    currency: str = Query(..., min_length=2, max_length=10),
+    at: datetime = Query(..., description="Fecha del préstamo (ISO 8601)"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Equivalencias de un préstamo sin comprobante, con las tasas de la fecha indicada."""
+    try:
+        return ClientLoanService(db).preview_manual(client_uuid, amount, currency, at)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.post("/{client_uuid}/loans", status_code=status.HTTP_201_CREATED)
+async def create_manual_loan(
+    client_uuid: UUID,
+    payload: ClientLoanManualCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Registra un préstamo a mano, sin comprobante."""
+    try:
+        return ClientLoanService(db).create_manual(
+            client_uuid=client_uuid,
+            preferred_value=payload.preferred_value,
+            fiat_currency=payload.fiat_currency,
+            fiat_amount=payload.fiat_amount,
+            valuation_at=payload.valuation_at,
+            usdt_amount=payload.usdt_amount,
+            bcv_amount=payload.bcv_amount,
+            notes=payload.notes,
+            created_by_user_id=current_user.id,
+        )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 

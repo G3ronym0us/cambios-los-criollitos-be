@@ -29,6 +29,18 @@ def _decimal(value: float) -> Decimal:
     return Decimal(str(round(float(value), 8)))
 
 
+def _changed(provided: Optional[float], suggested: Optional[float]) -> bool:
+    """
+    ¿El operador corrigió la sugerencia? El frontend trabaja con centavos; el redondeo
+    automático a dos decimales no debe quedar auditado como una corrección manual.
+    """
+    if provided is None:
+        return False
+    if suggested is None:
+        return True
+    return abs(float(provided) - float(suggested)) > 0.005000001
+
+
 class ClientLoanService:
     def __init__(self, db: Session):
         self.db = db
@@ -249,6 +261,71 @@ class ClientLoanService:
             )
         return client
 
+    def _validate_reference(self, preferred_value: str, fiat_currency: str) -> tuple[ClientLoanPreferredValue, str]:
+        try:
+            preferred = ClientLoanPreferredValue(preferred_value.upper())
+        except ValueError:
+            raise QuoteServiceError("invalid_preferred_value", "Referencia preferida inválida", 400)
+        currency = fiat_currency.strip().upper()
+        if not currency or currency == "USDT":
+            raise QuoteServiceError("invalid_fiat_currency", "Selecciona una moneda fiat válida", 400)
+        if preferred == ClientLoanPreferredValue.BCV and currency != "VES":
+            raise QuoteServiceError(
+                "bcv_requires_ves",
+                "La referencia BCV solo está disponible cuando la moneda fiat es VES",
+                400,
+            )
+        return preferred, currency
+
+    def _persist_loan(
+        self,
+        *,
+        client: WhatsAppClient,
+        outgoing_payment_id: Optional[int],
+        preferred: ClientLoanPreferredValue,
+        fiat_currency: str,
+        fiat_amount: Optional[float],
+        usdt_amount: Optional[float],
+        bcv_amount: Optional[float],
+        valuation_at: datetime,
+        manual_values: bool,
+        notes: Optional[str],
+        created_by_user_id: Optional[int],
+    ) -> dict:
+        """Guarda el préstamo con sus tres equivalencias. Compartido por las dos altas."""
+        if fiat_amount is None or fiat_amount <= 0:
+            raise QuoteServiceError("invalid_fiat_amount", "Indica un valor fiat válido", 400)
+        if usdt_amount is None or usdt_amount <= 0:
+            raise QuoteServiceError("invalid_usdt_amount", "Indica un valor USDT válido", 400)
+        if fiat_currency == "VES" and (bcv_amount is None or bcv_amount <= 0):
+            raise QuoteServiceError("invalid_bcv_amount", "Indica un valor BCV válido", 400)
+
+        usdt_rate = float(fiat_amount) / float(usdt_amount)
+        bcv_rate = (
+            float(fiat_amount) / float(bcv_amount)
+            if fiat_currency == "VES" and bcv_amount is not None
+            else None
+        )
+        loan = ClientLoan(
+            client_id=client.id,
+            outgoing_payment_id=outgoing_payment_id,
+            fiat_amount=_decimal(fiat_amount),
+            fiat_currency=fiat_currency,
+            usdt_amount=_decimal(usdt_amount),
+            usdt_rate=_decimal(usdt_rate),
+            bcv_amount=_decimal(bcv_amount) if bcv_amount is not None else None,
+            bcv_rate=_decimal(bcv_rate) if bcv_rate is not None else None,
+            valuation_at=valuation_at,
+            manual_values=manual_values,
+            preferred_value=preferred,
+            notes=notes,
+            created_by_user_id=created_by_user_id,
+        )
+        self.db.add(loan)
+        self.db.commit()
+        self.db.refresh(loan)
+        return self.serialize(loan)
+
     def create_from_outgoing(
         self,
         payment_id: int,
@@ -286,20 +363,7 @@ class ClientLoanService:
         if existing is not None:
             raise QuoteServiceError("loan_already_exists", "Este pago ya está registrado como préstamo", 409)
 
-        try:
-            preferred = ClientLoanPreferredValue(preferred_value.upper())
-        except ValueError:
-            raise QuoteServiceError("invalid_preferred_value", "Referencia preferida inválida", 400)
-
-        fiat_currency = fiat_currency.strip().upper()
-        if not fiat_currency or fiat_currency == "USDT":
-            raise QuoteServiceError("invalid_fiat_currency", "Selecciona una moneda fiat válida", 400)
-        if preferred == ClientLoanPreferredValue.BCV and fiat_currency != "VES":
-            raise QuoteServiceError(
-                "bcv_requires_ves",
-                "La referencia BCV solo está disponible cuando la moneda fiat es VES",
-                400,
-            )
+        preferred, fiat_currency = self._validate_reference(preferred_value, fiat_currency)
 
         preview = self.preview_outgoing(payment_id, fiat_currency, payment_currency)
         if not preview["detected_currency"]:
@@ -319,56 +383,115 @@ class ClientLoanService:
         if fiat_currency != "VES":
             bcv_amount = None
 
-        if fiat_amount is None or fiat_amount <= 0:
-            raise QuoteServiceError("invalid_fiat_amount", "Indica un valor fiat válido", 400)
-        if usdt_amount is None or usdt_amount <= 0:
-            raise QuoteServiceError("invalid_usdt_amount", "Indica un valor USDT válido", 400)
-        if fiat_currency == "VES" and (bcv_amount is None or bcv_amount <= 0):
-            raise QuoteServiceError("invalid_bcv_amount", "Indica un valor BCV válido", 400)
-
-        usdt_rate = float(fiat_amount) / float(usdt_amount)
-        bcv_rate = (
-            float(fiat_amount) / float(bcv_amount)
-            if fiat_currency == "VES" and bcv_amount is not None
-            else None
-        )
-
-        def changed(provided: Optional[float], suggested: Optional[float]) -> bool:
-            if provided is None:
-                return False
-            if suggested is None:
-                return True
-            # El frontend trabaja con centavos; el redondeo automático a dos
-            # decimales no debe quedar auditado como una corrección manual.
-            return abs(float(provided) - float(suggested)) > 0.005000001
-
         manual_values = any(
             (
-                changed(fiat_amount, suggested_fiat),
-                changed(usdt_amount, suggested_usdt),
-                changed(bcv_amount, suggested_bcv),
+                _changed(fiat_amount, suggested_fiat),
+                _changed(usdt_amount, suggested_usdt),
+                _changed(bcv_amount, suggested_bcv),
             )
         )
-
-        loan = ClientLoan(
-            client_id=client.id,
+        return self._persist_loan(
+            client=client,
             outgoing_payment_id=payment.id,
-            fiat_amount=_decimal(fiat_amount),
+            preferred=preferred,
             fiat_currency=fiat_currency,
-            usdt_amount=_decimal(usdt_amount),
-            usdt_rate=_decimal(usdt_rate),
-            bcv_amount=_decimal(bcv_amount) if bcv_amount is not None else None,
-            bcv_rate=_decimal(bcv_rate) if bcv_rate is not None else None,
+            fiat_amount=fiat_amount,
+            usdt_amount=usdt_amount,
+            bcv_amount=bcv_amount,
             valuation_at=preview["valuation_at"],
             manual_values=manual_values,
-            preferred_value=preferred,
             notes=notes,
             created_by_user_id=created_by_user_id,
         )
-        self.db.add(loan)
-        self.db.commit()
-        self.db.refresh(loan)
-        return self.serialize(loan)
+
+    def _client_by_uuid(self, client_uuid: UUID) -> WhatsAppClient:
+        client = (
+            self.db.query(WhatsAppClient).filter(WhatsAppClient.uuid == str(client_uuid)).first()
+        )
+        if client is None:
+            raise QuoteServiceError("client_not_found", "Cliente no encontrado", 404)
+        if is_unassigned_client_phone(client.phone):
+            raise QuoteServiceError(
+                "loan_client_invalid",
+                "Un cliente anónimo no puede ser el deudor de un préstamo",
+                400,
+            )
+        return client
+
+    @staticmethod
+    def _check_valuation_date(at: datetime) -> datetime:
+        moment = at if at.tzinfo is not None else at.replace(tzinfo=timezone.utc)
+        if moment > datetime.now(timezone.utc):
+            raise QuoteServiceError(
+                "invalid_valuation_date", "La fecha del préstamo no puede ser futura", 400
+            )
+        return moment
+
+    def preview_manual(
+        self, client_uuid: UUID, amount: float, fiat_currency: str, at: datetime
+    ) -> dict:
+        """Equivalencias de un préstamo dado de alta a mano, con las tasas de esa fecha."""
+        self._client_by_uuid(client_uuid)
+        moment = self._check_valuation_date(at)
+        currency = (fiat_currency or "").strip().upper()
+        if not currency or currency == "USDT":
+            raise QuoteServiceError("invalid_fiat_currency", "Selecciona una moneda fiat válida", 400)
+        if amount is None or amount <= 0:
+            raise QuoteServiceError("invalid_fiat_amount", "Indica un valor fiat válido", 400)
+
+        eq = valuation.equivalents(self.db, float(amount), currency, moment)
+        return {
+            "fiat_amount": float(amount),
+            "fiat_currency": currency,
+            "usdt_amount": eq["usdt_amount"],
+            "usdt_rate": eq["usdt_rate"],
+            "bcv_amount": eq["bcv_amount"],
+            "bcv_rate": eq["bcv_rate"],
+            "valuation_at": moment,
+            "warnings": eq["warnings"],
+        }
+
+    def create_manual(
+        self,
+        client_uuid: UUID,
+        preferred_value: str,
+        fiat_currency: str,
+        fiat_amount: float,
+        valuation_at: datetime,
+        usdt_amount: Optional[float] = None,
+        bcv_amount: Optional[float] = None,
+        notes: Optional[str] = None,
+        created_by_user_id: Optional[int] = None,
+    ) -> dict:
+        """Préstamo sin comprobante: el operador pone monto, moneda y fecha."""
+        client = self._client_by_uuid(client_uuid)
+        preferred, currency = self._validate_reference(preferred_value, fiat_currency)
+        moment = self._check_valuation_date(valuation_at)
+
+        preview = self.preview_manual(client_uuid, fiat_amount, currency, moment)
+        suggested_usdt = preview["usdt_amount"]
+        suggested_bcv = preview["bcv_amount"]
+        final_usdt = usdt_amount if usdt_amount is not None else suggested_usdt
+        final_bcv = bcv_amount if bcv_amount is not None else suggested_bcv
+        if currency != "VES":
+            final_bcv = None
+
+        manual_values = any(
+            (_changed(usdt_amount, suggested_usdt), _changed(bcv_amount, suggested_bcv))
+        )
+        return self._persist_loan(
+            client=client,
+            outgoing_payment_id=None,
+            preferred=preferred,
+            fiat_currency=currency,
+            fiat_amount=float(fiat_amount),
+            usdt_amount=final_usdt,
+            bcv_amount=final_bcv,
+            valuation_at=moment,
+            manual_values=manual_values,
+            notes=notes,
+            created_by_user_id=created_by_user_id,
+        )
 
     def _current_fiat_due(self, loan: ClientLoan) -> tuple[Optional[float], Optional[float]]:
         outstanding = loan.outstanding_amount

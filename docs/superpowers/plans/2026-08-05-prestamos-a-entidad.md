@@ -2194,7 +2194,7 @@ git commit -m "feat: show total debt and register loans by hand"
 - Consumes: `LoanReferenceFields` (Task 7), `clientService.getClients` (ya existe), `LoanValuation.requires_borrower` / `.suggested_client` (Task 6), `paymentService.createLoan({..., clientUuid})` (Task 6).
 - Produces: nada que consuman otras tareas.
 
-- [ ] **Step 1: Estado del deudor**
+- [x] **Step 1: Estado del deudor**
 
 Junto a los demás `useState` del diálogo (~línea 99):
 
@@ -2203,7 +2203,7 @@ Junto a los demás `useState` del diálogo (~línea 99):
   const [borrowerOptions, setBorrowerOptions] = useState<{ uuid: string; label: string }[]>([]);
 ```
 
-- [ ] **Step 2: Cargar candidatos y preseleccionar la entidad**
+- [x] **Step 2: Cargar candidatos y preseleccionar la entidad**
 
 Dentro del `useEffect`/callback que ya carga la valuación (`loadLoanValuation`), después de guardar el resultado:
 
@@ -2237,7 +2237,7 @@ Y un efecto nuevo que sólo corre cuando hace falta elegir:
 
 Importar `clientService` de `@/services/clientService` e `isUnassignedClientPhone` de `@/utils/functions`.
 
-- [ ] **Step 3: Pintar el selector**
+- [x] **Step 3: Pintar el selector**
 
 En el paso `loan`, justo antes del bloque de referencias:
 
@@ -2264,7 +2264,7 @@ En el paso `loan`, justo antes del bloque de referencias:
                 ) : null}
 ```
 
-- [ ] **Step 4: Reemplazar el bloque inline por el componente compartido**
+- [x] **Step 4: Reemplazar el bloque inline por el componente compartido**
 
 Sustituir todo el bloque de las tarjetas de referencia (desde `<div className="space-y-1.5">` con el `Label` "Referencia para llevar la deuda", ~línea 668, hasta el `</div>` que cierra el `role="radiogroup"`, ~línea 771) por:
 
@@ -2286,7 +2286,7 @@ Sustituir todo el bloque de las tarjetas de referencia (desde `<div className="s
 
 Importar `LoanReferenceFields` de `@/components/loans/LoanReferenceFields`. Borrar `setAmountWithTwoDecimals` si queda sin usar (la lógica vive ahora en el componente).
 
-- [ ] **Step 5: Mandar el deudor y bloquear el envío sin él**
+- [x] **Step 5: Mandar el deudor y bloquear el envío sin él**
 
 En el handler que llama a `paymentService.createLoan` (~línea 355), agregar la guarda y el campo:
 
@@ -2303,14 +2303,14 @@ y dentro del objeto que se manda:
       clientUuid: borrowerUuid,
 ```
 
-- [ ] **Step 6: Verificar**
+- [x] **Step 6: Verificar**
 
 Run: `cd frontend && npm run build`
 Expected: build limpio.
 
 Manual, con backend corriendo: en `/admin/payments` (salientes), abrir un comprobante mandado al grupo del negocio → "Préstamo". Aparece el selector con la entidad preseleccionada; al confirmar, el préstamo queda en la ficha de la entidad. Repetir con un comprobante de un teléfono normal: el selector no aparece y el flujo es el de siempre.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 cd frontend

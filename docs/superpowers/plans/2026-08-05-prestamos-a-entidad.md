@@ -1684,7 +1684,7 @@ git commit -m "feat: create and display entity clients"
   - `LoanReferenceFields` con props `{ fiatCurrencyLabel: string; bcvEnabled: boolean; preferredValue: LoanPreferredValue; onPreferredValueChange: (value: LoanPreferredValue) => void; fiatAmount: string; usdtAmount: string; bcvAmount: string; onFiatAmountChange: (value: string) => void; onUsdtAmountChange: (value: string) => void; onBcvAmountChange: (value: string) => void; idPrefix: string }`
   - `useClientProfile()` expone `state.loanTotals: LoanTotals | null` y `actions.createLoan(body: ManualLoanCreate): Promise<boolean>`
 
-- [ ] **Step 1: Crear el componente compartido de referencias**
+- [x] **Step 1: Crear el componente compartido de referencias**
 
 Crear `frontend/src/components/loans/LoanReferenceFields.tsx`:
 
@@ -1844,7 +1844,7 @@ export function LoanReferenceFields({
 }
 ```
 
-- [ ] **Step 2: Diálogo de alta manual**
+- [x] **Step 2: Diálogo de alta manual**
 
 Crear `frontend/src/app/admin/clients/[uuid]/_components/NewLoanDialog.tsx`:
 
@@ -2031,7 +2031,7 @@ export function NewLoanDialog({ clientUuid, open, onOpenChange, onCreate }: NewL
 }
 ```
 
-- [ ] **Step 3: Guardar los totales y el alta en el hook**
+- [x] **Step 3: Guardar los totales y el alta en el hook**
 
 En `frontend/src/app/admin/clients/[uuid]/_hooks/useClientProfile.ts`:
 
@@ -2069,7 +2069,7 @@ Y agregar la acción:
 
 Exponer `loanTotals` en `state` y `createLoan` en `actions`. Importar `LoanTotals` y `ManualLoanCreate` de `@/types/client`.
 
-- [ ] **Step 4: Totales y botón en la pestaña**
+- [x] **Step 4: Totales y botón en la pestaña**
 
 En `ClientLoansTab.tsx`:
 
@@ -2164,18 +2164,18 @@ por:
 </h3>
 ```
 
-- [ ] **Step 5: Pasar las props desde la página**
+- [x] **Step 5: Pasar las props desde la página**
 
 En `frontend/src/app/admin/clients/[uuid]/page.tsx`, donde se renderiza `<ClientLoansTab ... />`, agregar `clientUuid={uuid}`, `totals={state.loanTotals}` y `onCreateLoan={actions.createLoan}`.
 
-- [ ] **Step 6: Verificar**
+- [x] **Step 6: Verificar**
 
 Run: `cd frontend && npm run test && npm run build`
 Expected: PASS y build limpio.
 
 Manual, con el backend corriendo: en la ficha de la entidad → pestaña Préstamos → "Registrar préstamo" con 5000 VES, fecha de ayer y referencia USD BCV. Se crea, la tarjeta dice "Préstamo sin comprobante" y arriba aparece el total en USDT con el subtotal en USD (BCV).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 cd frontend

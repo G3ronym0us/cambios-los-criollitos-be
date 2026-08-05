@@ -28,6 +28,7 @@ from app.schemas.whatsapp import (
     WhatsAppIrrelevant,
     PaymentAllocationsUpdate,
     WhatsAppPaymentLink,
+    WhatsAppPaymentUpdate,
     WhatsAppPersonalExpense,
     ClientLoanCreate,
 )
@@ -161,6 +162,28 @@ async def list_payments(
             date_from=start,
             date_to=end,
         )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.patch("/{table}/{payment_id}")
+async def update_payment(
+    table: Literal["incoming", "outgoing"],
+    payment_id: int,
+    payload: WhatsAppPaymentUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Corrige a mano los campos que el OCR leyó mal (monto, moneda, referencia, bancos...).
+    Guarda el valor previo en `correction_original` y marca `corrected_at`, igual que la
+    corrección que hace el bot: el operador ve después qué había leído la máquina.
+
+    Solo se aplican los campos presentes en el body (`exclude_unset`).
+    """
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.update_payment(table, payment_id, payload.dict(exclude_unset=True))
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 

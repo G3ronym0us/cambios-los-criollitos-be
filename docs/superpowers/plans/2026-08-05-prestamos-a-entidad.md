@@ -27,7 +27,7 @@
 ### Task 1: Migración y modelo — entidad vinculada a un grupo, préstamo sin comprobante
 
 **Files:**
-- Create: `backend/alembic/versions/b5c6d7e8f9a0_entity_clients_and_manual_loans.py`
+- Create: `backend/alembic/versions/18e341e018c3_entity_clients_and_manual_loans.py`
 - Modify: `backend/app/models/whatsapp_client.py:22-44` (columnas) y `:57-77` (`dict()`)
 - Modify: `backend/app/models/client_loan.py:36-42`
 - Test: `backend/tests/test_client_loans.py`
@@ -125,12 +125,12 @@ En `backend/app/models/client_loan.py`, líneas 36-42:
 
 - [x] **Step 5: Escribir la migración**
 
-Crear `backend/alembic/versions/b5c6d7e8f9a0_entity_clients_and_manual_loans.py`:
+Crear `backend/alembic/versions/18e341e018c3_entity_clients_and_manual_loans.py`:
 
 ```python
 """entity clients and manual loans
 
-Revision ID: b5c6d7e8f9a0
+Revision ID: 18e341e018c3
 Revises: 31ac3d9074b1
 Create Date: 2026-08-05
 """
@@ -139,7 +139,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "b5c6d7e8f9a0"
+revision = "18e341e018c3"
 down_revision = "31ac3d9074b1"
 branch_labels = None
 depends_on = None
@@ -185,7 +185,7 @@ Expected: `outgoing_payment_id` sin `not null`; `linked_group_jid` presente. Los
 
 ```bash
 cd backend
-git add app/models/whatsapp_client.py app/models/client_loan.py alembic/versions/b5c6d7e8f9a0_entity_clients_and_manual_loans.py tests/test_client_loans.py
+git add app/models/whatsapp_client.py app/models/client_loan.py alembic/versions/18e341e018c3_entity_clients_and_manual_loans.py tests/test_client_loans.py
 git commit -m "feat: allow entity clients and loans without a receipt"
 ```
 

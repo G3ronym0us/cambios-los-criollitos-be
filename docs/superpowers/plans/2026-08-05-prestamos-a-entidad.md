@@ -1323,7 +1323,7 @@ git commit -m "feat: report a client's total outstanding debt"
   - `clientService.createManualLoan(clientUuid, body): Promise<ApiResponse<LoanData>>`
   - Tipos `LoanTotals`, `ManualLoanValuation`; `ClientLoansSummary.totals`; `LoanData.outgoing_payment_id: number | null`
 
-- [ ] **Step 1: Escribir el test que falla**
+- [x] **Step 1: Escribir el test que falla**
 
 Crear `frontend/src/utils/clientPhone.test.ts`:
 
@@ -1345,12 +1345,12 @@ describe('isEntityClientPhone', () => {
 });
 ```
 
-- [ ] **Step 2: Correr el test y verificar que falla**
+- [x] **Step 2: Correr el test y verificar que falla**
 
 Run: `cd frontend && npm run test -- clientPhone`
 Expected: FAIL — `isEntityClientPhone is not a function`.
 
-- [ ] **Step 3: Agregar el helper**
+- [x] **Step 3: Agregar el helper**
 
 En `frontend/src/utils/functions.ts`, después de `isUnassignedClientPhone`:
 
@@ -1364,12 +1364,12 @@ export const isEntityClientPhone = (phone: string | null | undefined): boolean =
   !!phone && phone.startsWith('entity:');
 ```
 
-- [ ] **Step 4: Correr el test y verificar que pasa**
+- [x] **Step 4: Correr el test y verificar que pasa**
 
 Run: `cd frontend && npm run test -- clientPhone`
 Expected: PASS.
 
-- [ ] **Step 5: Actualizar los tipos**
+- [x] **Step 5: Actualizar los tipos**
 
 En `frontend/src/types/client.ts`:
 
@@ -1415,7 +1415,7 @@ En `frontend/src/services/paymentService.ts`, al tipo `LoanValuation` (donde est
 
 Y en `createLoan`, agregar `clientUuid?: string | null;` al objeto `body` y `client_uuid: body.clientUuid ?? null,` al payload.
 
-- [ ] **Step 6: Agregar los métodos al servicio de clientes**
+- [x] **Step 6: Agregar los métodos al servicio de clientes**
 
 En `frontend/src/services/clientService.ts` (importar los tipos nuevos):
 
@@ -1454,7 +1454,7 @@ En `frontend/src/services/clientService.ts` (importar los tipos nuevos):
   }
 ```
 
-- [ ] **Step 7: Diálogo de alta de entidad**
+- [x] **Step 7: Diálogo de alta de entidad**
 
 Crear `frontend/src/app/admin/clients/_components/NewEntityDialog.tsx`:
 
@@ -1548,7 +1548,7 @@ export function NewEntityDialog({ open, onOpenChange, onCreate }: NewEntityDialo
 }
 ```
 
-- [ ] **Step 8: Conectar el diálogo a la página**
+- [x] **Step 8: Conectar el diálogo a la página**
 
 En `frontend/src/app/admin/clients/_hooks/useClients.ts`, agregar dentro del hook (antes del `return`):
 
@@ -1636,7 +1636,7 @@ export default function ClientsAdminPage() {
 
 Si `PageHeader` no acepta `actions`, revisar `frontend/src/components/shared/PageHeader.tsx` y agregar la prop `actions?: React.ReactNode` renderizada a la derecha del título.
 
-- [ ] **Step 9: Mostrar la entidad como entidad en la lista**
+- [x] **Step 9: Mostrar la entidad como entidad en la lista**
 
 En `frontend/src/app/admin/clients/_components/ClientItem.tsx`, donde se pinta `client.phone`, envolver con:
 
@@ -1652,14 +1652,14 @@ En `frontend/src/app/admin/clients/_components/ClientItem.tsx`, donde se pinta `
 
 Importar `isEntityClientPhone` de `@/utils/functions`.
 
-- [ ] **Step 10: Verificar compilación y flujo**
+- [x] **Step 10: Verificar compilación y flujo**
 
 Run: `cd frontend && npm run test && npm run build`
 Expected: tests PASS, build sin errores de tipo.
 
 Manual: en `/admin/clients`, crear "Bodegón X" con un JID; aparece en la lista mostrando "Entidad" en vez de un teléfono; su ficha abre sin errores.
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 cd frontend

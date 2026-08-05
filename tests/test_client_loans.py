@@ -107,6 +107,35 @@ def entity(db):
     return ClientEntityService(db).create("Bodegón X", "120363000000000000@g.us")
 
 
+def test_converting_to_usdt_divides_when_the_pair_is_stored_backwards(db, entity):
+    """
+    En producción la tasa vive como `USDT→VES 252` (bolívares por USDT, multiplicar).
+    Convertir VES→USDT tiene que DIVIDIR: el resolver de cotizaciones invertía el número
+    y el flag a la vez —dos inversiones— y multiplicaba, inflando los totales y la
+    equivalencia USDT de cada abono en varios órdenes de magnitud.
+    """
+    pair = CurrencyPair(
+        from_currency_id=_currency(db, "USDT").id,
+        to_currency_id=_currency(db, "VES").id,
+        pair_symbol="USDT-VES",
+        is_active=True,
+    )
+    db.add(pair)
+    db.flush()
+    db.add(ExchangeRate(
+        currency_pair_id=pair.id,
+        from_currency="USDT", to_currency="VES", rate=252.0,
+        inverse_percentage=False, is_active=True,
+        created_at=datetime.now(timezone.utc) - timedelta(days=1),
+    ))
+    db.flush()
+
+    converted, rate = ClientLoanService(db)._convert(9401.18, "VES", "USDT")
+
+    assert converted == pytest.approx(37.306, abs=0.001)
+    assert rate == pytest.approx(1 / 252, abs=0.00001)
+
+
 def test_loan_from_group_payment_requires_a_borrower(db, ves_rates):
     payment = factories.outgoing(db, 5000, "VES", phone="120363000000000000@g.us")
 
@@ -286,8 +315,9 @@ def test_totals_survive_a_missing_rate(db, ves_rates, entity):
         client_uuid=entity.uuid, preferred_value="FIAT", fiat_currency="VES",
         fiat_amount=5000, valuation_at=at,
     )
-    # Se cae la tasa activa VES/USDT: el subtotal sigue, el total en USDT no se puede.
-    db.query(ExchangeRate).update({ExchangeRate.is_active: False})
+    # Desaparece la tasa VES/USDT: el subtotal sigue, el total en USDT no se puede.
+    # (Desactivarla no basta: valorar mira la última tasa registrada, activa o no.)
+    db.query(ExchangeRate).delete()
     db.flush()
 
     totals = service.list_for_client(entity.uuid)["totals"]

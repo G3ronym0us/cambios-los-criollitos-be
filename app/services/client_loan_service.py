@@ -19,7 +19,6 @@ from app.models.whatsapp_payment import WhatsAppOutgoingPayment
 from app.services import valuation
 from app.services.bcv_service import get_cached_bcv_rate
 from app.services.whatsapp_quote_service import QuoteServiceError, is_unassigned_client_phone
-from app.services.whatsapp_rate_resolver import WhatsAppRateResolver
 
 
 LOAN_EPSILON = 0.00000001
@@ -44,24 +43,32 @@ def _changed(provided: Optional[float], suggested: Optional[float]) -> bool:
 class ClientLoanService:
     def __init__(self, db: Session):
         self.db = db
-        self.resolver = WhatsAppRateResolver(db)
 
     def _convert(self, amount: float, from_currency: str, to_currency: str) -> tuple[float, float]:
-        """Devuelve (monto convertido, unidades destino por unidad origen), sin margen comercial."""
+        """
+        Devuelve (monto convertido, unidades destino por unidad origen), sin margen comercial.
+
+        Se apoya en `valuation` en vez del resolver de cotizaciones: al recorrer un par en
+        sentido contrario (la tasa se guarda USDT→VES y aquí hace falta VES→USDT), el
+        resolver invierte el número Y el flag multiplicar/dividir, o sea dos veces, y acaba
+        multiplicando donde toca dividir. `valuation.historical_rate` conserva la tasa y
+        solo intercambia la operación, que es lo correcto.
+        """
         source = from_currency.upper()
         target = to_currency.upper()
         if float(amount) == 0:
             return 0.0, 0.0
         if source == target or {source, target} == {"USD", "USDT"}:
             return float(amount), 1.0
-        entry = self.resolver.get_rate_entry_for_pair(source, target)
-        if entry is None or entry.base_rate <= 0:
+        converted, _ = valuation.historical_convert(
+            self.db, float(amount), source, target, datetime.now(timezone.utc)
+        )
+        if converted is None or converted <= 0:
             raise QuoteServiceError(
                 "loan_rate_unavailable",
                 f"No hay una tasa disponible para convertir {source} a {target}",
                 409,
             )
-        converted = self.resolver.apply_rate(float(amount), entry.base_rate, entry.inverse_percentage)
         return float(converted), float(converted) / float(amount)
 
     def _bcv_values(self, fiat_amount: float, fiat_currency: str) -> tuple[Optional[float], Optional[float]]:

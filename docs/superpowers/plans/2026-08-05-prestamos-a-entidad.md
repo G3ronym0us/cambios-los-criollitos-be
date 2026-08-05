@@ -2322,7 +2322,7 @@ git commit -m "feat: pick the borrower when a loan receipt came from a group"
 
 ## Verificación final
 
-- [ ] `cd backend && pytest -v` — toda la suite en verde (no solo los archivos nuevos).
-- [ ] `cd frontend && npm run test && npm run build`.
-- [ ] Recorrido completo en local: crear la entidad con su grupo → mandar un comprobante al grupo desde el bot (o crear el pago saliente a mano) → marcarlo como préstamo con el deudor preseleccionado → registrar un segundo préstamo a mano en USD BCV → ver el total en USDT con los dos subtotales → abonar hasta cerrar uno y comprobar que sale del total.
-- [ ] `cd backend && alembic downgrade -1 && alembic upgrade head` sobre una copia de la BD local, para confirmar que la migración va y viene.
+- [x] `cd backend && pytest -v` — toda la suite en verde (no solo los archivos nuevos).
+- [x] `cd frontend && npm run test && npm run build`.
+- [x] Recorrido completo en local: crear la entidad con su grupo → mandar un comprobante al grupo desde el bot (o crear el pago saliente a mano) → marcarlo como préstamo con el deudor preseleccionado → registrar un segundo préstamo a mano en USD BCV → ver el total en USDT con los dos subtotales → abonar hasta cerrar uno y comprobar que sale del total.
+- [x] `cd backend && alembic downgrade -1 && alembic upgrade head` sobre una copia de la BD local, para confirmar que la migración va y viene.

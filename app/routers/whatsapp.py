@@ -392,9 +392,10 @@ def match_forwarded_incoming(
     principal: BotPrincipal = Depends(get_bot_principal),
 ):
     """
-    Qué pago entrante es el Zelle que el operador acaba de reenviar a un grupo — el mismo
+    Qué pago entrante es el comprobante que el operador acaba de reenviar a un grupo — el mismo
     comprobante saliendo como asiento contable. Tolerancia ±0,1% y ventana de 60 min, y nunca
-    un entrante ya reenviado a otro grupo.
+    un entrante ya reenviado a otro grupo. Fuera de Zelle exige además referencia o huella de
+    OCR coincidente.
     """
     criteria = ForwardedCriteria(
         provider=payload.provider,
@@ -403,6 +404,7 @@ def match_forwarded_incoming(
         reference=payload.reference,
         identification=payload.identification,
         phone_to=payload.phone_to,
+        raw_text=payload.raw_text,
         window_minutes=payload.window_minutes,
     )
     match = OperationMatchService(db).auto_match_forwarded_incoming(criteria)

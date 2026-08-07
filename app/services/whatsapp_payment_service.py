@@ -8,7 +8,6 @@ resolvemos sus vínculos con las operaciones.
 """
 
 import json
-import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
@@ -39,6 +38,7 @@ from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.repositories.fund_repository import FundRepository
 from app.services import valuation
 from app.schemas.whatsapp import WhatsAppOperationComplete
+from app.services.operation_match_service import receipt_fingerprint
 from app.services.whatsapp_client_account_service import WhatsAppClientAccountService
 from app.services.whatsapp_quote_service import (
     QuoteServiceError,
@@ -208,10 +208,9 @@ class WhatsAppPaymentService:
     # generosa porque el parecido no es de monto: es el texto exacto de una misma imagen.
     DUPLICATE_WINDOW = timedelta(days=7)
 
-    @staticmethod
-    def _receipt_fingerprint(text: Optional[str]) -> str:
-        """El texto del OCR sin espacios ni mayúsculas: dos lecturas de la MISMA captura."""
-        return re.sub(r"\s+", " ", (text or "")).strip().lower()
+    #: La misma huella que usa el matcher de reenvíos al grupo, para que "es la misma captura"
+    #: signifique lo mismo en los dos sitios.
+    _receipt_fingerprint = staticmethod(receipt_fingerprint)
 
     def _already_received(self, payload) -> tuple[Optional[object], Optional[str]]:
         """

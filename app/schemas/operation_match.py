@@ -36,7 +36,7 @@ class OutgoingMatchResponse(BaseModel):
 
 
 class ForwardedMatchRequest(BaseModel):
-    """Criterios del Zelle que el operador reenvió a un grupo."""
+    """Criterios del comprobante que el operador reenvió a un grupo."""
 
     provider: Optional[str] = None
     amount: Optional[float] = None
@@ -44,6 +44,8 @@ class ForwardedMatchRequest(BaseModel):
     reference: Optional[str] = None
     identification: Optional[str] = None
     phone_to: Optional[str] = None
+    #: Texto del OCR: fuera de Zelle es lo que prueba que es el MISMO comprobante.
+    raw_text: Optional[str] = None
     window_minutes: int = Field(FORWARDED_WINDOW_MINUTES, ge=1, le=1440)
 
 

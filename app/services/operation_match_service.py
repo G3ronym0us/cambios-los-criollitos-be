@@ -24,6 +24,7 @@ el ranking puede sugerir donde el bot se abstiene, nunca al revés.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional, Sequence
@@ -54,9 +55,14 @@ MIN_TOKEN_LENGTH = 4
 #: Estados en los que una operación sigue admitiendo el comprobante del cliente.
 OPEN_STATUSES = ("QUOTED", "PENDING")
 
-#: El Zelle reenviado es el MISMO comprobante, no uno parecido: tolerancia mucho más dura.
+#: El comprobante reenviado es el MISMO, no uno parecido: tolerancia mucho más dura.
 FORWARDED_TOLERANCE = 0.001
 FORWARDED_WINDOW_MINUTES = 60
+
+
+def receipt_fingerprint(text: Optional[str]) -> str:
+    """El texto del OCR sin espacios de más ni mayúsculas: dos lecturas de la MISMA captura."""
+    return re.sub(r"\s+", " ", (text or "")).strip().lower()
 
 
 def _aware(value: Optional[datetime]) -> Optional[datetime]:
@@ -139,7 +145,7 @@ class OutgoingCriteria:
 
 @dataclass
 class IncomingCandidate:
-    """Un entrante ya registrado, candidato a ser el Zelle que se reenvió al grupo."""
+    """Un entrante ya registrado, candidato a ser el comprobante que se reenvió al grupo."""
 
     id: int
     amount: Optional[float]
@@ -149,6 +155,7 @@ class IncomingCandidate:
     reference: Optional[str] = None
     identification: Optional[str] = None
     phone_to: Optional[str] = None
+    raw_text: Optional[str] = None
 
     @classmethod
     def from_model(cls, p: WhatsAppIncomingPayment) -> "IncomingCandidate":
@@ -161,6 +168,7 @@ class IncomingCandidate:
             reference=p.reference,
             identification=p.identification,
             phone_to=p.phone_to,
+            raw_text=p.raw_text,
         )
 
 
@@ -172,6 +180,8 @@ class ForwardedCriteria:
     reference: Optional[str] = None
     identification: Optional[str] = None
     phone_to: Optional[str] = None
+    #: Texto del OCR del comprobante reenviado: la prueba de que es la MISMA imagen.
+    raw_text: Optional[str] = None
     window_minutes: int = FORWARDED_WINDOW_MINUTES
 
     def tokens(self) -> list[str]:
@@ -377,15 +387,26 @@ def pick_forwarded_incoming(
     now: datetime,
 ) -> Optional[int]:
     """
-    El entrante Zelle que se reenvió a un grupo: es el MISMO comprobante saliendo como
-    asiento contable, así que la tolerancia es ±0,1% y la ventana de 60 min. Un Zelle no
-    puede reenviarse a dos grupos, de ahí `used_source_ids`.
+    El entrante que se reenvió a un grupo: es el MISMO comprobante saliendo como asiento
+    contable, así que la tolerancia es ±0,1% y la ventana de 60 min. Un comprobante no puede
+    reenviarse a dos grupos, de ahí `used_source_ids`.
 
-    Semántica histórica de `selectForwardedIncoming`, preservada sin cambios.
+    Vale para CUALQUIER moneda, no solo Zelle (caso BRL→VES, 2026-08-06: el entrante en reales
+    reenviado al grupo se guardaba como un saliente fantasma además del pago real en Bs).
+
+    Zelle se queda con la semántica histórica —monto, proveedor y su confirmación única
+    bastan—. Para el resto de monedas eso no alcanza: dos pagos móviles del mismo monto en una
+    hora son cosa de todos los días, y confundirlos borraría un saliente REAL. Por eso se exige
+    una prueba de que es el mismo comprobante: la referencia bancaria, o la huella del texto
+    del OCR (reenviar es mandar la misma imagen, así que el texto sale idéntico).
     """
-    if criteria.currency != "ZELLE":
+    if criteria.amount is None or criteria.amount <= 0 or not criteria.currency:
         return None
-    if criteria.amount is None or criteria.amount <= 0:
+
+    fingerprint = receipt_fingerprint(criteria.raw_text)
+    #: Sin referencia ni huella no hay forma de afirmar que es el mismo comprobante.
+    needs_proof = criteria.currency != "ZELLE" and not criteria.reference
+    if needs_proof and not fingerprint:
         return None
 
     since = now - timedelta(minutes=criteria.window_minutes or FORWARDED_WINDOW_MINUTES)
@@ -395,15 +416,16 @@ def pick_forwarded_incoming(
     matches = [
         c
         for c in candidates
-        if c.currency == "ZELLE"
+        if c.currency == criteria.currency
         and c.amount is not None
         and lo <= c.amount <= hi
         and c.created_at is not None
         and c.created_at >= since
         and c.id not in used_source_ids
         and (not criteria.provider or (c.provider or "").lower() == criteria.provider.lower())
-        # Zelle trae confirmación única: si el comprobante la tiene, tiene que coincidir.
+        # Si el comprobante trae referencia, identifica la transferencia: tiene que coincidir.
         and (not criteria.reference or c.reference == criteria.reference)
+        and (not needs_proof or receipt_fingerprint(c.raw_text) == fingerprint)
     ]
     matches.sort(key=lambda c: c.created_at, reverse=True)
 
@@ -539,11 +561,11 @@ class OperationMatchService:
     def auto_match_forwarded_incoming(
         self, criteria: ForwardedCriteria, *, limit: int = 500
     ) -> Optional[WhatsAppIncomingPayment]:
-        if criteria.currency != "ZELLE" or not criteria.amount:
+        if not criteria.currency or not criteria.amount:
             return None
         rows = (
             self.db.query(WhatsAppIncomingPayment)
-            .filter(WhatsAppIncomingPayment.currency == "ZELLE")
+            .filter(WhatsAppIncomingPayment.currency == criteria.currency)
             .order_by(WhatsAppIncomingPayment.created_at.desc())
             .limit(limit)
             .all()

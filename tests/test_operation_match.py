@@ -291,7 +291,7 @@ def test_score_candidate_reports_signed_delta():
 
 
 # ---------------------------------------------------------------------------
-# Zelle reenviado al grupo (pick_forwarded_incoming)
+# Comprobante reenviado al grupo (pick_forwarded_incoming)
 # ---------------------------------------------------------------------------
 
 
@@ -318,8 +318,37 @@ def test_forwarded_matches_the_same_zelle_receipt():
     assert pick_forwarded_incoming([inc(7, 200.0)], set(), fwd(200.0), NOW) == 7
 
 
-def test_forwarded_only_applies_to_zelle():
+def test_forwarded_requires_the_same_currency():
     assert pick_forwarded_incoming([inc(7, 200.0)], set(), fwd(200.0, currency="VES"), NOW) is None
+
+
+def test_forwarded_matches_a_non_zelle_receipt_by_reference():
+    """Caso BRL→VES (2026-08-06): antes solo se miraba ZELLE y el reenvío del entrante en
+    reales se guardaba como un saliente fantasma, además del pago real en Bs."""
+    candidates = [inc(7, 500.0, currency="BRL", reference="E2E-778")]
+    criteria = fwd(500.0, currency="BRL", reference="E2E-778")
+    assert pick_forwarded_incoming(candidates, set(), criteria, NOW) == 7
+
+
+def test_forwarded_matches_a_non_zelle_receipt_by_ocr_fingerprint():
+    """Sin referencia, la prueba es que es literalmente la misma imagen: el mismo texto."""
+    text = "Comprovante PIX R$ 500,00 13/07 14:32"
+    candidates = [inc(7, 500.0, currency="BRL", raw_text=text)]
+    criteria = fwd(500.0, currency="BRL", raw_text="Comprovante PIX   R$ 500,00\n13/07 14:32")
+    assert pick_forwarded_incoming(candidates, set(), criteria, NOW) == 7
+
+
+def test_forwarded_non_zelle_rejects_a_different_receipt_of_the_same_amount():
+    """Dos pagos del mismo monto en una hora son normales fuera de Zelle; tragarse el
+    segundo como reenvío borraría un saliente REAL."""
+    candidates = [inc(7, 500.0, currency="BRL", raw_text="Comprovante PIX R$ 500,00 14:32")]
+    criteria = fwd(500.0, currency="BRL", raw_text="Comprovante PIX R$ 500,00 15:07")
+    assert pick_forwarded_incoming(candidates, set(), criteria, NOW) is None
+
+
+def test_forwarded_non_zelle_without_reference_or_text_does_not_match():
+    candidates = [inc(7, 4908.0, currency="VES", raw_text="Pago movil 4.908,00 Bs")]
+    assert pick_forwarded_incoming(candidates, set(), fwd(4908.0, currency="VES"), NOW) is None
 
 
 def test_forwarded_tolerance_is_tighter_than_the_outgoing_one():

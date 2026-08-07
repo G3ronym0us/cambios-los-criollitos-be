@@ -109,6 +109,24 @@ class CurrencyPairUpdate(BaseModel):
                 raise ValueError(f'Invalid pair_type. Must be one of: {", ".join([pt.value for pt in PairType])}')
         return v
 
+class CurrencyPairRateInfo(BaseModel):
+    """
+    Tasa vigente de un par, embebida en el listado.
+
+    El admin necesita la tasa como columna principal; pedirla par por par con
+    `/rates/by-pair/{uuid}` disparaba una llamada por fila. Se resuelve en lote
+    en el repositorio (ver `get_rate_info_for_pairs`).
+    """
+    rate: float
+    is_manual: bool = False
+    automatic_rate: Optional[float] = None
+    # Cuándo se leyó la tasa: cada corrida del monitor inserta una fila nueva,
+    # así que el `created_at` de la fila activa es la antigüedad de la tasa.
+    read_at: datetime
+    rate_24h_ago: Optional[float] = None
+    change_24h_percentage: Optional[float] = None
+
+
 class CurrencyPairResponse(BaseModel):
     uuid: UUID
     pair_symbol: str
@@ -139,6 +157,8 @@ class CurrencyPairResponse(BaseModel):
     rounding_amount_side: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
+    # Solo lo llenan los endpoints de listado y de detalle; el resto lo deja en None.
+    current_rate: Optional[CurrencyPairRateInfo] = None
 
     class Config:
         from_attributes = True

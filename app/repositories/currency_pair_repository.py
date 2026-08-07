@@ -24,6 +24,67 @@ class CurrencyPairRepository:
 
         return manual_rate is not None
 
+    def get_rate_info_for_pairs(self, pair_ids: List[int]) -> dict:
+        """
+        Tasa vigente (y su variación en 24 h) de varios pares, en dos consultas.
+
+        El listado de admin muestra la tasa como columna principal. Resolverla
+        par por par con `/rates/by-pair/{uuid}` costaba una llamada HTTP por
+        fila, así que se resuelve aquí en lote.
+
+        Devuelve `{pair_id: {rate, is_manual, automatic_rate, read_at,
+        rate_24h_ago, change_24h_percentage}}`. Los pares sin tasa activa
+        simplemente no aparecen en el dict.
+        """
+        from app.models.exchange_rate import ExchangeRate
+        from datetime import timedelta
+
+        if not pair_ids:
+            return {}
+
+        current = self.db.query(ExchangeRate).filter(
+            ExchangeRate.currency_pair_id.in_(pair_ids),
+            ExchangeRate.is_active == True
+        ).all()
+
+        # Cada corrida del monitor inserta una fila nueva y desactiva la anterior,
+        # así que la tasa de hace 24 h es la fila más reciente anterior al corte.
+        cutoff = datetime.utcnow() - timedelta(hours=24)
+        historical_rows = self.db.query(
+            ExchangeRate.currency_pair_id,
+            ExchangeRate.rate,
+        ).distinct(ExchangeRate.currency_pair_id).filter(
+            ExchangeRate.currency_pair_id.in_(pair_ids),
+            ExchangeRate.created_at <= cutoff,
+        ).order_by(
+            ExchangeRate.currency_pair_id,
+            desc(ExchangeRate.created_at),
+        ).all()
+        historical = {pair_id: rate for pair_id, rate in historical_rows}
+
+        info = {}
+        for rate_row in current:
+            # Si la propia tasa vigente es anterior al corte, la fila "de hace
+            # 24 h" sería ella misma: no hay variación que medir, no un 0 %.
+            is_current_fresh = rate_row.created_at is not None and (
+                rate_row.created_at.replace(tzinfo=None) > cutoff
+            )
+            old_rate = historical.get(rate_row.currency_pair_id) if is_current_fresh else None
+            change = None
+            if old_rate:
+                change = round((rate_row.rate - old_rate) / old_rate * 100, 4)
+
+            info[rate_row.currency_pair_id] = {
+                "rate": rate_row.rate,
+                "is_manual": bool(rate_row.is_manual),
+                "automatic_rate": rate_row.automatic_rate,
+                "read_at": rate_row.created_at,
+                "rate_24h_ago": old_rate,
+                "change_24h_percentage": change,
+            }
+
+        return info
+
     async def create_currency_pair(self, pair_data: CurrencyPairCreate) -> CurrencyPair:
         """Create new currency pair"""
         # Get currencies from UUIDs

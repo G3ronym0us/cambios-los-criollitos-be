@@ -98,8 +98,15 @@ async def get_currency_pairs(
         pairs = pair_repo.get_all_pairs(skip, limit, active_only, currency_symbol=currency)
         total = len(pairs) + skip if len(pairs) == limit else skip + len(pairs)
 
+    # La tasa vigente es la columna principal del listado; se resuelve en lote
+    # para no disparar una consulta por par.
+    rate_info = pair_repo.get_rate_info_for_pairs([pair.id for pair in pairs])
+
     return CurrencyPairList(
-        pairs=[CurrencyPairResponse(**pair.dict()) for pair in pairs],
+        pairs=[
+            CurrencyPairResponse(**pair.dict(), current_rate=rate_info.get(pair.id))
+            for pair in pairs
+        ],
         total=total,
         skip=skip,
         limit=limit
@@ -177,7 +184,12 @@ async def get_base_pairs(
     """
     pair_repo = CurrencyPairRepository(db)
     base_pairs = pair_repo.get_base_pairs()
-    return [CurrencyPairResponse(**pair.dict()) for pair in base_pairs]
+    # Al elegir el base de un par derivado se muestra a cuánto cotiza ahora.
+    rate_info = pair_repo.get_rate_info_for_pairs([pair.id for pair in base_pairs])
+    return [
+        CurrencyPairResponse(**pair.dict(), current_rate=rate_info.get(pair.id))
+        for pair in base_pairs
+    ]
 
 @router.get("/{pair_uuid}/derived", response_model=List[CurrencyPairResponse])
 async def get_derived_pairs(
@@ -215,7 +227,9 @@ async def get_currency_pair(
             detail="Currency pair not found"
         )
 
-    return CurrencyPairResponse(**pair.dict())
+    # La cabecera del detalle muestra la tasa vigente, igual que el listado.
+    rate_info = pair_repo.get_rate_info_for_pairs([pair.id])
+    return CurrencyPairResponse(**pair.dict(), current_rate=rate_info.get(pair.id))
 
 @router.get("/symbol/{pair_symbol}", response_model=CurrencyPairResponse)
 async def get_currency_pair_by_symbol(

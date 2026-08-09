@@ -90,6 +90,14 @@ def update_client_account(
         account.alias = (fields["alias"] or "").strip() or None
         account.alias_normalized = normalize_alias(account.alias)
     if "payment_info" in fields and fields["payment_info"]:
+        # `uq_client_account_payment_info` no deja dos veces la misma cuenta. Sin este aviso
+        # el choque salta como IntegrityError, y un 500 llega al panel como "error de
+        # conexión al servidor" (ver `ServerErrorsAsJSON`).
+        twin = repo.get_by_payment_info(account.client_id, fields["payment_info"])
+        if twin is not None and twin.id != account.id:
+            raise HTTPException(
+                status_code=409, detail="El cliente ya tiene esa cuenta guardada"
+            )
         account.payment_info = fields["payment_info"]
     if "currency" in fields and fields["currency"]:
         account.currency = fields["currency"].upper()

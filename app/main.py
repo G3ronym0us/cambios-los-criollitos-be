@@ -7,6 +7,7 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 from app.services.scraper_service import BinanceP2PScraperService
 from app.routers import scraping, auth, currency, currency_pair, binance, rates, transaction, user, commission_config, fund, notifications, whatsapp, clients, client_accounts, operations, payments
+from app.core.errors import ServerErrorsAsJSON
 from app.database.connection import get_db
 
 # Modelos Pydantic
@@ -60,6 +61,11 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+# Errores no controlados -> 500 con cuerpo JSON. Se agrega ANTES que el CORS para quedar por
+# dentro de él: si no, la respuesta sale sin cabeceras CORS y el panel la reporta como una
+# caída de conexión en vez del error que fue.
+app.add_middleware(ServerErrorsAsJSON)
 
 # CORS
 app.add_middleware(

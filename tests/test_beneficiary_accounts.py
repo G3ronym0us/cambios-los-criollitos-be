@@ -3,8 +3,20 @@ import pytest
 from app.services.beneficiary_accounts import (
     alias_matches,
     build_payment_block,
+    extract_masked_destination,
+    masked_matches_account,
     normalize_alias,
 )
+
+# OCR de un "Transferencias a terceros" del BDV: sin cédula y con las dos cuentas tapadas.
+BDV_RECEIPT = """Transferencias a terceros
+7.337,81 Bs
+Fecha: 06/08/2026
+Operación: 059134978386
+Nombre: Amelida Josefina Bastardo
+Origen: 0102****6476
+Destino: 0102****3817
+Concepto: pago"""
 
 
 class TestNormalizeAlias:
@@ -68,3 +80,49 @@ class TestBuildPaymentBlock:
 
     def test_account_without_id_returns_none(self):
         assert build_payment_block("01020113121301031941", None, None, "0102") is None
+
+
+class TestExtractMaskedDestination:
+    def test_reads_destination_and_ignores_origin(self):
+        assert extract_masked_destination(BDV_RECEIPT) == ("0102", "3817")
+
+    def test_accepts_other_labels_and_mask_characters(self):
+        assert extract_masked_destination("Cuenta receptor 0134 xxxx 0098") == ("0134", "0098")
+        assert extract_masked_destination("Beneficiaria: 0105••••7788") == ("0105", "7788")
+
+    def test_column_split_ocr_returns_none(self):
+        # La etiqueta y su valor quedaron en líneas distintas: mirar la siguiente daría la
+        # cuenta del origen, así que no se devuelve nada.
+        split = "Origen:\nDestino:\n0102****6476\n0102****3817"
+        assert extract_masked_destination(split) is None
+
+    def test_origin_only_is_not_a_destination(self):
+        assert extract_masked_destination("Cuenta origen: 0102****6476") is None
+
+    def test_amounts_and_dates_are_not_accounts(self):
+        assert extract_masked_destination("Destino: pago 7.337,81 Bs el 06/08/2026") is None
+
+    def test_none_and_blank(self):
+        assert extract_masked_destination(None) is None
+        assert extract_masked_destination("") is None
+
+
+class TestMaskedMatchesAccount:
+    def test_matches_bank_and_last_four(self):
+        assert masked_matches_account(("0102", "1941"), "01020113121301031941\nV12345678") is True
+
+    def test_finds_account_anywhere_in_the_block(self):
+        block = "Banesco\n01340866100001310098\n26640340\nKelly zitman\n04126882238"
+        assert masked_matches_account(("0134", "0098"), block) is True
+
+    def test_same_last_four_at_another_bank_does_not_match(self):
+        assert masked_matches_account(("0134", "1941"), "01020113121301031941\nV12345678") is False
+
+    def test_different_last_four_does_not_match(self):
+        assert masked_matches_account(("0102", "3817"), "01020113121301031941\nV12345678") is False
+
+    def test_mobile_payment_block_has_no_account_to_match(self):
+        assert masked_matches_account(("0102", "2526"), "0102\nV12345678\n04147612526") is False
+
+    def test_empty_block(self):
+        assert masked_matches_account(("0102", "3817"), None) is False

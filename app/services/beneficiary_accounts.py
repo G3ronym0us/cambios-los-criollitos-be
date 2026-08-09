@@ -13,6 +13,13 @@ from typing import Optional
 # Prefijos de cédula venezolana. Si la identificación no trae uno, se asume V.
 _ID_PREFIXES = ("V", "E", "J")
 
+# Cuenta tapada de un comprobante: `0102****3817` (banco + últimos 4). Cada banco enmascara
+# con un carácter distinto y el OCR lo lee como puede, de ahí la clase amplia; exigir 2 o más
+# y cuatro dígitos a cada lado es lo que evita enganchar un monto o una fecha.
+_MASKED_ACCOUNT = re.compile(r"(?<!\d)(\d{4})[ \t]*[*xX•·●#.]{2,}[ \t]*(\d{4})(?!\d)")
+_DEST_LABEL = re.compile(r"destino|destinatario|receptor|beneficiari[oa]", re.IGNORECASE)
+_ACCOUNT_20 = re.compile(r"(?<!\d)(\d{20})(?!\d)")
+
 
 def normalize_alias(raw: Optional[str]) -> Optional[str]:
     """Minúsculas, sin diacríticos, espacios colapsados. None si queda vacío."""
@@ -68,3 +75,42 @@ def build_payment_block(
     if bank_to and ident and phone_to:
         return f"{bank_to.strip()}\n{_with_id_prefix(ident)}\n{phone_to.strip()}"
     return None
+
+
+def extract_masked_destination(raw_text: Optional[str]) -> Optional[tuple[str, str]]:
+    """
+    Banco y últimos 4 dígitos de la cuenta DESTINO cuando el comprobante la tapa
+    (`Destino: 0102****3817`). Con eso no se puede pagar, pero sí reconocer una cuenta ya
+    guardada.
+
+    Sólo se acepta la máscara que está en la misma línea que la etiqueta de destino. El
+    comprobante trae dos cuentas tapadas —origen y destino— y si el OCR parte la tabla en
+    columnas ("Origen:\\nDestino:\\n0102****6476\\n0102****3817") cualquier regla que mire
+    la línea siguiente devuelve la del origen, que es la cuenta del propio cliente. Ante esa
+    duda no se devuelve nada: perder el vínculo cuesta menos que atribuirlo mal.
+    """
+    if not raw_text:
+        return None
+    for line in raw_text.splitlines():
+        if not _DEST_LABEL.search(line):
+            continue
+        match = _MASKED_ACCOUNT.search(line)
+        if match:
+            return match.group(1), match.group(2)
+    return None
+
+
+def masked_matches_account(masked: tuple[str, str], payment_info: Optional[str]) -> bool:
+    """
+    ¿El bloque guardado contiene la cuenta que el comprobante dejó tapada? Se comparan banco
+    y últimos 4 dígitos, que es todo lo que se ve. El número de 20 dígitos se busca en todo
+    el bloque, no sólo en la primera línea: los bloques que mandó el cliente por texto traen
+    banco y nombre mezclados en cualquier orden.
+    """
+    if not payment_info:
+        return False
+    bank, last4 = masked
+    return any(
+        account.startswith(bank) and account.endswith(last4)
+        for account in _ACCOUNT_20.findall(payment_info)
+    )

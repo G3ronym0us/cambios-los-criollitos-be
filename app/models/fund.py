@@ -9,10 +9,11 @@ from app.models.mixins import UUIDMixin
 
 
 class FundMovementType(enum.Enum):
-    DEPOSIT    = "DEPOSIT"     # Gestor deposita USD al fondo (Binance/Kraken → Zelle)
-    EXCHANGE   = "EXCHANGE"    # Cambio gestionado: gestor envía USD al cliente, sale del fondo
-    PERSONAL   = "PERSONAL"    # Gasto personal del gestor con fondos del fondo (queda como deuda)
-    ADJUSTMENT = "ADJUSTMENT"  # Corrección manual
+    DEPOSIT     = "DEPOSIT"      # Gestor deposita USD al fondo (Binance/Kraken → Zelle)
+    EXCHANGE    = "EXCHANGE"     # La pata que SALE del fondo: se le pagó al cliente
+    EXCHANGE_IN = "EXCHANGE_IN"  # La pata que ENTRA al fondo: el cliente nos pagó
+    PERSONAL    = "PERSONAL"     # Gasto personal del gestor con fondos del fondo (queda como deuda)
+    ADJUSTMENT  = "ADJUSTMENT"   # Corrección manual
 
 
 class FundDepositMethod(enum.Enum):
@@ -151,6 +152,7 @@ class FundMovement(UUIDMixin, Base):
     Tipos:
     - DEPOSIT:    gestor deposita → aumenta posición (fondo debe al gestor)
     - EXCHANGE:   cambio realizado → disminuye posición (gestor usó fondos)
+    - EXCHANGE_IN: pata que entra → aumenta posición, igual que un depósito
     - PERSONAL:   gasto personal → disminuye posición (gestor debe al fondo)
     - ADJUSTMENT: corrección manual
     """

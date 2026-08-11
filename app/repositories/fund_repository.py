@@ -288,7 +288,8 @@ class FundRepository:
             return {}
 
         signed_amount = sa_case(
-            (FundMovement.movement_type == FundMovementType.DEPOSIT,
+            (FundMovement.movement_type.in_(
+                [FundMovementType.DEPOSIT, FundMovementType.EXCHANGE_IN]),
              reversal_signed(FundMovement.amount_usdt)),
             (FundMovement.movement_type.in_(
                 [FundMovementType.EXCHANGE, FundMovementType.PERSONAL]),
@@ -481,7 +482,9 @@ class FundRepository:
         ).filter(
             FundMovement.group_id == group_id,
             FundMovement.user_id == user_id,
-            FundMovement.movement_type == FundMovementType.DEPOSIT
+            FundMovement.movement_type.in_(
+                [FundMovementType.DEPOSIT, FundMovementType.EXCHANGE_IN]
+            )
         ).first()
 
         # Salidas (EXCHANGE + PERSONAL), reversas incluidas con signo negativo
@@ -536,7 +539,9 @@ class FundRepository:
             func.coalesce(func.sum(reversal_signed(FundMovement.amount_usdt)), 0).label("total_usdt")
         ).filter(
             FundMovement.group_id == group_id,
-            FundMovement.movement_type == FundMovementType.DEPOSIT
+            FundMovement.movement_type.in_(
+                [FundMovementType.DEPOSIT, FundMovementType.EXCHANGE_IN]
+            )
         ).first()
 
         outflow_result = self.db.query(

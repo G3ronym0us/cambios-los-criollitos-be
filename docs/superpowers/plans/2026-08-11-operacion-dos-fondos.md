@@ -14,6 +14,7 @@
 - **Rama:** `feat/operacion-dos-fondos` (ya creada, sobre `origin/main`).
 - **Commits en inglés** (`backend/CLAUDE.md`).
 - **Los tests corren contra Postgres real** en `localhost:5433`; si no está, `conftest.py` los saltea. Comando: `../venv/bin/python -m pytest` desde `backend/`.
+- **Base de la suite en esta rama: 343 tests en verde.** (En `feat/fund-capital-from-receipt` son 357 porque esa rama agrega `test_fund_capital_from_receipt.py` y `test_fund_balance_currency.py`; no es esta.) Cada tarea suma los suyos: el total esperado al final de la Task N es 343 + los acumulados.
 - **Nada de movimientos retroactivos para el histórico sin fondo.** Fuera de alcance por decisión del usuario.
 - **`amount` en `fund_movements` es siempre positivo**; el tipo determina el signo. No introducir importes negativos.
 - **`FundRepository.create_movement` hace `commit()`.** Dentro del helper de sync NO se usa: se crean las filas con `self.db.add()` + `flush()`, para no commitear a mitad de una operación de servicio.

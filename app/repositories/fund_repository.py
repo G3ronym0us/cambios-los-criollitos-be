@@ -626,3 +626,22 @@ class FundRepository:
             "available_funds_usdt": available_funds_usdt,
             "by_member": by_member,
         }
+
+    def get_active_group_by_currency(self, currency: Optional[str]) -> Optional[FundGroup]:
+        """
+        El fondo activo que lleva esa moneda, o None.
+
+        Devuelve None también cuando hay MÁS de uno: entre dos fondos de la misma moneda no
+        hay forma de elegir sin inventar, así que la pata queda sin fondo y lo resuelve el
+        operador a mano. Hoy los tres fondos tienen monedas distintas, pero el día que haya
+        dos en USD esto tiene que callarse, no adivinar.
+        """
+        if not currency:
+            return None
+        rows = (
+            self.db.query(FundGroup)
+            .filter(FundGroup.is_active.is_(True), func.upper(FundGroup.currency) == currency.upper())
+            .limit(2)
+            .all()
+        )
+        return rows[0] if len(rows) == 1 else None

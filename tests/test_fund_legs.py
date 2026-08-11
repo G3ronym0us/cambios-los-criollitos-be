@@ -77,3 +77,36 @@ def test_la_operacion_guarda_el_fondo_que_paga(db, fund, pairs, client, operator
     assert op.fund_group_out.name == "Cambios Brasil test"
     assert op.dict()["fund_group_out_uuid"] == brasil.uuid
     assert op.dict()["fund_group_out_name"] == "Cambios Brasil test"
+
+
+def test_el_fondo_de_una_moneda_se_resuelve_solo(db, fund):
+    """ZELLE liquida como USD, así que cae en el fondo USD."""
+    from app.services.valuation import settlement_currency
+
+    repo = FundRepository(db)
+
+    assert repo.get_active_group_by_currency(settlement_currency("ZELLE")).id == fund.id
+    assert repo.get_active_group_by_currency("USD").id == fund.id
+
+
+def test_una_moneda_sin_fondo_no_resuelve(db, fund):
+    """Los bolívares no tienen fondo: esa pata no deja movimiento."""
+    assert FundRepository(db).get_active_group_by_currency("VES") is None
+
+
+def test_dos_fondos_de_la_misma_moneda_no_resuelven(db, fund):
+    """Ante dos candidatos el sistema no adivina: lo elige el operador."""
+    otro = FundGroup(name="Otro USD", currency="USD", is_active=True)
+    db.add(otro)
+    db.flush()
+
+    assert FundRepository(db).get_active_group_by_currency("USD") is None
+
+
+def test_un_fondo_inactivo_no_compite(db, fund):
+    """Un fondo desactivado no cuenta ni para resolver ni para ambiguar."""
+    viejo = FundGroup(name="USD viejo", currency="USD", is_active=False)
+    db.add(viejo)
+    db.flush()
+
+    assert FundRepository(db).get_active_group_by_currency("USD").id == fund.id

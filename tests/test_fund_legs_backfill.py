@@ -81,3 +81,24 @@ def test_una_op_que_paga_en_bolivares_no_genera_pata_saliente(db, fund, pairs, c
     plan = plan_backfill(db)
 
     assert plan["crear_saliente"] == []
+
+
+def test_una_op_sin_completar_no_genera_pata_saliente(db, fund, pairs, client, operator):
+    """
+    Solo una op COMPLETED entregó la plata — la misma regla que `_sync_fund_legs` aplica en
+    vivo. En producción 3 de las 4 candidatas estaban PENDING: sin este filtro el arrastre
+    inventaba salidas por tratos que todavía no se pagaron.
+    """
+    brasil = FundGroup(name="Brasil", currency="BRL", is_active=True)
+    db.add(brasil)
+    db.flush()
+    op, mov = _op_con_movimiento(db, pairs, client, fund, 100, "USD", "ZELLE", "BRL", 100, operator.id)
+    op.status = WhatsAppOperationStatus.PENDING
+    db.flush()
+
+    plan = plan_backfill(db)
+
+    assert plan["crear_saliente"] == []
+    # La pata que YA existe se retipa igual: cambiarle el signo a lo que está mal registrado
+    # es independiente de si el trato se terminó.
+    assert plan["retipar"] == [(mov.id, FundMovementType.EXCHANGE_IN)]

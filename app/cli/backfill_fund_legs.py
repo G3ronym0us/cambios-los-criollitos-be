@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from app.database.connection import SessionLocal
 from app.models.fund import FundMovement, FundMovementType
-from app.models.whatsapp_operation import WhatsAppOperation
+from app.models.whatsapp_operation import WhatsAppOperation, WhatsAppOperationStatus
 from app.repositories.fund_repository import FundRepository
 from app.services import valuation
 
@@ -66,8 +66,11 @@ def plan_backfill(db: Session) -> dict:
                 "currency": entra,
             })
 
+        # Solo una operación COMPLETED entregó la plata, que es la misma regla que aplica
+        # `_sync_fund_legs` en vivo. Sin esto el arrastre inventa salidas por tratos que
+        # todavía no se pagaron: en producción eran 3 de 4 (una op zombi de julio incluida).
         grupo_sale = repo.get_active_group_by_currency(sale)
-        if grupo_sale is not None:
+        if grupo_sale is not None and op.status == WhatsAppOperationStatus.COMPLETED:
             plan["crear_saliente"].append({
                 "operation_id": op.id,
                 "transaction_id": op.transaction_id,

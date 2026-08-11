@@ -18,6 +18,9 @@ class _CreateDB:
     def add(self, value):
         self.added.append(value)
 
+    def flush(self):
+        pass
+
     def commit(self):
         self.commits += 1
 

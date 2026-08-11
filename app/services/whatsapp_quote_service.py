@@ -260,6 +260,16 @@ class WhatsAppQuoteService:
             if existing is not None:
                 op.beneficiary_account_id = existing.id
         self.db.add(op)
+        self.db.flush()
+
+        # Las operaciones que nacen de una cotización del bot —la mayoría— también traen sus
+        # fondos resueltos por moneda, igual que las que nacen de un comprobante. El import va
+        # adentro de la función: a nivel de módulo sería circular (whatsapp_payment_service ya
+        # importa whatsapp_quote_service).
+        from app.services.whatsapp_payment_service import WhatsAppPaymentService
+
+        WhatsAppPaymentService(self.db)._resolve_fund_legs_for_new_op(op)
+
         self.db.commit()
         self.db.refresh(op)
         WhatsAppClientAccountService(self.db).learn(op, op.notes, source="MESSAGE")
@@ -1071,6 +1081,13 @@ class WhatsAppQuoteService:
             op.status = target
             op.completed_at = now
             op.cancelled_at = None
+
+            # Completar por este camino administrativo también deja las dos patas en el
+            # libro. El import va adentro de la función: a nivel de módulo sería circular
+            # (whatsapp_payment_service ya importa whatsapp_quote_service).
+            from app.services.whatsapp_payment_service import WhatsAppPaymentService
+
+            WhatsAppPaymentService(self.db)._sync_fund_legs(op, operator)
         elif target == WhatsAppOperationStatus.CANCELLED:
             op.status = target
             op.cancelled_at = now

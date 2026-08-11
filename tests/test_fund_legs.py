@@ -240,3 +240,54 @@ def test_cambiar_el_valor_reajusta_las_dos_patas(db, pairs, client, fund, operat
     montos = {m.movement_type: m.amount for m in db.query(FundMovement).all()}
     assert montos[FundMovementType.EXCHANGE_IN] == 50
     assert montos[FundMovementType.EXCHANGE] == 232.88
+
+
+def test_una_operacion_nueva_resuelve_sus_fondos_sola(db, fund, pairs, client, operator):
+    """Nace con los fondos puestos según la moneda de cada pata."""
+    from app.services.whatsapp_payment_service import WhatsAppPaymentService
+    from tests import factories as f
+
+    brasil = FundGroup(name="Brasil", currency="BRL", is_active=True)
+    db.add(brasil)
+    db.flush()
+
+    svc = WhatsAppPaymentService(db)
+    inc = f.incoming(db, 100, "ZELLE", phone=client.phone)
+    created = f.create_op_from_payment(
+        svc, "incoming", inc, frm="ZELLE", to="BRL",
+        from_amount=100, to_amount=465.75,
+        user_uuid=operator.uuid, recorded_by=operator.id,
+    )
+
+    from app.models.whatsapp_operation import WhatsAppOperation
+    op = db.query(WhatsAppOperation).filter(
+        WhatsAppOperation.uuid == str(created["uuid"])
+    ).first()
+
+    assert op.fund_group_id == fund.id
+    assert op.fund_group_out_id == brasil.id
+
+
+def test_el_fondo_elegido_a_mano_le_gana_a_la_resolucion(db, fund, pairs, client, operator):
+    """Si el caller dice el fondo de entrada, no se pisa."""
+    from app.services.whatsapp_payment_service import WhatsAppPaymentService
+    from tests import factories as f
+
+    otro = FundGroup(name="Otro", currency="USD", is_active=True)
+    db.add(otro)
+    db.flush()
+
+    svc = WhatsAppPaymentService(db)
+    inc = f.incoming(db, 100, "ZELLE", phone=client.phone)
+    created = f.create_op_from_payment(
+        svc, "incoming", inc, frm="ZELLE", to="BRL",
+        from_amount=100, to_amount=465.75,
+        fund_uuid=otro.uuid, user_uuid=operator.uuid, recorded_by=operator.id,
+    )
+
+    from app.models.whatsapp_operation import WhatsAppOperation
+    op = db.query(WhatsAppOperation).filter(
+        WhatsAppOperation.uuid == str(created["uuid"])
+    ).first()
+
+    assert op.fund_group_id == otro.id

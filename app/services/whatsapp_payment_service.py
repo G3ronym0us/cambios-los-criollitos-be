@@ -35,6 +35,7 @@ from app.models.whatsapp_payment import (
 )
 from app.models.client_loan import ClientLoan
 from app.repositories.currency_pair_repository import CurrencyPairRepository
+from app.repositories.fund_repository import FundRepository
 from app.services import valuation
 from app.schemas.whatsapp import WhatsAppOperationComplete
 from app.services.operation_match_service import receipt_fingerprint
@@ -1419,6 +1420,28 @@ class WhatsAppPaymentService:
 
         self.db.flush()
 
+    def _resolve_fund_legs_for_new_op(self, op: WhatsAppOperation) -> None:
+        """
+        Completa los fondos que la operación no trae, por la moneda de cada pata.
+
+        Corre UNA vez, al nacer la operación. Lo que el caller ya puso (el fondo elegido a
+        mano, o el heredado del comprobante) no se pisa: solo se rellena lo que está en NULL.
+        """
+        cp = op.currency_pair
+        if cp is None:
+            return
+        repo = FundRepository(self.db)
+        if op.fund_group_id is None and cp.from_currency:
+            group = repo.get_active_group_by_currency(
+                settlement_currency(cp.from_currency.symbol)
+            )
+            op.fund_group_id = group.id if group else None
+        if op.fund_group_out_id is None and cp.to_currency:
+            group = repo.get_active_group_by_currency(
+                settlement_currency(cp.to_currency.symbol)
+            )
+            op.fund_group_out_id = group.id if group else None
+
     def _trim_settlements_to_value(self, op: WhatsAppOperation, value: float) -> None:
         """
         Recorta cuánto cubren los salientes cuando el valor baja por debajo de lo entregado:
@@ -1833,6 +1856,10 @@ class WhatsAppPaymentService:
             approved_at=now,
         )
         self.db.add(op)
+        self.db.flush()
+        # La op nace con los dos fondos resueltos por moneda; lo que ya vino puesto (el
+        # entrante explícito o el heredado del comprobante) no se toca.
+        self._resolve_fund_legs_for_new_op(op)
         self.db.flush()
         row.whatsapp_operation_id = op.id
         # El entrante estrena su parte del reparto: lo que pide la op, y si el comprobante

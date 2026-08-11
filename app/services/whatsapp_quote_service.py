@@ -868,6 +868,19 @@ class WhatsAppQuoteService:
                 )
             op.fund_group_id = group.id
 
+        # Fondo de la pata que SALE. clear_fund_group_out lo limpia.
+        if payload.clear_fund_group_out:
+            op.fund_group_out_id = None
+        elif payload.fund_group_out_uuid is not None:
+            group_out = (
+                self.db.query(FundGroup)
+                .filter(FundGroup.uuid == str(payload.fund_group_out_uuid))
+                .first()
+            )
+            if group_out is None:
+                raise QuoteServiceError("fund_group_not_found", "FundGroup no encontrado", 404)
+            op.fund_group_out_id = group_out.id
+
         # Receptor del entrante. clear_received_by lo limpia (vuelve a operador).
         if payload.clear_received_by:
             op.received_by_user_id = None
@@ -903,11 +916,16 @@ class WhatsAppQuoteService:
         """
         op = self._get_op_or_404(op_uuid)
         self._apply_scenario(op, payload)
-        if op.fund_group_id is not None and op.transaction_id is None:
+        if (op.fund_group_id or op.fund_group_out_id) and op.transaction_id is None:
             tx = self._create_transaction_for_op(op, WhatsAppOperationComplete(), operator)
             op.transaction_id = tx.id
         else:
             self._sync_linked_transaction(op)
+
+        from app.services.whatsapp_payment_service import WhatsAppPaymentService
+
+        WhatsAppPaymentService(self.db)._sync_fund_legs(op, operator)
+
         self.db.commit()
         self.db.refresh(op)
         return op

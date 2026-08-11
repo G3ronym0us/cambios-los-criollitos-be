@@ -379,3 +379,39 @@ def test_sin_transaction_id_no_registra_movimientos_ni_duplica(db, pairs, client
     svc._sync_fund_legs(op, operator)
 
     assert db.query(FundMovement).count() == 0
+
+
+def test_asignar_el_fondo_saliente_a_mano_crea_su_pata(db, fund, pairs, client, operator):
+    from app.schemas.whatsapp import WhatsAppOperationScenarioUpdate
+    from app.services.whatsapp_quote_service import WhatsAppQuoteService
+
+    brasil = FundGroup(name="Brasil", currency="BRL", is_active=True)
+    db.add(brasil)
+    db.flush()
+    op = _op_completada(db, pairs, client, fund, None, operator)
+
+    WhatsAppQuoteService(db).set_scenario(
+        op.uuid,
+        WhatsAppOperationScenarioUpdate(fund_group_out_uuid=brasil.uuid),
+        operator,
+    )
+
+    sale = db.query(FundMovement).filter(
+        FundMovement.movement_type == FundMovementType.EXCHANGE
+    ).all()
+    assert len(sale) == 1 and sale[0].group_id == brasil.id
+
+
+def test_quitar_el_fondo_a_mano_borra_su_pata(db, fund, pairs, client, operator):
+    from app.schemas.whatsapp import WhatsAppOperationScenarioUpdate
+    from app.services.whatsapp_quote_service import WhatsAppQuoteService
+
+    op = _op_completada(db, pairs, client, fund, None, operator)
+    svc = WhatsAppQuoteService(db)
+    svc.set_scenario(op.uuid, WhatsAppOperationScenarioUpdate(), operator)
+
+    svc.set_scenario(
+        op.uuid, WhatsAppOperationScenarioUpdate(clear_fund_group=True), operator
+    )
+
+    assert db.query(FundMovement).count() == 0

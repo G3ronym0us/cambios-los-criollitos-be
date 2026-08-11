@@ -168,16 +168,19 @@ class WhatsAppOperationResponse(BaseModel):
 
 class WhatsAppOperationScenarioUpdate(BaseModel):
     """
-    Setear/editar el escenario, grupo y receptor del entrante de una operación.
-    Todos opcionales (PATCH parcial). El grupo se resuelve por `fund_group_uuid` o,
-    para el bot, por `group_jid` (FundGroup.whatsapp_group_jid).
+    Setear/editar el escenario, los fondos y el receptor del entrante de una operación.
+    Todos opcionales (PATCH parcial). El fondo de la pata que ENTRA se resuelve por
+    `fund_group_uuid` o, para el bot, por `group_jid` (FundGroup.whatsapp_group_jid);
+    el de la pata que SALE, por `fund_group_out_uuid`.
     """
     scenario: Optional[Literal["NORMAL", "ZELLE_DIRECT", "VIA_PARTNER"]] = None
     fund_group_uuid: Optional[UUID] = None
+    fund_group_out_uuid: Optional[UUID] = None
     group_jid: Optional[str] = None
     received_by_user_uuid: Optional[UUID] = None
-    # Permite explícitamente limpiar el grupo / receptor (poner a NULL) cuando True.
+    # Permite explícitamente limpiar los fondos / receptor (poner a NULL) cuando True.
     clear_fund_group: bool = False
+    clear_fund_group_out: bool = False
     clear_received_by: bool = False
     # Reasigna la op a un cliente anónimo dedicado (VIA_PARTNER: el socio no es el cliente).
     anonymize_client: bool = False

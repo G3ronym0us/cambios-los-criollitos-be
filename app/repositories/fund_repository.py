@@ -379,14 +379,17 @@ class FundRepository:
         counts = {row.movement_type: int(row.count) for row in rows}
         profit_row = profit.first()
 
-        deposits = amounts.get(FundMovementType.DEPOSIT, 0.0)
+        # EXCHANGE_IN cuenta como entrada, igual que en `get_running_totals` / `get_user_position`
+        # / `get_group_balance`: la pata que entra de una operación de dos fondos es tan
+        # depósito como uno manual.
+        deposits = amounts.get(FundMovementType.DEPOSIT, 0.0) + amounts.get(FundMovementType.EXCHANGE_IN, 0.0)
         exchanges = amounts.get(FundMovementType.EXCHANGE, 0.0)
         personal = amounts.get(FundMovementType.PERSONAL, 0.0)
         adjustments = amounts.get(FundMovementType.ADJUSTMENT, 0.0)
 
         return {
             "deposits_usdt": deposits,
-            "deposits_count": counts.get(FundMovementType.DEPOSIT, 0),
+            "deposits_count": counts.get(FundMovementType.DEPOSIT, 0) + counts.get(FundMovementType.EXCHANGE_IN, 0),
             "exchanges_usdt": exchanges,
             "exchanges_count": counts.get(FundMovementType.EXCHANGE, 0),
             "personal_usdt": personal,

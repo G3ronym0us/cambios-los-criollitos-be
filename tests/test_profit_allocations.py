@@ -220,6 +220,10 @@ def test_history_totals_add_up_over_the_filter(service, db, fund_with_shares, cl
     """
     Los acumulados del historial cubren todo lo filtrado: la ganancia por un lado y el
     capital (entradas contra salidas) por otro, que son cosas distintas.
+
+    La operación paga en COP, que no tiene fondo, así que la única pata que deja movimiento es
+    la que entra al fondo Zelle/Paypal (EXCHANGE_IN de los 100 USD que puso el cliente) — cuenta
+    como entrada, igual que el depósito manual.
     """
     from app.models.fund import FundMovement, FundMovementType
     from datetime import datetime, timezone
@@ -234,9 +238,9 @@ def test_history_totals_add_up_over_the_filter(service, db, fund_with_shares, cl
 
     totals = FundRepository(db).get_movements_totals(group_id=fund_with_shares.id)
 
-    assert totals["deposits_usdt"] == pytest.approx(500)
-    assert totals["exchanges_usdt"] == pytest.approx(100)   # el EXCHANGE de la operación
-    assert totals["net_usdt"] == pytest.approx(400)         # entró 500, salieron 100
+    assert totals["deposits_usdt"] == pytest.approx(600)    # 500 depósito + 100 EXCHANGE_IN
+    assert totals["exchanges_usdt"] == 0                    # nada pagó en moneda con fondo
+    assert totals["net_usdt"] == pytest.approx(600)         # entraron los dos, no salió nada
     assert totals["profit_usdt"] == pytest.approx(7.0)      # y dejó 7 de ganancia
     assert totals["profit_count"] == 1
 
@@ -277,7 +281,7 @@ def test_each_movement_carries_the_running_balance_and_profit(service, db, fund_
         amount_usdt=500, movement_date=base,
     ))
     db.flush()
-    _op_from_cop_payment(service, db, fund_with_shares, operator)  # EXCHANGE de 100, gana 7
+    _op_from_cop_payment(service, db, fund_with_shares, operator)  # EXCHANGE_IN de 100, gana 7
 
     repo = FundRepository(db)
     movements, _ = repo.get_movements(group_id=fund_with_shares.id)
@@ -287,7 +291,7 @@ def test_each_movement_carries_the_running_balance_and_profit(service, db, fund_
     newest, oldest = movements[0], movements[-1]
     assert running[oldest.id]["balance_usdt"] == pytest.approx(500)   # solo el depósito
     assert running[oldest.id]["profit_usdt"] == pytest.approx(0)
-    assert running[newest.id]["balance_usdt"] == pytest.approx(400)   # 500 - 100
+    assert running[newest.id]["balance_usdt"] == pytest.approx(600)   # 500 + 100: los dos entraron
     assert running[newest.id]["profit_usdt"] == pytest.approx(7.0)
 
     balance = repo.get_group_balance(fund_with_shares.id)

@@ -165,7 +165,11 @@ def test_edit_value_up_reopens_pending(service, db, fund, client, operator):
 # --------------------------------------------------------------------- contabilidad
 
 def test_single_transaction_and_movement_per_operation(service, db, fund, client, operator):
-    """Una op pagada en dos monedas = UNA transacción y UN movimiento, en la moneda del fondo."""
+    """
+    Una op pagada en dos monedas = UNA transacción y UN movimiento: el que entra al fondo
+    Zelle/Paypal por los 220 USD que puso el cliente (no hay fondo en BRL ni en VES, así que
+    la pata que sale no deja nada).
+    """
     inc = f.incoming(db, 220, "ZELLE")
     op = _op(db, f.create_op_from_payment(
         service, "incoming", inc, frm="ZELLE", to="BRL", from_amount=220, to_amount=1005.44,
@@ -180,7 +184,7 @@ def test_single_transaction_and_movement_per_operation(service, db, fund, client
     assert len(txs) == 1 and txs[0].from_amount == 220 and txs[0].to_currency == "USDT"
     movs = db.query(FundMovement).filter(
         FundMovement.transaction_id == op.transaction_id,
-        FundMovement.movement_type == FundMovementType.EXCHANGE,
+        FundMovement.movement_type == FundMovementType.EXCHANGE_IN,
     ).all()
     assert len(movs) == 1 and movs[0].amount == 220 and movs[0].currency == "USD"
 
@@ -286,12 +290,15 @@ def _item(op_uuid, amount):
     return SimpleNamespace(operation_uuid=op_uuid, amount=amount)
 
 
-def test_a_fund_in_another_currency_takes_the_value_converted(service, db, client, operator):
+def test_a_leg_keeps_its_own_currency_even_if_the_funds_differs(service, db, client, operator):
     """
-    Un fondo en BRL que atiende un trato de 21 USDT saca reales, no dólares: el movimiento va
-    en la moneda del fondo. Antes esto era un 400 y la operación no se podía crear.
+    Un fondo en BRL puede quedar asociado a la pata que entra en USDT: el movimiento va en la
+    moneda de ESA pata (USDT), no en la que declara el fondo (BRL) — la conversión que hacía
+    `_fund_movement_figures` desaparece con el diseño de dos patas, donde cada una va en la
+    suya por construcción. Antes esto era un 400 y la operación no se podía crear; sigue sin
+    serlo, solo que ahora no convierte.
     """
-    from app.models.fund import FundGroup, FundGroupMember, FundMovement
+    from app.models.fund import FundGroup, FundGroupMember, FundMovement, FundMovementType
 
     brasil = FundGroup(name="Cambios Brasil", currency="BRL", is_active=True)
     db.add(brasil)
@@ -299,8 +306,6 @@ def test_a_fund_in_another_currency_takes_the_value_converted(service, db, clien
     db.add(FundGroupMember(group_id=brasil.id, user_id=operator.id, is_fund_manager=True))
     db.flush()
 
-    # 21 USDT valen 106,64 BRL a la tasa del par (5,078 en el fixture ZELLE-BRL no aplica:
-    # se valora USDT→BRL con la tasa vigente).
     pix = f.outgoing(db, 106.64, "BRL")
     res = f.create_op_from_payment(
         service, "outgoing", pix, frm="USDT", to="BRL", from_amount=21, to_amount=106.64,
@@ -312,5 +317,7 @@ def test_a_fund_in_another_currency_takes_the_value_converted(service, db, clien
         db.query(FundMovement).filter(FundMovement.transaction_id == op.transaction_id).first()
     )
     assert movement is not None
-    assert movement.currency == "BRL"          # la moneda del fondo, no la del trato
+    assert movement.movement_type == FundMovementType.EXCHANGE_IN
+    assert movement.currency == "USDT"          # la pata que entra, no la moneda del fondo
+    assert movement.amount == 21
     assert movement.amount_usdt == pytest.approx(21, abs=0.01)

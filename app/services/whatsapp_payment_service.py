@@ -35,7 +35,6 @@ from app.models.whatsapp_payment import (
 )
 from app.models.client_loan import ClientLoan
 from app.repositories.currency_pair_repository import CurrencyPairRepository
-from app.repositories.fund_repository import FundRepository
 from app.services import valuation
 from app.schemas.whatsapp import WhatsAppOperationComplete
 from app.services.operation_match_service import receipt_fingerprint
@@ -1235,17 +1234,20 @@ class WhatsAppPaymentService:
         # Un comprobante de salida cubre una parte del valor del trato. Sin monto explícito se
         # toma lo que da la tasa de referencia: el Pix de 914,04 a 4,5702 cubre 200 de 220, y
         # los 20 restantes quedan pendientes hasta que llegue otro pago.
-        completed_by_delivery = False
         if table == "outgoing" and op is not None:
             self._apply_settlement(row, op, settled_amount)
             # El intermediario nunca mandó los datos, pero el pago ya se hizo: el comprobante
             # es la mejor fuente posible de la cuenta del beneficiario.
             WhatsAppClientAccountService(self.db).learn_from_outgoing(op, row)
             if complete_outgoing:
-                completed_by_delivery = self._sync_status_from_delivery(op, completing_user)
+                self._sync_status_from_delivery(op, completing_user)
 
-        if not completed_by_delivery:
-            self.db.commit()
+        # El libro sigue a la operación: si vincular este pago la completó, las patas del
+        # fondo quedan al día. `_sync_status_from_delivery` ya comitea al completar la op;
+        # este commit persiste lo que este sync flushee después de eso.
+        if op is not None:
+            self._sync_fund_legs(op, completing_user)
+        self.db.commit()
         self.db.refresh(row)
 
         # El borrado va al final, con el vínculo ya soltado: así la op llega sin pagos a
@@ -1314,9 +1316,9 @@ class WhatsAppPaymentService:
         self._trim_settlements_to_value(op, value)
         self.db.flush()
         self._sync_status_from_delivery(op, actor)
-        # El valor cambió: su transacción y el movimiento del fondo lo siguen.
+        # El valor cambió: su transacción y las patas del fondo lo siguen.
         WhatsAppQuoteService(self.db)._sync_linked_transaction(op)
-        self._sync_fund_movement(op)
+        self._sync_fund_legs(op, actor)
         self.db.commit()
         self.db.refresh(op)
 
@@ -1324,60 +1326,98 @@ class WhatsAppPaymentService:
         result["released_from_allocations"] = released
         return result
 
-    def _fund_movement_figures(self, op: WhatsAppOperation, group) -> tuple[float, str, float, float]:
+    def _fund_leg_specs(self, op: WhatsAppOperation) -> list[tuple]:
         """
-        Cuánto sale del fondo por esta operación, en la moneda base del fondo: el VALOR del
-        trato convertido a esa moneda, con su equivalente USDT. Un solo movimiento por
-        operación, sin importar en cuántas monedas se pagó.
-        """
-        value, currency, value_usdt, usdt_rate = (
-            WhatsAppQuoteService(self.db)._operation_value_usdt(op)
-        )
-        base = settlement_currency(group.currency)
-        # Fondo en dólares (el caso real): el movimiento es el valor en USD ≈ su USDT.
-        if base in ("USD", "USDT"):
-            return round(value_usdt, 2), base, round(value_usdt, 2), 1.0
-        # Fondo en la misma moneda que el valor (ej. fondo VES y valor en Bs).
-        if base == settlement_currency(currency):
-            rate = round(value / value_usdt, 6) if value_usdt else 1.0
-            return round(value, 2), base, round(value_usdt, 2), rate
+        Las patas que la operación declara: (fondo_id, tipo, monto, moneda).
 
-        # El fondo lleva otra moneda que el valor: un fondo en BRL que atiende un trato de 21
-        # USDT saca reales, no dólares. El movimiento va en la moneda del fondo, convertido a
-        # la tasa del día de la operación. Antes era un 400 que impedía crear la operación.
+        La pata que entra es lo que el cliente da; la que sale, lo que le pagamos. Cada una va
+        en SU moneda, que por construcción es la del fondo que la lleva — por eso acá no hay
+        ninguna conversión de moneda (la había `_fund_movement_figures`, que existía para
+        expresar el valor de la op en la moneda de un fondo distinto).
+        """
+        cp = op.currency_pair
+        if cp is None:
+            return []
+        from_symbol = cp.from_currency.symbol if cp.from_currency else None
+        to_symbol = cp.to_currency.symbol if cp.to_currency else None
+
+        specs = []
+        if op.fund_group_id and op.from_amount and from_symbol:
+            specs.append((
+                op.fund_group_id,
+                FundMovementType.EXCHANGE_IN,
+                round(float(op.from_amount), 2),
+                settlement_currency(from_symbol),
+            ))
+        if op.fund_group_out_id and op.to_amount and to_symbol:
+            specs.append((
+                op.fund_group_out_id,
+                FundMovementType.EXCHANGE,
+                round(float(op.to_amount), 2),
+                settlement_currency(to_symbol),
+            ))
+        return specs
+
+    def _sync_fund_legs(self, op: WhatsAppOperation, actor: Optional[User] = None) -> None:
+        """
+        Deja el libro igual a lo que dice la operación: hasta dos movimientos, uno por pata
+        con fondo. Crea, actualiza y borra; correrla dos veces deja el mismo resultado.
+
+        Reemplaza a `_sync_fund_movement` (que solo reajustaba) y a la creación suelta dentro
+        de `create_operation_from_payment`: eran dos caminos que podían divergir.
+
+        No usa `FundRepository.create_movement` a propósito: ese hace `commit()`, y esto corre
+        dentro de operaciones de servicio que todavía no terminaron.
+        """
+        existing = {
+            m.movement_type: m
+            for m in self.db.query(FundMovement)
+            .filter(FundMovement.transaction_id == op.transaction_id)
+            .all()
+        } if op.transaction_id is not None else {}
+
+        # Solo una operación completada movió plata. Cancelarla o devolverla a cotizada
+        # retira sus movimientos.
+        specs = (
+            self._fund_leg_specs(op)
+            if op.status == WhatsAppOperationStatus.COMPLETED
+            else []
+        )
+
+        user_id = (actor.id if actor else None) or op.received_by_user_id
+        if specs and user_id is None:
+            # Sin gestor no se puede registrar, pero eso nunca tumba la operación.
+            specs = []
+
         at = op.valuation_at or op.quoted_at or datetime.now(timezone.utc)
-        converted, _ = valuation.historical_convert(self.db, value, currency, base, at)
-        if converted is None:
-            raise QuoteServiceError(
-                "fund_rate_unavailable",
-                f"No hay tasa para valorar {currency} en {group.currency}",
-                400,
-            )
-        rate = round(converted / value_usdt, 6) if value_usdt else 1.0
-        return round(converted, 2), base, round(value_usdt, 2), rate
+        wanted_types = set()
+        for group_id, mtype, amount, currency in specs:
+            wanted_types.add(mtype)
+            eq = valuation.equivalents(self.db, amount, currency, at)
+            usdt = eq["usdt_amount"]
+            rate = (amount / usdt) if usdt else None
 
-    def _sync_fund_movement(self, op: WhatsAppOperation) -> None:
-        """Reajusta el movimiento EXCHANGE del fondo cuando cambia el valor de la operación."""
-        if op.transaction_id is None or op.fund_group_id is None:
-            return
-        movement = (
-            self.db.query(FundMovement)
-            .filter(
-                FundMovement.transaction_id == op.transaction_id,
-                FundMovement.movement_type == FundMovementType.EXCHANGE,
-            )
-            .first()
-        )
-        if movement is None:
-            return
-        group = self.db.query(FundGroup).filter(FundGroup.id == op.fund_group_id).first()
-        if group is None:
-            return
-        amount, currency, mv_usdt, mv_rate = self._fund_movement_figures(op, group)
-        movement.amount = amount
-        movement.currency = currency
-        movement.amount_usdt = mv_usdt
-        movement.usdt_rate = mv_rate
+            movement = existing.get(mtype)
+            if movement is None:
+                movement = FundMovement(
+                    movement_type=mtype,
+                    transaction_id=op.transaction_id,
+                    movement_date=at,
+                    user_id=user_id,
+                    recorded_by_user_id=actor.id if actor else None,
+                )
+                self.db.add(movement)
+            movement.group_id = group_id
+            movement.amount = amount
+            movement.currency = currency
+            movement.amount_usdt = usdt
+            movement.usdt_rate = rate
+
+        for mtype, movement in existing.items():
+            if mtype in (FundMovementType.EXCHANGE, FundMovementType.EXCHANGE_IN) and mtype not in wanted_types:
+                self.db.delete(movement)
+
+        self.db.flush()
 
     def _trim_settlements_to_value(self, op: WhatsAppOperation, value: float) -> None:
         """
@@ -1805,8 +1845,12 @@ class WhatsAppPaymentService:
             # que da la tasa, la tasa efectiva del pago sale de ahí.
             self._apply_settlement(row, op, from_amount)
 
-        # Salida con fondo: registrar el EXCHANGE (sale plata del fondo) por el lado de la op
-        # cuya moneda coincide con la moneda base del fondo.
+        # Con fondo: crear la transacción para que la pata que entra (`fund_group_id`) cuelgue
+        # de ella. El movimiento en sí lo deja `_sync_fund_legs` al final de la función, una
+        # vez que se conoce el estado final de la operación (PENDING o COMPLETED, según el
+        # bloque de abajo) — antes se creaba acá mismo vía `_fund_movement_figures`, que
+        # convertía de moneda; ahora cada pata va en la suya y el helper decide si corresponde.
+        transaction_user = None
         if group is not None:
             exchange_user_id = recorded_by_user_id
             if exchange_user_uuid is not None:
@@ -1815,9 +1859,7 @@ class WhatsAppPaymentService:
                     raise QuoteServiceError("user_not_found", f"Usuario {exchange_user_uuid} no encontrado", 404)
                 exchange_user_id = user.id
             if exchange_user_id is None:
-                raise QuoteServiceError("exchange_user_required", "Falta el gestor del movimiento EXCHANGE", 400)
-
-            mv_amount, mv_currency, mv_usdt, mv_rate = self._fund_movement_figures(op, group)
+                raise QuoteServiceError("exchange_user_required", "Falta el gestor del movimiento del fondo", 400)
 
             transaction_user = self.db.query(User).filter(User.id == exchange_user_id).first()
             if transaction_user is None:
@@ -1831,23 +1873,10 @@ class WhatsAppPaymentService:
             )
             op.transaction_id = tx.id
 
-            FundRepository(self.db).create_movement(
-                group_id=group.id,
-                user_id=exchange_user_id,
-                movement_type=FundMovementType.EXCHANGE,
-                amount=mv_amount,
-                currency=mv_currency,
-                amount_usdt=mv_usdt,
-                usdt_rate=mv_rate,
-                movement_date=now,
-                transaction_id=tx.id,
-                recorded_by_user_id=recorded_by_user_id,
-            )
-
         # Un entrante inicia la operación pero no confirma que el dinero haya sido entregado al
         # cliente: siempre permanece PENDING hasta vincular el pago saliente. Si la operación se
         # crea desde el propio saliente, sí puede completarse de inmediato, salvo la entrega física
-        # de USD. El movimiento EXCHANGE del fondo y la Transaction no duplican el fondo.
+        # de USD.
         if table == "outgoing" and from_currency.upper() != "USD":
             completing_user = (
                 self.db.query(User).filter(User.id == recorded_by_user_id).first()
@@ -1862,6 +1891,10 @@ class WhatsAppPaymentService:
             op.completed_at = now
             tx = quote_svc._create_transaction_for_op(op, WhatsAppOperationComplete(), completing_user)
             op.transaction_id = tx.id
+            transaction_user = transaction_user or completing_user
+
+        # El libro sigue a la operación: si terminó COMPLETED, deja hasta dos movimientos.
+        self._sync_fund_legs(op, transaction_user)
 
         self.db.commit()
         self.db.refresh(op)

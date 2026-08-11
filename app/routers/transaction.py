@@ -220,7 +220,7 @@ async def create_transaction(
             fund_repo.create_movement(
                 group_id=effective_fund_group.id,
                 user_id=current_user.id,
-                movement_type=FundMovementType.EXCHANGE,
+                movement_type=FundMovementType.EXCHANGE_IN,
                 amount=transaction.from_amount,
                 currency=currency_pair.from_currency.symbol,
                 movement_date=datetime.utcnow(),

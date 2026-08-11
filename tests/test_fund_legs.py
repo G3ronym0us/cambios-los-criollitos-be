@@ -445,3 +445,33 @@ def test_sin_fondo_saliente_la_ganancia_queda_donde_estaba(db, fund, pairs, clie
 
     assert len(allocations) == 1
     assert allocations[0].fund_group_id == fund.id
+
+
+def test_la_transaccion_manual_registra_una_entrada(db, fund, pairs, operator):
+    """Lo que el cliente entrega ENTRA al fondo: el endpoint manual también lo registra así."""
+    from starlette.testclient import TestClient
+
+    from app.core.dependencies import get_current_user
+    from app.database.connection import get_db
+    from app.main import app
+
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: operator
+    try:
+        with TestClient(app, raise_server_exceptions=False) as api:
+            resp = api.post("/transactions", json={
+                "currency_pair_uuid": str(pairs["ZELLE-BRL"].uuid),
+                "from_amount": 100,
+                "to_amount": 465.75,
+                "total_profit_percentage": 0.0,
+                "fund_group_uuid": str(fund.uuid),
+                "profit_splits": [],
+                "status": "completed",
+            })
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code in (200, 201), resp.text
+    movs = db.query(FundMovement).all()
+    assert len(movs) == 1
+    assert movs[0].movement_type == FundMovementType.EXCHANGE_IN

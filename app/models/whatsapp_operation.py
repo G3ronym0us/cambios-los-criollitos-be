@@ -90,6 +90,11 @@ class WhatsAppOperation(UUIDMixin, Base):
     )
     # Grupo contable (FundGroup, ej. "cambios d&j") al que pertenece el cambio
     fund_group_id = Column(Integer, ForeignKey("fund_groups.id", ondelete="SET NULL"), nullable=True, index=True)
+    # El fondo de la pata que ENTRA (lo que el cliente entrega) es `fund_group_id`; este es
+    # el de la pata que SALE (lo que le pagamos). Una operación mueve la caja de los dos.
+    fund_group_out_id = Column(
+        Integer, ForeignKey("fund_groups.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     # Quién recibió el pago ENTRANTE. NULL = operador (yo); un socio (Jean) = su User.
     received_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
 
@@ -156,6 +161,7 @@ class WhatsAppOperation(UUIDMixin, Base):
     )
     transaction = relationship("Transaction", foreign_keys=[transaction_id])
     fund_group = relationship("FundGroup", foreign_keys=[fund_group_id])
+    fund_group_out = relationship("FundGroup", foreign_keys=[fund_group_out_id])
     received_by = relationship("User", foreign_keys=[received_by_user_id])
     no_payments_ack_by = relationship("User", foreign_keys=[no_payments_ack_by_user_id])
     beneficiary_account = relationship("WhatsAppClientAccount", foreign_keys=[beneficiary_account_id])
@@ -208,6 +214,8 @@ class WhatsAppOperation(UUIDMixin, Base):
             "scenario": self.scenario.value if self.scenario else None,
             "fund_group_uuid": self.fund_group.uuid if self.fund_group else None,
             "fund_group_name": self.fund_group.name if self.fund_group else None,
+            "fund_group_out_uuid": self.fund_group_out.uuid if self.fund_group_out else None,
+            "fund_group_out_name": self.fund_group_out.name if self.fund_group_out else None,
             "received_by_user_uuid": self.received_by.uuid if self.received_by else None,
             "received_by_username": self.received_by.username if self.received_by else None,
             "delivery_status": self.delivery_status.value if self.delivery_status else None,

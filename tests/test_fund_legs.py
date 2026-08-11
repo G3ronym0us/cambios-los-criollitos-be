@@ -49,3 +49,31 @@ def test_exchange_in_cuenta_como_entrada_en_el_balance_del_grupo(db, fund, opera
     balance = FundRepository(db).get_group_balance(fund.id)
 
     assert balance["total_position_usdt"] == 60
+
+
+def test_la_operacion_guarda_el_fondo_que_paga(db, fund, pairs, client, operator):
+    """La pata que sale tiene su propio fondo, y sale en el dict de la op."""
+    from datetime import timedelta
+
+    from app.models.whatsapp_operation import (
+        WhatsAppAmountSide, WhatsAppOperation, WhatsAppOperationStatus,
+    )
+
+    brasil = FundGroup(name="Cambios Brasil test", currency="BRL", is_active=True)
+    db.add(brasil)
+    db.flush()
+
+    now = datetime.now(timezone.utc)
+    op = WhatsAppOperation(
+        client_id=client.id, currency_pair_id=pairs["ZELLE-BRL"].id,
+        from_amount=100, to_amount=465.75, rate_used=4.6575, amount_side=WhatsAppAmountSide.SEND,
+        status=WhatsAppOperationStatus.COMPLETED, amount=100, currency="ZELLE",
+        fund_group_id=fund.id, fund_group_out_id=brasil.id,
+        created_at=now, quoted_at=now, expires_at=now + timedelta(minutes=30),
+    )
+    db.add(op)
+    db.flush()
+
+    assert op.fund_group_out.name == "Cambios Brasil test"
+    assert op.dict()["fund_group_out_uuid"] == brasil.uuid
+    assert op.dict()["fund_group_out_name"] == "Cambios Brasil test"

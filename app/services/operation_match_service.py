@@ -459,6 +459,26 @@ class OperationMatchService:
     def __init__(self, db: Session):
         self.db = db
 
+    def _client_phones_for(self, phone: str) -> list[str]:
+        """
+        Bajo qué clientes pueden estar las ops de este teléfono. Normalmente solo el suyo,
+        pero si el número es el de un socio (`FundGroupMember.whatsapp_phone`) sus ops se
+        reasignan al cliente anónimo `anon:partner:{user_id}` (ver `_apply_scenario` en
+        whatsapp_quote_service): el comprobante que llega en su chat directo tiene que poder
+        alcanzarlas igual. Sin esto, todo saliente pagado en el chat de un socio quedaba
+        suelto (caso Dionis, 6→11 de agosto de 2026: 40 comprobantes sin operación).
+        """
+        from app.models.fund import FundGroupMember
+
+        user_ids = [
+            r[0]
+            for r in self.db.query(FundGroupMember.user_id)
+            .filter(FundGroupMember.whatsapp_phone == phone)
+            .distinct()
+            .all()
+        ]
+        return [phone, *(f"anon:partner:{uid}" for uid in user_ids)]
+
     def _load_operations(
         self,
         *,
@@ -476,7 +496,9 @@ class OperationMatchService:
             selectinload(WhatsAppOperation.outgoing_payments)
         )
         if phone:
-            q = q.join(WhatsAppClient).filter(WhatsAppClient.phone == phone)
+            q = q.join(WhatsAppClient).filter(
+                WhatsAppClient.phone.in_(self._client_phones_for(phone))
+            )
         if scenario:
             q = q.filter(WhatsAppOperation.scenario == scenario)
         if statuses:

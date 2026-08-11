@@ -468,3 +468,47 @@ def test_service_auto_match_ignores_an_operation_that_already_has_a_payout(
         OutgoingCriteria(amount=1005.44, currency="BRL"), phone=client.phone
     )
     assert matched is None, "una op con saliente no puede absorber otro comprobante"
+
+
+def test_service_auto_match_reaches_the_anonymous_operations_of_a_partner(db, fund, pairs, partner):
+    """
+    El comprobante que se paga en el chat directo de un SOCIO tiene que alcanzar sus ops,
+    aunque VIA_PARTNER las haya reasignado al cliente anónimo `anon:partner:{user_id}`.
+    Caso real (Dionis, agosto 2026): 40 salientes quedaron sueltos porque el matcher solo
+    miraba el cliente de ese teléfono, donde ya no queda ninguna op.
+    """
+    from datetime import timedelta
+
+    from app.models.fund import FundGroupMember
+    from app.models.whatsapp_client import WhatsAppClient
+    from app.models.whatsapp_operation import (
+        WhatsAppOperation,
+        WhatsAppOperationScenario,
+        WhatsAppOperationStatus,
+    )
+    from app.services.operation_match_service import OperationMatchService, OutgoingCriteria
+
+    phone = "573123146340"
+    db.add(WhatsAppClient(phone=phone, display_name="Dionis"))
+    db.add(FundGroupMember(group_id=fund.id, user_id=partner.id, whatsapp_phone=phone))
+    anon = WhatsAppClient(
+        phone=f"anon:partner:{partner.id}", display_name="Anónimo (vía socio)"
+    )
+    db.add(anon)
+    db.flush()
+
+    now = datetime.now(timezone.utc)
+    op_row = WhatsAppOperation(
+        client_id=anon.id, currency_pair_id=pairs["COP-VES"].id,
+        from_amount=29998.31, to_amount=7612.167, rate_used=0.2455,
+        amount_side="RECEIVE", status=WhatsAppOperationStatus.PENDING,
+        scenario=WhatsAppOperationScenario.VIA_PARTNER,
+        created_at=now, quoted_at=now, expires_at=now + timedelta(minutes=30),
+    )
+    db.add(op_row)
+    db.flush()
+
+    matched = OperationMatchService(db).auto_match(
+        OutgoingCriteria(amount=7612.17, currency="VES"), phone=phone
+    )
+    assert matched is not None and matched.id == op_row.id

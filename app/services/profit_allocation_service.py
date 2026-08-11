@@ -57,9 +57,9 @@ class ProfitAllocationService:
 
     def ensure_defaults(self, op: WhatsAppOperation) -> list[OperationProfitAllocation]:
         """
-        Reparto por defecto de una operación que aún no lo tiene: todo al fondo que la
-        atendió, por el porcentaje configurado en ese fondo. Nunca más de lo cobrado —dar más
-        que el margen es una decisión explícita, no un default.
+        Reparto por defecto de una operación que aún no lo tiene: todo al fondo que **pagó**;
+        si esa pata no tiene fondo, al que recibió. Por el porcentaje configurado en ese fondo.
+        Nunca más de lo cobrado —dar más que el margen es una decisión explícita, no un default.
 
         Una operación sin fondo no reparte: su ganancia sigue siendo el margen cobrado, sin
         atribuir a nadie (es como se contabilizaba hasta ahora).
@@ -67,14 +67,19 @@ class ProfitAllocationService:
         existing = self.allocations(op)
         if existing:
             return existing
-        if op.fund_group_id is None:
+
+        # Gana el fondo que puso la plata. Si esa pata no tiene fondo (las operaciones que
+        # pagan en bolívares, que son la mayoría), sigue ganando el de entrada, que es como
+        # se repartía antes de que la operación tuviera dos patas.
+        group_id = op.fund_group_out_id or op.fund_group_id
+        if group_id is None:
             return []
 
         charged = float(op.applied_percentage or 0)
         if charged <= 0:
             return []
 
-        group = self.db.query(FundGroup).filter(FundGroup.id == op.fund_group_id).first()
+        group = self.db.query(FundGroup).filter(FundGroup.id == group_id).first()
         if group is None:
             return []
 

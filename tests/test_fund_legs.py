@@ -415,3 +415,33 @@ def test_quitar_el_fondo_a_mano_borra_su_pata(db, fund, pairs, client, operator)
     )
 
     assert db.query(FundMovement).count() == 0
+
+
+def test_la_ganancia_por_defecto_va_al_fondo_que_pago(db, fund, pairs, client, operator):
+    from app.services.profit_allocation_service import ProfitAllocationService
+
+    brasil = FundGroup(name="Brasil", currency="BRL", is_active=True)
+    db.add(brasil)
+    db.flush()
+    op = _op_completada(db, pairs, client, fund, brasil, operator)
+    op.applied_percentage = 8
+    db.flush()
+
+    allocations = ProfitAllocationService(db).ensure_defaults(op)
+
+    assert len(allocations) == 1
+    assert allocations[0].fund_group_id == brasil.id
+
+
+def test_sin_fondo_saliente_la_ganancia_queda_donde_estaba(db, fund, pairs, client, operator):
+    """Las ops que pagan en bolívares se comportan exactamente como antes."""
+    from app.services.profit_allocation_service import ProfitAllocationService
+
+    op = _op_completada(db, pairs, client, fund, None, operator)
+    op.applied_percentage = 8
+    db.flush()
+
+    allocations = ProfitAllocationService(db).ensure_defaults(op)
+
+    assert len(allocations) == 1
+    assert allocations[0].fund_group_id == fund.id

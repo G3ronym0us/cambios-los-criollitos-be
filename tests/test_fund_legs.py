@@ -291,3 +291,91 @@ def test_el_fondo_elegido_a_mano_le_gana_a_la_resolucion(db, fund, pairs, client
     ).first()
 
     assert op.fund_group_id == otro.id
+
+
+# --------------------------------------------------------------- El hueco entre Task 4 y 5
+
+def test_solo_la_pata_saliente_resuelve_fondo_igual_crea_transaccion_y_movimiento(
+    db, pairs, client, operator
+):
+    """
+    Entra USDT (ninguna moneda de la op tiene fondo USDT) y sale BRL (con fondo, `brasil`).
+    Antes la transacción solo se creaba cuando el fondo ENTRANTE venía explícito (`if group
+    is not None`, con `group` resuelto ANTES de crear la op); con la resolución automática de
+    las dos patas eso dejaba a esta op sin transacción pese a tener fondo en la pata saliente.
+
+    `table="incoming"` es a propósito: para "outgoing" con moneda distinta de USD la función
+    crea una transacción por su cuenta (para completar la op de inmediato) sin pasar por el
+    bloque que se está probando, y eso enmascararía el bug.
+    """
+    from datetime import timedelta
+
+    from app.models.whatsapp_operation import WhatsAppOperation, WhatsAppOperationStatus
+    from app.services.whatsapp_payment_service import WhatsAppPaymentService
+    from tests import factories as f
+
+    brasil = FundGroup(name="Brasil", currency="BRL", is_active=True)
+    db.add(brasil)
+    db.flush()
+
+    svc = WhatsAppPaymentService(db)
+    inc = f.incoming(db, 100, "USDT", phone=client.phone)
+    created = f.create_op_from_payment(
+        svc, "incoming", inc, frm="USDT", to="BRL",
+        from_amount=100, to_amount=465.75,
+        user_uuid=operator.uuid, recorded_by=operator.id,
+    )
+
+    op = db.query(WhatsAppOperation).filter(
+        WhatsAppOperation.uuid == str(created["uuid"])
+    ).first()
+
+    assert op.fund_group_id is None
+    assert op.fund_group_out_id == brasil.id
+    assert op.transaction_id is not None
+
+    # Completarla deja la pata saliente en el libro.
+    op.status = WhatsAppOperationStatus.COMPLETED
+    db.flush()
+    svc._sync_fund_legs(op, operator)
+
+    movs = db.query(FundMovement).filter(FundMovement.transaction_id == op.transaction_id).all()
+    assert len(movs) == 1
+    assert movs[0].movement_type == FundMovementType.EXCHANGE
+    assert movs[0].group_id == brasil.id
+    assert movs[0].amount == 465.75
+
+
+def test_sin_transaction_id_no_registra_movimientos_ni_duplica(db, pairs, client, fund, operator):
+    """
+    Un movimiento siempre cuelga de una transacción — es lo que lo hace desaparecer por
+    CASCADE si la op se borra. Con `transaction_id` en NULL, `_sync_fund_legs` no tiene con
+    qué correlacionar lo existente; sin el guard crearía un movimiento suelto, y otro
+    distinto en cada corrida porque nunca se encontraría a sí mismo la próxima vez.
+    """
+    from datetime import timedelta
+
+    from app.models.whatsapp_operation import (
+        WhatsAppAmountSide, WhatsAppOperation, WhatsAppOperationStatus,
+    )
+    from app.services.whatsapp_payment_service import WhatsAppPaymentService
+
+    now = datetime.now(timezone.utc)
+    op = WhatsAppOperation(
+        client_id=client.id, currency_pair_id=pairs["ZELLE-BRL"].id,
+        from_amount=100, to_amount=465.75, rate_used=4.6575, amount_side=WhatsAppAmountSide.SEND,
+        status=WhatsAppOperationStatus.COMPLETED, amount=100, currency="ZELLE",
+        amount_usdt=100, usdt_rate=1,
+        fund_group_id=fund.id, received_by_user_id=operator.id,
+        created_at=now, quoted_at=now, valuation_at=now,
+        expires_at=now + timedelta(minutes=30),
+    )
+    db.add(op)
+    db.flush()
+    assert op.transaction_id is None
+
+    svc = WhatsAppPaymentService(db)
+    svc._sync_fund_legs(op, operator)
+    svc._sync_fund_legs(op, operator)
+
+    assert db.query(FundMovement).count() == 0

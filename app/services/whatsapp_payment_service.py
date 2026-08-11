@@ -1385,6 +1385,14 @@ class WhatsAppPaymentService:
             else []
         )
 
+        if specs and op.transaction_id is None:
+            # Un movimiento siempre cuelga de una transacción — es lo que lo hace
+            # desaparecer por CASCADE si la op se borra. Sin `transaction_id`, `existing`
+            # queda vacío (no hay con qué correlacionar), y sin este guard el bloque de
+            # abajo crearía movimientos sueltos con `transaction_id=None`, duplicados en
+            # cada corrida porque nunca se encontrarían a sí mismos la próxima vez.
+            specs = []
+
         user_id = (actor.id if actor else None) or op.received_by_user_id
         if specs and user_id is None:
             # Sin gestor no se puede registrar, pero eso nunca tumba la operación.
@@ -1872,33 +1880,37 @@ class WhatsAppPaymentService:
             # que da la tasa, la tasa efectiva del pago sale de ahí.
             self._apply_settlement(row, op, from_amount)
 
-        # Con fondo: crear la transacción para que la pata que entra (`fund_group_id`) cuelgue
-        # de ella. El movimiento en sí lo deja `_sync_fund_legs` al final de la función, una
+        # Con fondo en cualquiera de las dos patas hace falta la transacción, para que los
+        # movimientos cuelguen de ella y se vayan con ella (FK ON DELETE CASCADE) si la op
+        # se borra. El movimiento en sí lo deja `_sync_fund_legs` al final de la función, una
         # vez que se conoce el estado final de la operación (PENDING o COMPLETED, según el
         # bloque de abajo) — antes se creaba acá mismo vía `_fund_movement_figures`, que
         # convertía de moneda; ahora cada pata va en la suya y el helper decide si corresponde.
         transaction_user = None
-        if group is not None:
+        if op.fund_group_id or op.fund_group_out_id:
             exchange_user_id = recorded_by_user_id
             if exchange_user_uuid is not None:
                 user = self.db.query(User).filter(User.uuid == exchange_user_uuid).first()
                 if user is None:
                     raise QuoteServiceError("user_not_found", f"Usuario {exchange_user_uuid} no encontrado", 404)
                 exchange_user_id = user.id
-            if exchange_user_id is None:
-                raise QuoteServiceError("exchange_user_required", "Falta el gestor del movimiento del fondo", 400)
 
-            transaction_user = self.db.query(User).filter(User.id == exchange_user_id).first()
-            if transaction_user is None:
-                raise QuoteServiceError("transaction_user_required", "Falta el usuario de la transacción", 400)
-            # La transacción va primero para que el movimiento cuelgue de ella: así el
-            # movimiento se va con la transacción (FK ON DELETE CASCADE) si la op se borra.
-            tx = quote_svc._create_transaction_for_op(
-                op,
-                WhatsAppOperationComplete(),
-                transaction_user,
+            transaction_user = (
+                self.db.query(User).filter(User.id == exchange_user_id).first()
+                if exchange_user_id
+                else None
             )
-            op.transaction_id = tx.id
+            # Sin gestor no hay quién firme la transacción, pero eso nunca tumba la
+            # operación: `_sync_fund_legs` (regla 6) simplemente no registra las patas.
+            if transaction_user is not None:
+                # La transacción va primero para que el movimiento cuelgue de ella: así el
+                # movimiento se va con la transacción (FK ON DELETE CASCADE) si la op se borra.
+                tx = quote_svc._create_transaction_for_op(
+                    op,
+                    WhatsAppOperationComplete(),
+                    transaction_user,
+                )
+                op.transaction_id = tx.id
 
         # Un entrante inicia la operación pero no confirma que el dinero haya sido entregado al
         # cliente: siempre permanece PENDING hasta vincular el pago saliente. Si la operación se

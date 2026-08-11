@@ -17,6 +17,7 @@
 - **Base de la suite en esta rama: 343 tests en verde.** (En `feat/fund-capital-from-receipt` son 357 porque esa rama agrega `test_fund_capital_from_receipt.py` y `test_fund_balance_currency.py`; no es esta.) Cada tarea suma los suyos: el total esperado al final de la Task N es 343 + los acumulados.
 - **Nada de movimientos retroactivos para el histórico sin fondo.** Fuera de alcance por decisión del usuario.
 - **`amount` en `fund_movements` es siempre positivo**; el tipo determina el signo. No introducir importes negativos.
+- **Al construir una `WhatsAppOperation` a mano en un test, los campos de enum van con el miembro, no con el string.** `amount_side=WhatsAppAmountSide.SEND`, `status=WhatsAppOperationStatus.COMPLETED`, `scenario=WhatsAppOperationScenario.VIA_PARTNER`. SQLAlchemy no convierte un string suelto al enum en memoria, así que `op.dict()` revienta después con `AttributeError: 'str' object has no attribute 'value'`. (Encontrado ejecutando la Task 2.)
 - **`FundRepository.create_movement` hace `commit()`.** Dentro del helper de sync NO se usa: se crean las filas con `self.db.add()` + `flush()`, para no commitear a mitad de una operación de servicio.
 
 ---
@@ -28,7 +29,7 @@
 | `app/models/fund.py` | Enum `FundMovementType` gana `EXCHANGE_IN` | Modificar |
 | `app/repositories/fund_repository.py` | Los tres cálculos que cuentan movimientos + resolver fondo por moneda | Modificar |
 | `app/models/whatsapp_operation.py` | Columna `fund_group_out_id`, relación y `dict()` | Modificar |
-| `alembic/versions/a1b2c3d4e5f6_add_operation_out_fund.py` | Migración aditiva de la columna | Crear |
+| `alembic/versions/b7c8d9e0f1a2_add_operation_out_fund.py` | Migración aditiva de la columna | Crear |
 | `app/services/whatsapp_payment_service.py` | `_sync_fund_legs`, resolución al crear, borrar `_fund_movement_figures`/`_sync_fund_movement` | Modificar |
 | `app/services/whatsapp_quote_service.py` | Resolver fondos al cotizar; `_apply_scenario` acepta el fondo saliente | Modificar |
 | `app/schemas/whatsapp.py` | `fund_group_out_uuid` / `clear_fund_group_out` | Modificar |
@@ -185,7 +186,7 @@ git commit -m "feat: EXCHANGE_IN movements count as money entering the fund"
 
 **Files:**
 - Modify: `app/models/whatsapp_operation.py:92` (columna), `:158` (relación), `:177-215` (`dict()`)
-- Create: `alembic/versions/a1b2c3d4e5f6_add_operation_out_fund.py`
+- Create: `alembic/versions/b7c8d9e0f1a2_add_operation_out_fund.py`
 - Test: `tests/test_fund_legs.py`
 
 **Interfaces:**
@@ -201,7 +202,7 @@ def test_la_operacion_guarda_el_fondo_que_paga(db, fund, pairs, client, operator
     from datetime import timedelta
 
     from app.models.whatsapp_operation import (
-        WhatsAppOperation, WhatsAppOperationStatus,
+        WhatsAppAmountSide, WhatsAppOperation, WhatsAppOperationStatus,
     )
 
     brasil = FundGroup(name="Cambios Brasil test", currency="BRL", is_active=True)
@@ -211,7 +212,7 @@ def test_la_operacion_guarda_el_fondo_que_paga(db, fund, pairs, client, operator
     now = datetime.now(timezone.utc)
     op = WhatsAppOperation(
         client_id=client.id, currency_pair_id=pairs["ZELLE-BRL"].id,
-        from_amount=100, to_amount=465.75, rate_used=4.6575, amount_side="SEND",
+        from_amount=100, to_amount=465.75, rate_used=4.6575, amount_side=WhatsAppAmountSide.SEND,
         status=WhatsAppOperationStatus.COMPLETED, amount=100, currency="ZELLE",
         fund_group_id=fund.id, fund_group_out_id=brasil.id,
         created_at=now, quoted_at=now, expires_at=now + timedelta(minutes=30),
@@ -264,12 +265,12 @@ Confirmar la cabeza actual antes de escribir:
 
 Debe decir `18e341e018c3 (head)`. Si dice otra cosa, usar esa como `down_revision`.
 
-`alembic/versions/a1b2c3d4e5f6_add_operation_out_fund.py`:
+`alembic/versions/b7c8d9e0f1a2_add_operation_out_fund.py`:
 
 ```python
 """operation records the fund that paid
 
-Revision ID: a1b2c3d4e5f6
+Revision ID: b7c8d9e0f1a2
 Revises: 18e341e018c3
 Create Date: 2026-08-11
 """
@@ -278,7 +279,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "a1b2c3d4e5f6"
+revision = "b7c8d9e0f1a2"
 down_revision = "18e341e018c3"
 branch_labels = None
 depends_on = None
@@ -324,7 +325,7 @@ Expected: las tres corren sin error (el ida y vuelta prueba el `downgrade`)
 - [ ] **Step 6: Commit**
 
 ```bash
-git add app/models/whatsapp_operation.py alembic/versions/a1b2c3d4e5f6_add_operation_out_fund.py tests/test_fund_legs.py
+git add app/models/whatsapp_operation.py alembic/versions/b7c8d9e0f1a2_add_operation_out_fund.py tests/test_fund_legs.py
 git commit -m "feat: operations record the fund that paid the outgoing leg"
 ```
 
@@ -444,12 +445,14 @@ Reglas que implementa:
 def _op_completada(db, pairs, client, fund_in, fund_out, operator):
     from datetime import timedelta
 
-    from app.models.whatsapp_operation import WhatsAppOperation, WhatsAppOperationStatus
+    from app.models.whatsapp_operation import (
+        WhatsAppAmountSide, WhatsAppOperation, WhatsAppOperationStatus,
+    )
 
     now = datetime.now(timezone.utc)
     op = WhatsAppOperation(
         client_id=client.id, currency_pair_id=pairs["ZELLE-BRL"].id,
-        from_amount=100, to_amount=465.75, rate_used=4.6575, amount_side="SEND",
+        from_amount=100, to_amount=465.75, rate_used=4.6575, amount_side=WhatsAppAmountSide.SEND,
         status=WhatsAppOperationStatus.COMPLETED, amount=100, currency="ZELLE",
         amount_usdt=100, usdt_rate=1,
         fund_group_id=fund_in.id if fund_in else None,
@@ -1216,14 +1219,16 @@ from datetime import datetime, timedelta, timezone
 
 from app.cli.backfill_fund_legs import plan_backfill
 from app.models.fund import FundGroup, FundMovement, FundMovementType
-from app.models.whatsapp_operation import WhatsAppOperation, WhatsAppOperationStatus
+from app.models.whatsapp_operation import (
+    WhatsAppAmountSide, WhatsAppOperation, WhatsAppOperationStatus,
+)
 
 
 def _op_con_movimiento(db, pairs, client, group, amount, currency, frm, to, usdt):
     now = datetime.now(timezone.utc)
     op = WhatsAppOperation(
         client_id=client.id, currency_pair_id=pairs[f"{frm}-{to}"].id,
-        from_amount=100, to_amount=465.75, rate_used=4.6575, amount_side="SEND",
+        from_amount=100, to_amount=465.75, rate_used=4.6575, amount_side=WhatsAppAmountSide.SEND,
         status=WhatsAppOperationStatus.COMPLETED, amount=100, currency=frm,
         fund_group_id=group.id, created_at=now, quoted_at=now, valuation_at=now,
         expires_at=now + timedelta(minutes=30),

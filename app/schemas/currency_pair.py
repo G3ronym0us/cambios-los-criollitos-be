@@ -28,11 +28,11 @@ class CurrencyPairBase(BaseModel):
     rounding_direction: Optional[Literal["UP", "DOWN"]] = Field(None, description="Rounding direction")
     rounding_amount_side: Optional[Literal["FROM", "TO"]] = Field(None, description="AMOUNT mode only: which side's amount is rounded (rounded only when it is the calculated side)")
 
-    @validator('to_currency_uuid')
-    def validate_different_currencies(cls, v, values):
-        if 'from_currency_uuid' in values and v == values['from_currency_uuid']:
-            raise ValueError('From and to currencies must be different')
-        return v
+    # Un par NO tiene por qué cruzar dos monedas distintas: `USDT-USDT` es una paridad 1:1 y
+    # es la única forma de expresar «un porcentaje sobre la par» en un modelo donde todo
+    # porcentaje necesita colgarse de un par base (ZELLE-USDT = USDT-USDT −7 %). No abre
+    # ninguna cotización rara: el resolver corta en seco cuando `from == to` y devuelve 1.
+    # Por eso aquí ya no se valida que sean diferentes.
 
     @validator('banks_to_track')
     def validate_banks_to_track(cls, v, values):

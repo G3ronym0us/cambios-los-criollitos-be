@@ -72,9 +72,20 @@ podría pedir "100 dólares a usdt" y el sistema le cotizaría **100 USDT con ma
 oferta que hoy es imposible porque el par no existe, y que estaríamos abriendo sin querer.
 
 `USDT-USDT = 1` publica una tautología: no hay nada que explotar, porque el resolver corta en
-seco cuando `from == to` y devuelve 1 sin consultar la base
-(`whatsapp_rate_resolver.py:69`). Nada impide crear un par con la misma moneda a ambos lados:
-no hay validación en el modelo, ni en el repositorio, ni en el formulario del front.
+seco cuando `from == to` y devuelve 1 sin consultar la base (`whatsapp_rate_resolver.py:69`).
+
+**Corrección (2026-08-19, al ejecutar el plan).** Este documento afirmaba que nada impedía
+crear un par con la misma moneda a ambos lados. Era falso, y en dos sitios a la vez: la
+búsqueda cubrió el modelo, el repositorio y el router, pero no los **schemas** ni el
+`submit()` del formulario del front. Había que quitar:
+
+- `CurrencyPairBase.validate_different_currencies` en `app/schemas/currency_pair.py`, que
+  rechazaba el alta con *«From and to currencies must be different»* (la hereda
+  `CurrencyPairCreate`; `CurrencyPairUpdate` no, así que la edición nunca estuvo afectada).
+- La misma regla en el formulario de creación del panel.
+
+Las dos venían de suponer que un par siempre cruza monedas distintas. Cubierto por
+`tests/test_parity_pair_creation.py`.
 
 **No tiene costo cosmético.** Se revisó si la paridad ensuciaba alguna pantalla y no: el
 calculador arma un `Set` de **monedas**, no de pares (`CurrencyCalculator.tsx:116`), así que

@@ -365,6 +365,19 @@ that dependency does not raise: it freezes the pair at its last value."
 
 ---
 
+## Task 2b: Permitir el par de paridad (apareció al ejecutar)
+
+El plan daba por hecho que crear `USDT-USDT` era solo configuración. No lo era: el schema lo
+rechazaba con *«From and to currencies must be different»*
+(`CurrencyPairBase.validate_different_currencies`, heredado por `CurrencyPairCreate`), y el
+formulario del panel tenía la misma regla. Ambas se quitaron; el par de paridad no se cotiza
+—el resolver corta cuando `from == to`— así que no abre ninguna cotización nueva.
+
+Cubierto por `tests/test_parity_pair_creation.py` (crear la paridad y que un par normal siga
+funcionando) y, del lado del front, por `_lib/newPairForm.test.ts`.
+
+---
+
 ## Task 3: Desplegar y configurar los pares en producción
 
 No hay código en esta tarea; es la puesta en marcha y su verificación. Se hace **después** de que el arreglo de la Tarea 1 esté en producción, porque el paso 2 depende de él.

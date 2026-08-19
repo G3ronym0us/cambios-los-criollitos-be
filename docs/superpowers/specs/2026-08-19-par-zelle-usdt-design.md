@@ -32,7 +32,7 @@ como la misma cosa con un spread; simplemente nunca lo dijo explícitamente.
 
 ## La forma elegida
 
-Dos filas de datos. **Cero código nuevo** salvo un test y un filtro cosmético.
+Dos filas de datos. **Cero código nuevo** salvo un test que fija el mecanismo.
 
 ### El par de paridad
 
@@ -76,9 +76,12 @@ seco cuando `from == to` y devuelve 1 sin consultar la base
 (`whatsapp_rate_resolver.py:69`). Nada impide crear un par con la misma moneda a ambos lados:
 no hay validación en el modelo, ni en el repositorio, ni en el formulario del front.
 
-Su único costo es cosmético: el calculador listaría un "USDT → USDT". **Entra en el alcance**
-taparlo: filtrar `rate.from_currency !== rate.to_currency` en el bucle que arma la lista de
-monedas del calculador (`frontend/src/components/CurrencyCalculator.tsx:118`).
+**No tiene costo cosmético.** Se revisó si la paridad ensuciaba alguna pantalla y no: el
+calculador arma un `Set` de **monedas**, no de pares (`CurrencyCalculator.tsx:116`), así que
+`USDT-USDT` aporta un "USDT" que ya estaba por los otros pares; y la home renderiza solo la
+calculadora (`page.tsx:116`). Los componentes que sí pintan un cartel por par —`CategorySection`
+y `RateCard`— no los importa ninguna pantalla viva. La paridad se ve únicamente en
+`/admin/currency-pairs`, que es donde debe verse.
 
 ### Por qué `use_inverse_percentage = true`
 

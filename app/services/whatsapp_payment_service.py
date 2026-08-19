@@ -295,16 +295,25 @@ class WhatsAppPaymentService:
         para poder filtrar y contar sin traerse la tabla entera. Un entrante está por
         atender si el OCR no leyó el monto, si no tiene destino de ningún tipo (ni
         operación, ni depósito a fondo, ni crédito de saldo), o si tiene destino pero le
-        sobra dinero. Un saliente, si no está clasificado ni vinculado.
+        sobra dinero. Un saliente, si no está clasificado y además le falta el monto o el
+        vínculo con su operación.
         """
         if table == "outgoing":
-            return or_(
-                Model.amount.is_(None),
-                and_(
+            # Clasificar es una decisión terminal: personal, irrelevante o préstamo ya dicen
+            # dónde acabó ese dinero. Va PRIMERO porque antes mandaba `amount IS NULL` y un
+            # comprobante marcado irrelevante seguía contando como «por atender» para
+            # siempre: el OCR no va a leer un monto nuevo de una foto que el operador ya
+            # descartó, así que la fila no salía nunca de la bandeja (caso saliente #4691).
+            classified = or_(
+                Model.is_personal_expense.is_(True),
+                Model.is_irrelevant.is_(True),
+                exists().where(ClientLoan.outgoing_payment_id == Model.id),
+            )
+            return and_(
+                ~classified,
+                or_(
+                    Model.amount.is_(None),
                     Model.whatsapp_operation_id.is_(None),
-                    Model.is_personal_expense.is_(False),
-                    Model.is_irrelevant.is_(False),
-                    ~exists().where(ClientLoan.outgoing_payment_id == Model.id),
                 ),
             )
 

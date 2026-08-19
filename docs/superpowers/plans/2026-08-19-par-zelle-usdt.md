@@ -423,16 +423,25 @@ curl -s https://api.cambiosloscriollitos.com/rates | \
 
 Esperado: una entrada con `rate: 1.0`, `is_manual: true`. Si sale vacío, el arreglo de la Tarea 1 no está desplegado.
 
-- [ ] **Step 4: Crear el par `ZELLE-USDT`**
+- [ ] **Step 4: Crear el par `ZELLE-USDT` — en DOS pantallas**
 
-| campo | valor |
-|---|---|
-| from / to | ZELLE / USDT |
-| tipo | `DERIVED` |
-| par base | `USDT-USDT` |
-| porcentaje | `7` |
-| porcentaje inverso | sí |
-| activo | sí |
+**Ojo: el diálogo de alta ya no pide el par base ni el porcentaje.** Se rediseñó para pedir
+solo lo esencial (monedas, tipo y descripción) y dejar el resto para la pantalla del par. Así
+que este paso son dos:
+
+**4a. En el diálogo «Nuevo par»:** from/to `ZELLE / USDT`, tipo **Derivado** (el que viene
+marcado por defecto es *Base*: hay que cambiarlo), descripción, y «Crear y configurar».
+
+**4b. En la pantalla del par**, que se abre sola al crear → pestaña **General**: par base
+`USDT/USDT`, porcentaje `7`, **Porcentaje inverso** activado, y guardar.
+
+**Por eso el paso 3 va antes:** `GET /currency-pairs/base-pairs` solo ofrece pares base
+activos que tengan rastreo de Binance **o una tasa manual**. Sin el precio manual del paso 3,
+`USDT-USDT` no aparece en el desplegable de «Par base» y el 4b no se puede completar.
+
+Si `ZELLE-USDT` ya se creó como `Base` por error, no hace falta borrarlo: se corrige en su
+pantalla (pestaña General) cambiando el tipo a Derivado y rellenando base y porcentaje —
+`CurrencyPairUpdate` acepta los tres campos.
 
 - [ ] **Step 5: Forzar el scrape y verificar la tasa**
 

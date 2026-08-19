@@ -145,8 +145,18 @@ class ExchangeRateRepository:
                 # Si existe un registro, actualizarlo
                 rate.set_manual_rate(manual_rate)
             else:
-                # Si no existe, crear un nuevo registro manual
+                # Primera tasa del par. `currency_pair_id` es NOT NULL, así que hay que
+                # resolver el par por sus símbolos: sin esto el INSERT reventaba, el except
+                # de abajo se lo tragaba y un par recién creado (una paridad, cualquier par
+                # sin scraper) no podía recibir su tasa desde el panel.
+                pair = self.db.query(CurrencyPair).filter(
+                    CurrencyPair.pair_symbol == f"{from_currency}-{to_currency}".upper()
+                ).first()
+                if pair is None:
+                    return None
+
                 rate = ExchangeRate(
+                    currency_pair_id=pair.id,
                     from_currency=from_currency,
                     to_currency=to_currency,
                     rate=manual_rate,

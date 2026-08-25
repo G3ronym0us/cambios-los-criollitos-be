@@ -17,6 +17,8 @@ from app.models.whatsapp_operation import WhatsAppOperationScenario
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.schemas.whatsapp import (
+    WhatsAppAnalysisLog,
+    WhatsAppAnalysisLogResponse,
     WhatsAppSourceMessage,
     WhatsAppSourceMessageLookup,
     WhatsAppSourceMessageResponse,
@@ -52,6 +54,7 @@ from app.schemas.operation_match import (
     OutgoingMatchRequest,
     OutgoingMatchResponse,
 )
+from app.services.analysis_log_service import AnalysisLogService
 from app.services.bank_email_service import BankEmailService
 from app.services.bcv_service import fetch_bcv_rate, get_cached_bcv_rate
 from app.services.operation_match_service import (
@@ -291,6 +294,34 @@ def find_operation_by_source_message(
         operation_uuid=row.operation.uuid, client_phone=row.client_phone,
         wa_message_id=row.wa_message_id,
     )
+
+
+@router.post(
+    "/analyses",
+    response_model=WhatsAppAnalysisLogResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def log_message_analysis(
+    payload: WhatsAppAnalysisLog,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    """
+    Registra qué leyó el analizador y qué dedujo. Es corpus, no decisión.
+
+    El bot llama sin esperar la respuesta, así que este endpoint no puede tener efectos
+    sobre nada más: escribe una fila en una tabla que nadie lee en caliente y devuelve el
+    uuid por si algún día hace falta enganchar la etiqueta desde el front.
+    """
+    row = AnalysisLogService(db).record(
+        client_phone=payload.client_phone,
+        messages=payload.messages,
+        output=payload.output,
+        wa_message_id=payload.wa_message_id,
+        analyzer=payload.analyzer,
+        context=payload.context,
+    )
+    return WhatsAppAnalysisLogResponse(uuid=row.uuid)
 
 
 @router.get("/operations", response_model=WhatsAppOperationList)

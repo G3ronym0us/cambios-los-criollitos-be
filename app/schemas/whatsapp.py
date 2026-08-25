@@ -277,6 +277,28 @@ class WhatsAppSourceMessageResponse(BaseModel):
     wa_message_id: Optional[str] = None
 
 
+# ===== Bitácora del analizador (corpus) =====
+
+class WhatsAppAnalysisLog(BaseModel):
+    """
+    Una corrida del analizador de mensajes. El bot la manda sin esperar respuesta: no
+    alimenta ninguna decisión, es el corpus con el que después se mide y se entrena.
+    """
+    client_phone: str = Field(..., min_length=3, max_length=64)
+    # La ventana tal cual la vio el analizador, el mensaje más viejo primero.
+    messages: List[str] = Field(..., min_length=1, max_length=10)
+    # El AnalysisResult crudo. Sin esquema fijo a propósito: cuando el analizador cambie de
+    # forma, las filas viejas siguen siendo legibles y `analyzer` dice cuál las produjo.
+    output: dict
+    wa_message_id: Optional[str] = Field(None, max_length=255)
+    analyzer: str = Field("heuristic-v1", min_length=1, max_length=32)
+    context: Optional[dict] = None
+
+
+class WhatsAppAnalysisLogResponse(BaseModel):
+    uuid: UUID
+
+
 # ===== Payments (comprobantes OCR) =====
 
 class WhatsAppPaymentCreate(BaseModel):

@@ -38,6 +38,7 @@ VERDICTS = {
     "cancelled": "op cancelada por otro motivo — ambiguo, mirar a mano",
     "open": "op todavía QUOTED/PENDING — aún no dice nada",
     "ghost_quote": "dedujo QUOTE con monto y no nació ninguna operación",
+    "op_gone": "sí nació una operación, pero hoy no está en la base — no dice nada del análisis",
     "no_action": "no dedujo cotización y no nació operación — el caso aburrido y correcto",
 }
 
@@ -59,35 +60,67 @@ class AnalysisCorpusService:
         self, rows: list[WhatsAppMessageAnalysis]
     ) -> dict[str, WhatsAppOperation]:
         """
-        Mapa wa_message_id → operación, en dos consultas para toda la ventana. El puente es
-        `whatsapp_operation_messages`, el mismo índice que el bot usa para el revoke.
+        Mapa wa_message_id → operación.
+
+        La vía principal es `whatsapp_operation_messages`, el mismo índice que el bot usa
+        para el revoke. Pero esa tabla solo existe desde el 2026-07-27, y el mapa que el bot
+        guarda en su SQLite viene de julio: las filas del backfill traen su operación de
+        origen en `context.source_operation_uuid`, y sin esa segunda vía 300 análisis que sí
+        produjeron una cotización se leerían como que no produjeron ninguna.
         """
         message_ids = [r.wa_message_id for r in rows if r.wa_message_id]
-        if not message_ids:
-            return {}
-        links = (
-            self.db.query(WhatsAppOperationMessage)
-            .filter(WhatsAppOperationMessage.wa_message_id.in_(message_ids))
-            .all()
-        )
-        if not links:
-            return {}
-        ops = {
-            op.id: op
-            for op in self.db.query(WhatsAppOperation)
-            .filter(WhatsAppOperation.id.in_([l.whatsapp_operation_id for l in links]))
-            .all()
+        found: dict[str, WhatsAppOperation] = {}
+        if message_ids:
+            links = (
+                self.db.query(WhatsAppOperationMessage)
+                .filter(WhatsAppOperationMessage.wa_message_id.in_(message_ids))
+                .all()
+            )
+            if links:
+                ops = {
+                    op.id: op
+                    for op in self.db.query(WhatsAppOperation)
+                    .filter(
+                        WhatsAppOperation.id.in_([l.whatsapp_operation_id for l in links])
+                    )
+                    .all()
+                }
+                found = {
+                    link.wa_message_id: ops[link.whatsapp_operation_id]
+                    for link in links
+                    if link.whatsapp_operation_id in ops
+                }
+
+        # Segunda vía, solo para lo que quedó sin resolver.
+        pending = {
+            r.wa_message_id: source_operation_uuid(r)
+            for r in rows
+            if r.wa_message_id and r.wa_message_id not in found and source_operation_uuid(r)
         }
-        return {
-            link.wa_message_id: ops[link.whatsapp_operation_id]
-            for link in links
-            if link.whatsapp_operation_id in ops
-        }
+        if pending:
+            by_uuid = {
+                str(op.uuid): op
+                for op in self.db.query(WhatsAppOperation)
+                .filter(WhatsAppOperation.uuid.in_(list(pending.values())))
+                .all()
+            }
+            for message_id, op_uuid in pending.items():
+                op = by_uuid.get(op_uuid)
+                if op is not None:
+                    found[message_id] = op
+        return found
 
     def verdict(
         self, row: WhatsAppMessageAnalysis, op: Optional[WhatsAppOperation]
     ) -> str:
         if op is None:
+            # Si la fila sabe de qué operación nació, que no aparezca no dice nada sobre la
+            # lectura: la operación se borró. Llamarlo `ghost_quote` acusaría al analizador
+            # de inventar una cotización que en realidad sí existió — y para las filas del
+            # backfill, que salen del mapa de mensajes que crearon cotizaciones, ese
+            # veredicto es estructuralmente imposible.
+            if source_operation_uuid(row):
+                return "op_gone"
             output = row.output or {}
             deduced_quote = output.get("intent") == "QUOTE" and output.get("amount") is not None
             return "ghost_quote" if deduced_quote else "no_action"
@@ -144,6 +177,19 @@ class AnalysisCorpusService:
             if replacement is not None:
                 record["replacement"] = _op_summary(replacement)
         return record
+
+
+def source_operation_uuid(row: WhatsAppMessageAnalysis) -> Optional[str]:
+    """
+    La operación de la que la fila dice haber nacido, si lo sabe.
+
+    Solo la traen las filas del backfill, que la leen del mapa mensaje→operación del SQLite
+    del bot. Las de la captura viva no la tienen: cuando el bot analiza todavía no existe
+    ninguna operación, así que para ellas el único puente posible es el índice del backend.
+    """
+    context = row.context or {}
+    value = context.get("source_operation_uuid")
+    return value if isinstance(value, str) and value else None
 
 
 def _op_summary(op: WhatsAppOperation) -> dict[str, Any]:

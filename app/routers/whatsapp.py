@@ -743,11 +743,17 @@ def create_pending_deposit(
     db: Session = Depends(get_db),
     principal: BotPrincipal = Depends(get_bot_principal),
 ):
-    """Un gestor subió un comprobante al grupo → crea un depósito PENDING (confirmable en /admin/funds)."""
+    """
+    Un gestor reportó un comprobante → crea un depósito PENDING (confirmable en /admin/funds).
+
+    El comprobante puede venir del grupo del fondo o del chat directo con el gestor, según
+    cómo se lleve ese fondo.
+    """
     service = FundPendingDepositService(db)
     try:
         return service.create_pending(
             group_jid=payload.group_jid,
+            manager_phone=payload.manager_phone,
             detected_phone=payload.detected_phone,
             amount=payload.amount,
             currency=payload.currency,

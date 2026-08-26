@@ -224,6 +224,10 @@ class WhatsAppPartnerResponse(BaseModel):
     username: Optional[str] = None
     group_uuid: UUID
     group_name: str
+    # Moneda base del fondo. El bot la necesita para decidir si el comprobante ya trae el
+    # monto que vale: un fondo en COP repuesto con un envío en USDT no lo trae.
+    group_currency: Optional[str] = None
+    # Sin jid, el fondo no se lleva en un grupo sino en el chat directo con este gestor.
     group_jid: Optional[str] = None
     is_fund_manager: bool = False
 
@@ -234,14 +238,26 @@ class WhatsAppPartnerList(BaseModel):
 
 
 class WhatsAppPendingDepositCreate(BaseModel):
-    """El bot reporta un comprobante subido al grupo por un gestor → depósito PENDING."""
-    group_jid: str
+    """
+    El bot reporta un comprobante de un gestor → depósito PENDING.
+
+    Llega por el grupo (`group_jid`) o por el chat directo con el gestor (`manager_phone`):
+    no todo fondo se lleva en un grupo de WhatsApp. Hace falta uno de los dos.
+    """
+    group_jid: Optional[str] = None
+    manager_phone: Optional[str] = None
     detected_phone: Optional[str] = None     # autor del mensaje en el grupo (gestor)
     amount: Optional[float] = None
     currency: Optional[str] = None
     provider: Optional[str] = None
     reference: Optional[str] = None
     raw_text: Optional[str] = None
+
+    @validator("manager_phone", always=True)
+    def uno_de_los_dos(cls, v, values):
+        if not v and not values.get("group_jid"):
+            raise ValueError("hace falta group_jid o manager_phone")
+        return v
 
 
 class WhatsAppOperationList(BaseModel):

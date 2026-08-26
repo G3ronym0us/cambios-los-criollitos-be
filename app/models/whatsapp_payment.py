@@ -188,6 +188,11 @@ class WhatsAppOutgoingPayment(UUIDMixin, Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     operation = relationship("WhatsAppOperation", foreign_keys=[whatsapp_operation_id])
+    settlements = relationship(
+        "WhatsAppOutgoingSettlement",
+        back_populates="payment",
+        cascade="all, delete-orphan",
+    )
 
     def dict(self):
         return {
@@ -219,5 +224,61 @@ class WhatsAppOutgoingPayment(UUIDMixin, Base):
             "source_payment_id": self.source_payment_id,
             "corrected_at": self.corrected_at,
             "correction_original": self.correction_original,
+            "created_at": self.created_at,
+        }
+
+
+class WhatsAppOutgoingSettlement(UUIDMixin, Base):
+    """
+    Qué parte del valor de cada operación cubre un comprobante SALIENTE.
+
+    Es el espejo de `WhatsAppPaymentAllocation`, que hace lo mismo del lado entrante. Hacía
+    falta porque el reparto solo existía en una dirección: un cliente que manda dos Zelle
+    (80 y 35) y recibe UN pago de 98.711,4 no se podía representar — el saliente tenía un
+    solo FK y había que elegir a cuál de los dos tratos mentirle.
+
+    Los montos van en la moneda del VALOR de cada operación (80 ZELLE, 35 ZELLE), no en la
+    del comprobante: es la misma convención que tenía `settled_amount` en el pago, del que
+    esta tabla es la generalización. `whatsapp_outgoing_payments.settled_amount` se conserva
+    como el total ya cubierto por el comprobante, y su `whatsapp_operation_id` sigue siendo
+    la operación principal —la de mayor parte—, igual que en los entrantes.
+    """
+    __tablename__ = "whatsapp_outgoing_settlements"
+    __table_args__ = (
+        UniqueConstraint(
+            "outgoing_payment_id", "whatsapp_operation_id", name="uq_settlement_payment_operation"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    outgoing_payment_id = Column(
+        Integer, ForeignKey("whatsapp_outgoing_payments.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    whatsapp_operation_id = Column(
+        Integer, ForeignKey("whatsapp_operations.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    #: En la moneda del valor de la operación.
+    settled_amount = Column(Float, nullable=False)
+    #: Tasa contra la que se comparó al vincular, para que la diferencia siga siendo auditable.
+    settled_reference_rate = Column(Float, nullable=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    payment = relationship("WhatsAppOutgoingPayment", back_populates="settlements")
+    operation = relationship("WhatsAppOperation", foreign_keys=[whatsapp_operation_id])
+    created_by = relationship("User", foreign_keys=[created_by_user_id])
+
+    def dict(self):
+        op = self.operation
+        cp = op.currency_pair if op else None
+        return {
+            "uuid": self.uuid,
+            "settled_amount": self.settled_amount,
+            "settled_reference_rate": self.settled_reference_rate,
+            "operation_uuid": op.uuid if op else None,
+            "operation_status": op.status.value if op and op.status else None,
+            "pair_symbol": cp.pair_symbol if cp else None,
             "created_at": self.created_at,
         }

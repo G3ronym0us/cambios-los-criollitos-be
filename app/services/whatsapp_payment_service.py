@@ -32,6 +32,7 @@ from app.models.whatsapp_payment import (
     WhatsAppIncomingPayment,
     WhatsAppOutgoingPayment,
     WhatsAppPaymentAllocation,
+    WhatsAppOutgoingSettlement,
 )
 from app.models.client_loan import ClientLoan
 from app.repositories.currency_pair_repository import CurrencyPairRepository
@@ -783,14 +784,20 @@ class WhatsAppPaymentService:
         return float(op.from_amount or 0), from_symbol
 
     def delivered_amount(self, op: WhatsAppOperation, exclude_payment_id: Optional[int] = None) -> float:
-        """Suma de lo que cubren los comprobantes de salida de la operación."""
-        q = self.db.query(WhatsAppOutgoingPayment).filter(
-            WhatsAppOutgoingPayment.whatsapp_operation_id == op.id,
-            WhatsAppOutgoingPayment.settled_amount.isnot(None),
+        """
+        Suma de lo que cubren los comprobantes de salida de la operación.
+
+        Se lee del REPARTO y no del FK del comprobante: un saliente puede cubrir varias
+        operaciones a la vez —el cliente manda dos Zelle y se le paga en uno solo— y ahí el
+        FK apunta solo a la principal. Con un único destino el reparto tiene una fila y esto
+        da exactamente lo mismo que antes.
+        """
+        q = self.db.query(WhatsAppOutgoingSettlement).filter(
+            WhatsAppOutgoingSettlement.whatsapp_operation_id == op.id,
         )
         if exclude_payment_id is not None:
-            q = q.filter(WhatsAppOutgoingPayment.id != exclude_payment_id)
-        return round(sum(p.settled_amount for p in q.all()), 2)
+            q = q.filter(WhatsAppOutgoingSettlement.outgoing_payment_id != exclude_payment_id)
+        return round(sum(s.settled_amount for s in q.all()), 2)
 
     def _reference_rate(self, op: WhatsAppOperation, payment) -> Optional[float]:
         """
@@ -896,8 +903,69 @@ class WhatsAppPaymentService:
                 value = self.operation_value(op)[0] - self.delivered_amount(op, payment.id)
         if value is not None and value <= 0:
             raise QuoteServiceError("invalid_settled_amount", "Lo cubierto debe ser > 0", 400)
-        payment.settled_amount = round(float(value), 2)
-        payment.settled_reference_rate = reference_rate
+        self._upsert_settlement(payment, op, round(float(value), 2), reference_rate)
+        self._sync_settlement_totals(payment)
+
+    def _upsert_settlement(
+        self,
+        payment: WhatsAppOutgoingPayment,
+        op: WhatsAppOperation,
+        settled_amount: float,
+        reference_rate: Optional[float],
+        actor: Optional[User] = None,
+    ) -> None:
+        """Crea o actualiza lo que este comprobante cubre de ESA operación."""
+        existing = (
+            self.db.query(WhatsAppOutgoingSettlement)
+            .filter(
+                WhatsAppOutgoingSettlement.outgoing_payment_id == payment.id,
+                WhatsAppOutgoingSettlement.whatsapp_operation_id == op.id,
+            )
+            .first()
+        )
+        if existing is not None:
+            existing.settled_amount = settled_amount
+            existing.settled_reference_rate = reference_rate
+            return
+        self.db.add(
+            WhatsAppOutgoingSettlement(
+                outgoing_payment_id=payment.id,
+                whatsapp_operation_id=op.id,
+                settled_amount=settled_amount,
+                settled_reference_rate=reference_rate,
+                created_by_user_id=actor.id if actor else None,
+            )
+        )
+
+    def _drop_settlement(self, payment_id: int, op_id: int) -> None:
+        self.db.query(WhatsAppOutgoingSettlement).filter(
+            WhatsAppOutgoingSettlement.outgoing_payment_id == payment_id,
+            WhatsAppOutgoingSettlement.whatsapp_operation_id == op_id,
+        ).delete(synchronize_session=False)
+
+    def _sync_settlement_totals(self, payment: WhatsAppOutgoingPayment) -> None:
+        """
+        Deja el comprobante al día con su reparto: `settled_amount` es el total cubierto y el
+        FK apunta a la operación de la parte mayor.
+
+        Los dos campos son ahora derivados, igual que en los entrantes (`_sync_primary_operation`).
+        Se conservan porque medio sistema los lee —el bot, el matcher, las listas— y porque con
+        un solo destino siguen valiendo exactamente lo mismo que antes.
+        """
+        self.db.flush()
+        rows = (
+            self.db.query(WhatsAppOutgoingSettlement)
+            .filter(WhatsAppOutgoingSettlement.outgoing_payment_id == payment.id)
+            .order_by(WhatsAppOutgoingSettlement.settled_amount.desc(), WhatsAppOutgoingSettlement.id)
+            .all()
+        )
+        if not rows:
+            payment.settled_amount = None
+            payment.settled_reference_rate = None
+            return
+        payment.settled_amount = round(sum(r.settled_amount for r in rows), 2)
+        payment.settled_reference_rate = rows[0].settled_reference_rate
+        payment.whatsapp_operation_id = rows[0].whatsapp_operation_id
 
     def _sync_status_from_delivery(self, op: WhatsAppOperation, completing_user: Optional[User]) -> bool:
         """
@@ -1129,6 +1197,130 @@ class WhatsAppPaymentService:
         self.db.refresh(payment)
         return self.allocation_summary(payment_id)
 
+    # ---------- Reparto de un SALIENTE entre operaciones ----------
+
+    def settlement_summary(self, payment_id: int) -> dict:
+        """
+        Qué operaciones cubre un comprobante de salida y con cuánto de cada valor.
+
+        El caso que lo pide: el cliente manda dos Zelle (80 y 35) y se le paga TODO en un
+        solo envío. Antes había que elegir a cuál de los dos tratos vincularlo y mentirle al
+        otro; ahora el comprobante se reparte, igual que ya se repartía un entrante.
+        """
+        payment = self._get_or_404("outgoing", payment_id)
+        rows = list(payment.settlements)
+        items = []
+        for row in rows:
+            item = row.dict()
+            op = row.operation
+            if op is not None:
+                value, currency = self.operation_value(op)
+                item["operation_value"] = value
+                item["operation_value_currency"] = currency
+                item["operation_delivered"] = self.delivered_amount(op)
+                item["operation_pending"] = round(value - self.delivered_amount(op), 2)
+            items.append(item)
+
+        settled = round(sum(r.settled_amount for r in rows), 2)
+        # Lo que el comprobante entrega en SU moneda contra lo que ya está repartido: la
+        # diferencia es lo que el operador todavía no ha dicho a qué trato pertenece.
+        covered_in_payment_currency = round(
+            sum(
+                r.settled_amount * (r.settled_reference_rate or 0)
+                for r in rows
+                if r.settled_reference_rate
+            ),
+            2,
+        )
+        return {
+            "payment_id": payment.id,
+            "amount": payment.amount,
+            "currency": payment.currency,
+            "settled_total": settled,
+            "covered_in_payment_currency": covered_in_payment_currency,
+            "unassigned_in_payment_currency": round(
+                (payment.amount or 0) - covered_in_payment_currency, 2
+            ),
+            "settlements": items,
+        }
+
+    def set_settlements(
+        self,
+        payment_id: int,
+        items: list,
+        actor: Optional[User] = None,
+    ) -> dict:
+        """
+        Reemplaza el reparto completo del comprobante de salida. Cada item es
+        {operation_uuid, settled_amount}, con el monto en la moneda del VALOR de esa operación.
+
+        No se valida contra el monto del comprobante como en los entrantes: aquí cada parte va
+        en la moneda de SU operación —80 ZELLE y 35 ZELLE para un pago en bolívares—, así que
+        la suma no es comparable con el pago sin pasar por las tasas de cada una. Lo que sí se
+        exige es que ninguna operación quede cubierta de más, que es el error que importa.
+        """
+        payment = self._get_or_404("outgoing", payment_id)
+        self._assert_not_loan(payment_id)
+        if not items:
+            raise QuoteServiceError(
+                "settlements_empty",
+                "El reparto no puede quedar vacío: desvincula el comprobante si ya no cubre "
+                "ninguna operación",
+                400,
+            )
+
+        resolved = []
+        seen = set()
+        for item in items:
+            op = (
+                self.db.query(WhatsAppOperation)
+                .filter(WhatsAppOperation.uuid == str(item.operation_uuid))
+                .first()
+            )
+            if op is None:
+                raise QuoteServiceError(
+                    "op_not_found", f"Operación {item.operation_uuid} no encontrada", 404
+                )
+            if op.id in seen:
+                raise QuoteServiceError(
+                    "settlement_duplicated",
+                    f"La operación {op.uuid} aparece dos veces en el reparto",
+                    400,
+                )
+            if item.settled_amount <= 0:
+                raise QuoteServiceError(
+                    "invalid_settled_amount", "Cada parte del reparto debe ser > 0", 400
+                )
+            seen.add(op.id)
+            resolved.append((op, round(item.settled_amount, 2)))
+
+        # Ninguna operación puede quedar cubierta por encima de su valor contando lo que ya
+        # cubren OTROS comprobantes suyos.
+        for op, amount in resolved:
+            value, currency = self.operation_value(op)
+            other = self.delivered_amount(op, exclude_payment_id=payment.id)
+            if value > 0 and round(other + amount, 2) > round(value, 2) + 0.01:
+                raise QuoteServiceError(
+                    "settlement_exceeds_operation",
+                    f"La operación {op.uuid} vale {value:.2f} {currency} y ya tiene "
+                    f"{other:.2f} cubiertos: no puede recibir {amount:.2f} más",
+                    400,
+                )
+
+        payment.settlements.clear()
+        self.db.flush()
+        for op, amount in resolved:
+            self._upsert_settlement(payment, op, amount, self._reference_rate(op, payment), actor)
+        self._sync_settlement_totals(payment)
+        self.db.flush()
+        # Cada operación tocada recalcula su estado: repartir puede completar varias a la vez.
+        for op, _ in resolved:
+            self._sync_status_from_delivery(op, actor)
+            self._sync_fund_legs(op, actor)
+        self.db.commit()
+        self.db.refresh(payment)
+        return self.settlement_summary(payment_id)
+
     def _resolve_orphan(
         self,
         row,
@@ -1238,6 +1430,12 @@ class WhatsAppPaymentService:
                 self._drop_allocation(row.id, row.whatsapp_operation_id)
                 row.whatsapp_operation_id = None
                 self._sync_primary_operation(row)
+            elif table == "outgoing" and row.whatsapp_operation_id is not None:
+                # Simétrico al entrante: se suelta la parte de la op principal y, si el
+                # comprobante todavía cubre otras, el FK pasa a la siguiente del reparto.
+                self._drop_settlement(row.id, row.whatsapp_operation_id)
+                row.whatsapp_operation_id = None
+                self._sync_settlement_totals(row)
             else:
                 row.whatsapp_operation_id = None
 
@@ -1466,12 +1664,9 @@ class WhatsAppPaymentService:
         reduce a prorrata; la tasa efectiva de cada pago se recalcula sola (amount/settled).
         """
         payouts = (
-            self.db.query(WhatsAppOutgoingPayment)
-            .filter(
-                WhatsAppOutgoingPayment.whatsapp_operation_id == op.id,
-                WhatsAppOutgoingPayment.settled_amount.isnot(None),
-            )
-            .order_by(WhatsAppOutgoingPayment.id)
+            self.db.query(WhatsAppOutgoingSettlement)
+            .filter(WhatsAppOutgoingSettlement.whatsapp_operation_id == op.id)
+            .order_by(WhatsAppOutgoingSettlement.id)
             .all()
         )
         covered = round(sum(p.settled_amount for p in payouts), 2)
@@ -1486,6 +1681,10 @@ class WhatsAppPaymentService:
                 share = round(payout.settled_amount * value / covered, 2)
                 payout.settled_amount = share
                 remaining = round(remaining - share, 2)
+        # Cada comprobante tocado tiene que quedar con su total al día: el recorte pudo
+        # cambiar su parte en ESTA operación mientras conserva las de otras.
+        for payment in {p.payment for p in payouts if p.payment is not None}:
+            self._sync_settlement_totals(payment)
 
     def _trim_allocations_to_value(self, op: WhatsAppOperation, value: float) -> float:
         """

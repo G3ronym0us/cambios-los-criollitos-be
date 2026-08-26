@@ -371,6 +371,22 @@ class PaymentAllocationsUpdate(BaseModel):
     allocations: List[PaymentAllocationItem]
 
 
+class OutgoingSettlementItem(BaseModel):
+    """
+    Parte del valor de UNA operación que cubre un comprobante de salida.
+
+    El monto va en la moneda del VALOR de esa operación (80 ZELLE), no en la del comprobante:
+    un solo pago en bolívares puede cubrir dos tratos en Zelle a la vez.
+    """
+    operation_uuid: UUID
+    settled_amount: float = Field(..., gt=0)
+
+
+class OutgoingSettlementsUpdate(BaseModel):
+    """Reparto completo del comprobante de salida: reemplaza el anterior y no puede ir vacío."""
+    settlements: List[OutgoingSettlementItem]
+
+
 class OrphanDecision(BaseModel):
     """
     Qué hacer con la operación si al desvincular este pago se queda sin ningún comprobante.

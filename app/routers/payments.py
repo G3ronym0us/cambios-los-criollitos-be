@@ -27,6 +27,7 @@ from app.schemas.whatsapp import (
     WhatsAppForwardToGroup,
     WhatsAppIrrelevant,
     PaymentAllocationsUpdate,
+    OutgoingSettlementsUpdate,
     WhatsAppPaymentLink,
     WhatsAppPaymentUpdate,
     WhatsAppPersonalExpense,
@@ -269,6 +270,42 @@ async def set_payment_allocations(
     service = WhatsAppPaymentService(db)
     try:
         return service.set_allocations(payment_id, payload.allocations, actor=current_user)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.get("/outgoing/{payment_id}/settlements")
+async def get_outgoing_settlements(
+    payment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Reparto de un comprobante de salida: qué operaciones cubre y con cuánto del valor de cada
+    una. Un cliente que manda dos Zelle y recibe un solo pago cubre dos tratos con un
+    comprobante. Operador JWT.
+    """
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.settlement_summary(payment_id)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.put("/outgoing/{payment_id}/settlements")
+async def set_outgoing_settlements(
+    payment_id: int,
+    payload: OutgoingSettlementsUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Reparte un comprobante de salida entre varias operaciones. Reemplaza el reparto anterior
+    y completa las que queden cubiertas. Operador JWT.
+    """
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.set_settlements(payment_id, payload.settlements, actor=current_user)
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 

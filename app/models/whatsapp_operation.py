@@ -145,11 +145,20 @@ class WhatsAppOperation(UUIDMixin, Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     client = relationship("WhatsAppClient", back_populates="operations")
-    # Los comprobantes de salida dicen cómo se pagó el trato; su `settled_amount` suma lo
-    # entregado. Solo lectura: el vínculo lo maneja el servicio de pagos.
+    # Los comprobantes de salida dicen cómo se pagó el trato. Solo lectura: el vínculo lo
+    # maneja el servicio de pagos. OJO: este FK es solo la operación PRINCIPAL del
+    # comprobante; lo entregado se cuenta desde `outgoing_settlements`, porque un mismo
+    # saliente puede cubrir varias operaciones.
     outgoing_payments = relationship(
         "WhatsAppOutgoingPayment",
         primaryjoin="WhatsAppOperation.id == foreign(WhatsAppOutgoingPayment.whatsapp_operation_id)",
+        viewonly=True,
+    )
+    # Qué parte del valor cubre cada comprobante de salida — incluidos los que llegan por el
+    # reparto y cuyo FK apunta a otra operación.
+    outgoing_settlements = relationship(
+        "WhatsAppOutgoingSettlement",
+        primaryjoin="WhatsAppOperation.id == foreign(WhatsAppOutgoingSettlement.whatsapp_operation_id)",
         viewonly=True,
     )
     currency_pair = relationship("CurrencyPair", lazy="joined")
@@ -174,9 +183,9 @@ class WhatsAppOperation(UUIDMixin, Base):
 
     @property
     def delivered_amount(self) -> float:
-        """Cuánto del valor cubren ya sus comprobantes de salida."""
+        """Cuánto del valor cubren ya sus comprobantes de salida, vengan del FK o del reparto."""
         return round(
-            sum(p.settled_amount or 0 for p in (self.outgoing_payments or [])),
+            sum(s.settled_amount or 0 for s in (self.outgoing_settlements or [])),
             2,
         )
 

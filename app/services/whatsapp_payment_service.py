@@ -1847,7 +1847,12 @@ class WhatsAppPaymentService:
         # la tasa que se terminó usando contra la base del par, así vale igual si el operador
         # cotizó a la tasa del día o a una propia.
         rate_used = to_amount / from_amount
-        entry = WhatsAppRateResolver(self.db).get_rate_entry_for_pair(from_currency, to_currency)
+        # Contra la tasa que regía CUANDO SE PAGÓ, no la de hoy: si no, un comprobante de
+        # ayer leído hoy sale con una ganancia que nadie cobró —la que inventa el movimiento
+        # de la tasa entre medias—. El front cotiza con esa misma tasa (`/rates/by-pair?at=`).
+        entry = WhatsAppRateResolver(self.db).get_rate_entry_for_pair(
+            from_currency, to_currency, at=row.created_at
+        )
         applied_percentage = WhatsAppRateResolver.implied_margin(entry, rate_used)
         op = WhatsAppOperation(
             client_id=client.id,

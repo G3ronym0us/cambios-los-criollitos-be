@@ -275,6 +275,31 @@ class ExchangeRateRepository:
             joinedload(ExchangeRate.currency_pair).joinedload(CurrencyPair.to_currency)
         ).first()
 
+    def get_rate_by_pair_at(self, currency_pair_uuid: UUID, at: datetime) -> Optional[ExchangeRate]:
+        """
+        La tasa que REGÍA en un instante dado, no la de hoy.
+
+        Misma regla que `WhatsAppRateResolver._fetch_latest_active`: la vigente de entonces
+        ya no está activa —la desactivó la siguiente—, así que se busca por fecha y no por
+        el flag. Sirve para leer un comprobante de ayer con la tasa de ayer.
+        """
+        currency_pair = self.db.query(CurrencyPair).filter(
+            CurrencyPair.uuid == currency_pair_uuid
+        ).first()
+
+        if not currency_pair:
+            return None
+
+        return self.db.query(ExchangeRate).filter(
+            and_(
+                ExchangeRate.currency_pair_id == currency_pair.id,
+                ExchangeRate.created_at <= at
+            )
+        ).options(
+            joinedload(ExchangeRate.currency_pair).joinedload(CurrencyPair.from_currency),
+            joinedload(ExchangeRate.currency_pair).joinedload(CurrencyPair.to_currency)
+        ).order_by(ExchangeRate.created_at.desc()).first()
+
     def update_rate(self, rate_uuid: UUID, update_data: ExchangeRateUpdate) -> Optional[ExchangeRate]:
         """
         Actualizar una tasa de cambio existente.

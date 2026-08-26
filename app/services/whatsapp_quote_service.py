@@ -1164,6 +1164,7 @@ class WhatsAppQuoteService:
                 "username": m.user.username if m.user else None,
                 "group_uuid": group.uuid if group else None,
                 "group_name": group.name if group else None,
+                "group_currency": group.currency if group else None,
                 "group_jid": group.whatsapp_group_jid if group else None,
                 "is_fund_manager": bool(m.is_fund_manager),
             })

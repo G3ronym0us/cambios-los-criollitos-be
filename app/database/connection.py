@@ -8,7 +8,7 @@ engine = create_engine(
     settings.DATABASE_URL,
     pool_pre_ping=True,
     pool_recycle=300,
-    echo=settings.DEBUG  # Solo mostrar SQL en modo debug
+    echo=settings.SQL_ECHO,  # Ver config: apagado salvo que se pida explícitamente
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

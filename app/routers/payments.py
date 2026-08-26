@@ -399,6 +399,7 @@ async def create_operation_from_payment(
             exchange_user_uuid=payload.exchange_user_uuid,
             recorded_by_user_id=current_user.id,
             fund_group_provided="fund_group_uuid" in payload.model_fields_set,
+            notes=payload.notes,
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)

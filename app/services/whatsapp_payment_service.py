@@ -1812,6 +1812,7 @@ class WhatsAppPaymentService:
         exchange_user_uuid: Optional[UUID] = None,
         recorded_by_user_id: Optional[int] = None,
         fund_group_provided: bool = False,
+        notes: Optional[str] = None,
     ) -> dict:
         row = self._get_or_404(table, payment_id)
         if table == "outgoing":
@@ -1865,6 +1866,7 @@ class WhatsAppPaymentService:
             applied_percentage=applied_percentage,
             default_percentage=entry.base_percentage if entry else None,
             amount_side=side,
+            notes=(notes or None),
             status=WhatsAppOperationStatus.PENDING,
             delivery_status=WhatsAppDeliveryStatus.PENDING if track_delivery else None,
             fund_group_id=group.id if group else None,

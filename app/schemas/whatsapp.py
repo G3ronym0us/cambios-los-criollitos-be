@@ -508,6 +508,10 @@ class WhatsAppCreateOpManual(BaseModel):
     amount_side: str = "SEND"
     fund_group_uuid: Optional[UUID] = None
     exchange_user_uuid: Optional[UUID] = None
+    # Por qué el valor de la operación no es el del comprobante: cuando el operador decide
+    # dejar la diferencia (y con ella una tasa efectiva distinta a la cotizada), la decisión
+    # se guarda con la operación en vez de perderse en el diálogo que la preguntó.
+    notes: Optional[str] = Field(None, max_length=2000)
 
     @validator('from_currency', 'to_currency')
     def upper_currency(cls, v: str) -> str:

@@ -858,14 +858,18 @@ class WhatsAppQuoteService:
             if group is None:
                 raise QuoteServiceError("fund_group_not_found", "FundGroup no encontrado", 404)
             op.fund_group_id = group.id
-        elif payload.group_jid:
-            group = self.db.query(FundGroup).filter(FundGroup.whatsapp_group_jid == payload.group_jid).first()
-            if group is None:
-                raise QuoteServiceError(
-                    "fund_group_not_found",
-                    f"No hay FundGroup asociado al grupo {payload.group_jid}",
-                    404,
-                )
+        elif payload.group_jid or payload.fund_manager_phone:
+            # El canal del fondo: su grupo, o el chat directo con su gestor. La regla es una
+            # sola (`fund_channel`) — ver el caso del pago 4951.
+            #
+            # El import va acá dentro y no arriba porque `fund_channel` levanta
+            # `QuoteServiceError`, que se define en ESTE módulo: a nivel de módulo el ciclo
+            # rompe la carga.
+            from app.services.fund_channel import resolve_fund_channel
+
+            group = resolve_fund_channel(
+                self.db, payload.group_jid, None, payload.fund_manager_phone
+            )
             op.fund_group_id = group.id
 
         # Fondo de la pata que SALE. clear_fund_group_out lo limpia.

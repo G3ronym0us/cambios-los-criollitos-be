@@ -702,7 +702,9 @@ def forward_incoming_to_group(
     """Marca un pago entrante como contabilizado en un grupo (ZELLE_DIRECT). No crea saliente."""
     service = WhatsAppPaymentService(db)
     try:
-        return service.mark_incoming_forwarded_to_group(payment_id, payload.group_jid, payload.group_uuid)
+        return service.mark_incoming_forwarded_to_group(
+            payment_id, payload.group_jid, payload.group_uuid, payload.manager_phone
+        )
     except QuoteServiceError as exc:
         _handle_service_error(exc)
 

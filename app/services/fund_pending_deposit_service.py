@@ -26,6 +26,7 @@ from app.models.fund import (
 from app.models.user import User
 from app.models.whatsapp_payment import WhatsAppIncomingPayment
 from app.repositories.fund_repository import FundRepository
+from app.services.fund_channel import resolve_fund_channel
 from app.services.whatsapp_quote_service import QuoteServiceError
 
 # Ventana para el match por monto: sin referencia, dos comprobantes del mismo monto y moneda
@@ -260,46 +261,5 @@ class FundPendingDepositService:
         group_uuid: Optional[UUID],
         manager_phone: Optional[str] = None,
     ) -> FundGroup:
-        """
-        El fondo al que pertenece un depósito.
-
-        El jid del grupo era la única vía, y da por sentado que todo fondo se lleva en un
-        grupo de WhatsApp. «Cambios Colombia» no: se maneja en el chat directo con su gestor,
-        y por eso no tiene jid — el gestor mandaba el comprobante por privado y terminaba
-        cotizado como si fuera un cliente. Resolver por el teléfono del gestor cubre las dos
-        formas sin tratarlas como casos distintos.
-        """
-        group = None
-        if group_uuid is not None:
-            group = self.db.query(FundGroup).filter(FundGroup.uuid == str(group_uuid)).first()
-        elif group_jid:
-            group = self.db.query(FundGroup).filter(FundGroup.whatsapp_group_jid == group_jid).first()
-        elif manager_phone:
-            grupos = (
-                self.db.query(FundGroup)
-                .join(FundGroupMember, FundGroupMember.group_id == FundGroup.id)
-                .filter(
-                    FundGroupMember.whatsapp_phone == manager_phone,
-                    FundGroupMember.is_fund_manager.is_(True),
-                    FundGroup.is_active.is_(True),
-                )
-                .all()
-            )
-            # Gestionar más de un fondo es normal (el operador gestiona varios): ahí el
-            # teléfono no alcanza para saber a cuál va el depósito, y adivinar sería mover
-            # capital al fondo equivocado. Se rechaza y se pide el fondo explícito.
-            if len(grupos) > 1:
-                raise QuoteServiceError(
-                    "ambiguous_fund_group",
-                    f"{manager_phone} gestiona {len(grupos)} fondos: "
-                    f"{', '.join(g.name for g in grupos)}. Indicá cuál.",
-                    409,
-                )
-            group = grupos[0] if grupos else None
-        if group is None:
-            raise QuoteServiceError(
-                "fund_group_not_found",
-                f"Fondo para {group_uuid or group_jid or manager_phone} no encontrado",
-                404,
-            )
-        return group
+        """El fondo al que pertenece un depósito. La regla vive en `fund_channel`."""
+        return resolve_fund_channel(self.db, group_jid, group_uuid, manager_phone)

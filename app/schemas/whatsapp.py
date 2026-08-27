@@ -170,13 +170,16 @@ class WhatsAppOperationScenarioUpdate(BaseModel):
     """
     Setear/editar el escenario, los fondos y el receptor del entrante de una operación.
     Todos opcionales (PATCH parcial). El fondo de la pata que ENTRA se resuelve por
-    `fund_group_uuid` o, para el bot, por `group_jid` (FundGroup.whatsapp_group_jid);
+    `fund_group_uuid` o, para el bot, por `group_jid` (FundGroup.whatsapp_group_jid) o por
+    `fund_manager_phone` (el fondo que se lleva en el chat directo con su gestor);
     el de la pata que SALE, por `fund_group_out_uuid`.
     """
     scenario: Optional[Literal["NORMAL", "ZELLE_DIRECT", "VIA_PARTNER"]] = None
     fund_group_uuid: Optional[UUID] = None
     fund_group_out_uuid: Optional[UUID] = None
     group_jid: Optional[str] = None
+    #: Chat directo del gestor, para los fondos que no se llevan en un grupo.
+    fund_manager_phone: Optional[str] = None
     received_by_user_uuid: Optional[UUID] = None
     # Permite explícitamente limpiar los fondos / receptor (poner a NULL) cuando True.
     clear_fund_group: bool = False
@@ -473,9 +476,15 @@ class ClientLoanRepaymentCreate(BaseModel):
 
 
 class WhatsAppForwardToGroup(BaseModel):
-    """Marcar un pago entrante como contabilizado en un grupo (escenario ZELLE_DIRECT)."""
+    """
+    Marcar un pago entrante como contabilizado en un fondo (escenario ZELLE_DIRECT).
+
+    El canal del fondo es su grupo (`group_jid`) o el chat directo con su gestor
+    (`manager_phone`): no todo fondo se lleva en un grupo.
+    """
     group_jid: Optional[str] = None
     group_uuid: Optional[UUID] = None
+    manager_phone: Optional[str] = None
 
 
 class WhatsAppBalanceCredit(BaseModel):

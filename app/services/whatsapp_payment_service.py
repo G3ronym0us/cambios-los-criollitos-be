@@ -40,6 +40,7 @@ from app.repositories.fund_repository import FundRepository
 from app.services import valuation
 from app.schemas.whatsapp import WhatsAppOperationComplete
 from app.services.operation_match_service import receipt_fingerprint
+from app.services.fund_channel import resolve_fund_channel
 from app.services.whatsapp_client_account_service import WhatsAppClientAccountService
 from app.services.whatsapp_quote_service import (
     QuoteServiceError,
@@ -96,6 +97,21 @@ def _implicit_allocation_dict(op, amount: float) -> dict:
         "created_by_username": None,
         "created_at": None,
     }
+
+
+#: Desde qué fracción de la pata que sale se considera que UN comprobante la cubre entera.
+#: Separa dos cosas que se parecen en la base pero no en la vida: un descuento —el operador
+#: cierra la op con un poco menos y la tasa efectiva sale de ahí, que es a propósito— y un
+#: pago parcial, que es una fracción visible del total y deja hermanos esperando.
+FULL_PAYOUT_MIN_RATIO = 0.9
+
+
+def _covers_whole_payout(payment, to_amount: Optional[float]) -> bool:
+    """¿Este comprobante es la pata que sale de la operación, o sólo un trozo de ella?"""
+    if not to_amount or to_amount <= 0 or not payment.amount:
+        # Sin con qué comparar se conserva lo de siempre: el comprobante la cubre.
+        return True
+    return float(payment.amount) >= to_amount * FULL_PAYOUT_MIN_RATIO
 
 
 class WhatsAppPaymentService:
@@ -1815,11 +1831,16 @@ class WhatsAppPaymentService:
         payment_id: int,
         group_jid: Optional[str] = None,
         group_uuid: Optional[UUID] = None,
+        manager_phone: Optional[str] = None,
     ) -> dict:
         """
-        Marca un pago ENTRANTE como contabilizado en un grupo (FundGroup), al reenviarlo
-        el operador al grupo (escenario ZELLE_DIRECT). Resuelve el grupo por su JID de
-        WhatsApp (`whatsapp_group_jid`) o por uuid. No crea ningún saliente.
+        Marca un pago ENTRANTE como contabilizado en un fondo (FundGroup), al reenviarlo el
+        operador al canal de ese fondo (escenario ZELLE_DIRECT). No crea ningún saliente.
+
+        El canal es el grupo de WhatsApp o el chat directo con el gestor (`manager_phone`),
+        que es como se lleva «Cambios Colombia»; la regla de resolución es una sola, en
+        `fund_channel`. Cuando sólo se miraba el jid, el reenvío al chat de Dionis no se
+        reconocía y quedaba un saliente fantasma (pago 4951).
 
         El grupo se guarda en la OPERACIÓN del pago (el pago ya no tiene columna propia: el
         fondo se deriva de la op). Si el entrante todavía no está vinculado a una operación,
@@ -1827,15 +1848,7 @@ class WhatsAppPaymentService:
         que vuelve a fijar el grupo.
         """
         row = self._get_or_404("incoming", payment_id)
-        group = None
-        if group_uuid is not None:
-            group = self.db.query(FundGroup).filter(FundGroup.uuid == str(group_uuid)).first()
-        elif group_jid:
-            group = self.db.query(FundGroup).filter(FundGroup.whatsapp_group_jid == group_jid).first()
-        if group is None:
-            raise QuoteServiceError(
-                "fund_group_not_found", f"Fondo para grupo {group_uuid or group_jid} no encontrado", 404
-            )
+        group = resolve_fund_channel(self.db, group_jid, group_uuid, manager_phone)
         op = row.operation
         if op is not None and op.fund_group_id != group.id:
             op.fund_group_id = group.id
@@ -2093,7 +2106,18 @@ class WhatsAppPaymentService:
             # Crear la operación DESDE un comprobante de salida afirma que ese pago es el que
             # la cubre: el valor se fijó mirándolo. Si el operador puso un valor distinto al
             # que da la tasa, la tasa efectiva del pago sale de ahí.
-            self._apply_settlement(row, op, from_amount)
+            #
+            # Pero eso vale sólo si el comprobante ES la pata que sale. Cuando la operación
+            # se arma desde UNO de varios pagos parciales, afirmarlo la deja saldada por un
+            # comprobante que cubre una fracción: la op 3898 (350 USD → 315.000 Bs) nació del
+            # pago 4938 (65.723 Bs, ~73 USD) marcado como los 350 enteros, y con el pendiente
+            # en cero los otros dos pagos móviles ya no la veían entre las sugeridas —el
+            # prorrateo de `expected_amount` sólo se activa con pendiente > 0—. Cuando el
+            # comprobante se queda corto se registra lo que de verdad cubre y el resto queda
+            # pendiente, que es lo que deja entrar a los que faltan.
+            self._apply_settlement(
+                row, op, from_amount if _covers_whole_payout(row, to_amount) else None
+            )
 
         # Con fondo en cualquiera de las dos patas hace falta la transacción, para que los
         # movimientos cuelguen de ella y se vayan con ella (FK ON DELETE CASCADE) si la op

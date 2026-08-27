@@ -218,6 +218,38 @@ El guardarraíl de hoy (un comprobante cubre la op entera sólo si es ≥90% de 
 hacer falta en el camino nuevo, porque `to_amount` ya no se teclea. Se **conserva** para el
 camino viejo: `create_operation_from_payment` sigue existiendo y el bot lo usa.
 
+## Decisión abierta: el margen implícito puede salir negativo
+
+Derivar la tasa de la suma obliga a recalcular `applied_percentage` contra la base del momento,
+y **puede dar negativo**. No es hipotético: es el primer caso que va a pasar por aquí.
+
+```
+op 3898 · base del momento 917,000
+   tasa 900  →  margen  +1,8539 %   (lo que hay hoy, mal)
+   tasa 920  →  margen  −0,3272 %   (lo correcto: se dio más que la base)
+```
+
+Hoy el schema lo prohíbe (`applied_percentage: Field(None, ge=0, le=99)`) y la ganancia de la
+transacción se calcula desde ahí. Las dos salidas:
+
+- **Guardarlo tal cual.** Ganancia negativa, honesta: se entregó por encima de la base y eso es
+  una pérdida real contra la referencia. Hay que levantar el `ge=0` y revisar que nada aguas
+  abajo asuma margen positivo.
+- **Dejar el margen en 0 y llevar la diferencia a otro sitio.** La operación no miente sobre la
+  tasa, pero la pérdida deja de verse en su ganancia.
+
+**Sin resolver.** La implementación no está definida hasta que se decida, porque la operación
+3898 —el caso de aceptación— cae justo aquí.
+
+## Caso de aceptación
+
+La operación **3898** queda deliberadamente sin corregir en producción (decisión del usuario,
+2026-08-27): es el caso con el que se valida la feature. Al terminar, cuadrarla desde el panel
+tiene que dar `to_amount` 322.000, tasa 920 y las tres liquidaciones sumando 350,00 exactos.
+
+Su hermana **3950** sí se corrigió con lo que ya existía (dos comprobantes, 412,84 + 437,16),
+porque ahí la tasa estaba bien y sólo fallaba el reparto.
+
 ## Riesgos
 
 - **Un comprobante mal leído ensucia la tasa de la operación.** Es la contracara de que mande la

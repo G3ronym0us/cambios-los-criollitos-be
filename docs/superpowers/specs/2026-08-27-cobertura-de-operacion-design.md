@@ -256,12 +256,15 @@ inferir. El camino de cobertura calcula el margen directo contra la base y lo gu
 | dónde | qué |
 |---|---|
 | `WhatsAppOperationUpdate.applied_percentage` | `Field(None, ge=0, le=99)` → admitir negativos (`gt=-100, lt=99`). |
-| `TransactionCreate.profit_percentage` | `Field(..., ge=0, le=100)` → idem. Es donde el dinero aterriza de verdad. |
+| `ProfitSplitBase.profit_percentage` | **sin cambios** — ver abajo. |
 | `implied_margin` | **sin cambios.** |
 
-Los dos schemas hay que revisarlos contra lo que consume la ganancia aguas abajo
-(`TransactionProfitSplit`, los repartos del fondo): una ganancia negativa repartida entre socios
-es una pérdida repartida, y hay que confirmar que las sumas no asumen signo.
+**Verificado durante la implementación (2026-08-27):** `ProfitSplitBase.profit_percentage` NO es
+el margen de la operación sino **la parte que le toca a cada socio** (50 = la mitad), y sale de
+`ProfitAllocationService.member_shares`, que ya filtra `percentage > 0`. Una operación en pérdida
+se reparte con el **monto** en negativo —`value_usdt * percentage / 100` con `value_usdt`
+negativo—, no con la parte. Aflojar ese `ge=0` habría debilitado un guardarraíl correcto sin
+ganar nada. El único schema que se toca es el de la operación.
 
 ## Caso de aceptación
 

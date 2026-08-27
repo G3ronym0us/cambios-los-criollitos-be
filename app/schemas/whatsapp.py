@@ -205,7 +205,9 @@ class WhatsAppOperationUpdate(WhatsAppOperationScenarioUpdate):
     """Edición atómica de los datos administrativos de una operación."""
 
     currency_pair_uuid: Optional[UUID] = None
-    applied_percentage: Optional[float] = Field(None, ge=0, le=99)
+    #: Puede ser NEGATIVO: se entregó por encima de la tasa base. Es una pérdida real contra
+    #: la referencia y esconderla en un cero sería mentir sobre la operación.
+    applied_percentage: Optional[float] = Field(None, gt=-100, lt=99)
     client_phone: Optional[str] = Field(None, min_length=4, max_length=32)
     client_display_name: Optional[str] = Field(None, max_length=120)
 
@@ -473,6 +475,34 @@ class ClientLoanRepaymentCreate(BaseModel):
     """Abono expresado en la referencia preferida del préstamo."""
     preferred_amount: float = Field(..., gt=0)
     notes: Optional[str] = None
+
+
+class OperationCoveragePayment(BaseModel):
+    payment_id: int
+    #: Sólo cuando ese comprobante abarca DOS tratos; si no, aporta su monto completo y no hay
+    #: nada que teclear.
+    settled_amount: Optional[float] = Field(None, gt=0)
+
+
+class OperationCoverageUncovered(BaseModel):
+    """La parte del valor que no tiene comprobante, con el motivo que la deja cerrar."""
+
+    amount: float = Field(..., ge=0)
+    reason: Optional[Literal["CASH", "OTHER_CHANNEL", "BALANCE", "ADJUSTMENT"]] = None
+
+
+class OperationCoverageUpdate(BaseModel):
+    """
+    Con qué comprobantes se cubre la operación. Es el conjunto COMPLETO, no deltas.
+
+    `partial` distingue «guardo lo que llevo» de «esto ya está cuadrado»: la tasa se deriva de
+    la suma sólo al cuadrar, porque a medias la suma está incompleta.
+    """
+
+    payments: List[OperationCoveragePayment]
+    value_amount: Optional[float] = Field(None, gt=0)
+    uncovered: Optional[OperationCoverageUncovered] = None
+    partial: bool = False
 
 
 class WhatsAppForwardToGroup(BaseModel):

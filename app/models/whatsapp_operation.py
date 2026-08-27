@@ -128,6 +128,12 @@ class WhatsAppOperation(UUIDMixin, Base):
     no_payments_ack_at = Column(DateTime(timezone=True), nullable=True)
     no_payments_ack_note = Column(Text, nullable=True)
 
+    #: Parte del valor que no tiene comprobante porque no se puede representar acá: efectivo
+    #: en mano, un canal que el bot no lee, saldo a favor, un ajuste. No es un error a
+    #: corregir — se declara, y declararlo es lo que deja cerrar el trato.
+    uncovered_amount = Column(Float, nullable=True)
+    uncovered_reason = Column(String(24), nullable=True)
+
     # Vínculo con la Transaction derivada. Puede existir desde QUOTED/PENDING si hay fondo.
     transaction_id = Column(Integer, ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True, index=True)
 
@@ -205,7 +211,9 @@ class WhatsAppOperation(UUIDMixin, Base):
             "amount": self.amount,
             "currency": self.currency,
             "delivered_amount": delivered,
-            "pending_amount": round((value or 0) - delivered, 2),
+            "uncovered_amount": self.uncovered_amount,
+            "uncovered_reason": self.uncovered_reason,
+            "pending_amount": round((value or 0) - delivered - (self.uncovered_amount or 0), 2),
             "amount_usdt": self.amount_usdt,
             "usdt_rate": self.usdt_rate,
             "bcv_amount": self.bcv_amount,

@@ -16,6 +16,8 @@ from sqlalchemy import and_, case, exists, func, or_, select
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.core.timezones import CARACAS_TZ
+from dataclasses import dataclass
+
 from app.models.currency import Currency
 from app.models.currency_pair import CurrencyPair
 from app.models.whatsapp_client import WhatsAppClient
@@ -39,7 +41,7 @@ from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.repositories.fund_repository import FundRepository
 from app.services import valuation
 from app.schemas.whatsapp import WhatsAppOperationComplete
-from app.services.operation_match_service import receipt_fingerprint
+from app.services.operation_match_service import receipt_fingerprint, suggest_combination
 from app.services.fund_channel import resolve_fund_channel
 from app.services.whatsapp_client_account_service import WhatsAppClientAccountService
 from app.services.whatsapp_quote_service import (
@@ -112,6 +114,19 @@ def _covers_whole_payout(payment, to_amount: Optional[float]) -> bool:
         # Sin con qué comparar se conserva lo de siempre: el comprobante la cubre.
         return True
     return float(payment.amount) >= to_amount * FULL_PAYOUT_MIN_RATIO
+
+
+#: Motivos por los que una parte del valor puede no tener comprobante. Ninguno es un error:
+#: son formas de pagar que el sistema no sabe representar.
+UNCOVERED_REASONS = ("CASH", "OTHER_CHANNEL", "BALANCE", "ADJUSTMENT")
+
+
+@dataclass
+class _RateProbe:
+    """Lo mínimo que `_reference_rate` mira de un comprobante: su moneda."""
+
+    currency: Optional[str]
+    amount: Optional[float] = None
 
 
 class WhatsAppPaymentService:
@@ -1214,6 +1229,231 @@ class WhatsAppPaymentService:
         return self.allocation_summary(payment_id)
 
     # ---------- Reparto de un SALIENTE entre operaciones ----------
+
+    # ---------- Cobertura: la misma tabla, anclada en la OPERACIÓN ----------
+
+    def _get_op_or_404(self, op_uuid) -> WhatsAppOperation:
+        op = (
+            self.db.query(WhatsAppOperation)
+            .filter(WhatsAppOperation.uuid == str(op_uuid))
+            .first()
+        )
+        if op is None:
+            raise QuoteServiceError("op_not_found", f"Operación {op_uuid} no encontrada", 404)
+        return op
+
+    def _payout_currency(self, op: WhatsAppOperation) -> Optional[str]:
+        """La moneda de la pata que SALE: contra ella se miden los comprobantes."""
+        cp = op.currency_pair
+        return cp.to_currency.symbol if cp and cp.to_currency else None
+
+    def _free_amount(self, payment: WhatsAppOutgoingPayment) -> float:
+        """
+        Cuánto del comprobante no está repartido todavía, en su propia moneda.
+
+        Cada parte del reparto va en la moneda del VALOR de su operación, así que para saber
+        cuánto consume del comprobante hay que pasarla por su tasa — igual que hace el panel
+        que reparte un comprobante entre varias operaciones.
+        """
+        usado = sum(
+            (s.settled_amount or 0) * (s.settled_reference_rate or 0)
+            for s in payment.settlements
+            if s.settled_reference_rate
+        )
+        return round(float(payment.amount or 0) - usado, 2)
+
+    def operation_coverage(self, op_uuid) -> dict:
+        """
+        Qué cubre ya esta operación y con qué comprobantes podría terminar de cubrirse.
+
+        Es el espejo de `settlement_summary`: la misma tabla leída por la otra columna. El
+        ancla es la OPERACIÓN, que es como se trabaja cuando el trato se pagó en partes —
+        buscar de a un comprobante obliga a llevar la suma de cabeza, y fue lo que dejó la
+        operación 3898 sin poder cuadrarse.
+        """
+        op = self._get_op_or_404(op_uuid)
+        value, currency = self.operation_value(op)
+        delivered = self.delivered_amount(op)
+        uncovered = float(op.uncovered_amount or 0)
+        pending = round(value - delivered - uncovered, 2)
+
+        settlements = [
+            {
+                "payment_id": s.outgoing_payment_id,
+                "settled_amount": s.settled_amount,
+                "rate": s.settled_reference_rate,
+                "amount": s.payment.amount if s.payment else None,
+                "currency": s.payment.currency if s.payment else None,
+            }
+            for s in op.outgoing_settlements
+        ]
+        mine = {s["payment_id"] for s in settlements}
+
+        phone = op.client.phone if op.client else None
+        candidates = []
+        if phone:
+            rows = (
+                self.db.query(WhatsAppOutgoingPayment)
+                .filter(WhatsAppOutgoingPayment.client_phone == phone)
+                .order_by(WhatsAppOutgoingPayment.created_at.desc())
+                .limit(60)
+                .all()
+            )
+            for row in rows:
+                if row.id in mine:
+                    continue
+                free = self._free_amount(row)
+                if free <= 0.01:
+                    continue
+                candidates.append(
+                    {
+                        "payment_id": row.id,
+                        "amount": row.amount,
+                        "free_amount": free,
+                        "currency": row.currency,
+                        "provider": row.provider,
+                        "reference": row.reference,
+                        "created_at": row.created_at,
+                    }
+                )
+
+        reference_rate = self._reference_rate(op, _RateProbe(self._payout_currency(op)))
+        return {
+            "operation_uuid": str(op.uuid),
+            "value": value,
+            "value_currency": currency,
+            "delivered": delivered,
+            "uncovered": op.uncovered_amount,
+            "uncovered_reason": op.uncovered_reason,
+            "pending": pending,
+            "reference_rate": reference_rate,
+            "settlements": settlements,
+            "candidates": candidates,
+            "suggestion": suggest_combination(candidates, pending, reference_rate),
+        }
+
+    def set_operation_coverage(
+        self,
+        op_uuid,
+        payments: list,
+        value_amount: Optional[float] = None,
+        uncovered: Optional[dict] = None,
+        partial: bool = False,
+        actor: Optional[User] = None,
+    ) -> dict:
+        """
+        Fija con qué comprobantes se cubre la operación, y deriva su tasa de la suma.
+
+        El monto de la pata que SALE no se teclea: es lo que suman los comprobantes marcados.
+        Así el error que motivó todo esto —cotizar 900 cuando eran 920, sin dónde arreglarlo
+        después porque el margen sólo resta— deja de ser posible: no hay número tecleado que
+        pueda salir mal.
+
+        `partial` es la diferencia entre «guardo lo que llevo» y «esto ya está cuadrado». La
+        derivación ocurre sólo al cuadrar, porque a medias la suma es incompleta y una tasa
+        sacada de ahí sería absurda: un comprobante de 65.723 sobre un valor de 350 daría
+        187,78. Mientras tanto cada comprobante se valora a la tasa de referencia y la
+        cotización se queda como está.
+        """
+        op = self._get_op_or_404(op_uuid)
+        if value_amount is not None:
+            if value_amount <= 0:
+                raise QuoteServiceError("invalid_amount", "El valor debe ser > 0", 400)
+            op.amount = value_amount
+        value, _ = self.operation_value(op)
+
+        resto = 0.0
+        if uncovered is not None:
+            resto = round(float(uncovered.get("amount") or 0), 2)
+            motivo = uncovered.get("reason")
+            if resto > 0 and motivo not in UNCOVERED_REASONS:
+                raise QuoteServiceError(
+                    "uncovered_needs_reason",
+                    "Declarar un resto sin comprobante exige decir por qué: "
+                    + ", ".join(UNCOVERED_REASONS),
+                    400,
+                )
+            op.uncovered_amount = resto or None
+            op.uncovered_reason = motivo if resto else None
+        resto = float(op.uncovered_amount or 0)
+
+        rows = []
+        for item in payments:
+            pid = item["payment_id"] if isinstance(item, dict) else item.payment_id
+            row = (
+                self.db.query(WhatsAppOutgoingPayment)
+                .filter(WhatsAppOutgoingPayment.id == pid)
+                .first()
+            )
+            if row is None:
+                raise QuoteServiceError(
+                    "payment_not_found", f"Comprobante {pid} no encontrado", 404
+                )
+            explicit = (
+                item.get("settled_amount")
+                if isinstance(item, dict)
+                else getattr(item, "settled_amount", None)
+            )
+            rows.append((row, explicit))
+
+        cubierto_por_valor = round(value - resto, 2)
+        if rows and not partial and cubierto_por_valor > 0:
+            suma = round(sum(float(r.amount or 0) for r, _ in rows), 2)
+            nueva_tasa = suma / cubierto_por_valor
+            op.to_amount = suma
+            op.rate_used = nueva_tasa
+            op.inverse_percentage = False
+            op.applied_percentage = self._margin_against_base(op, nueva_tasa)
+            self.db.flush()
+
+        # Se rehace el reparto entero: cada comprobante aporta su monto completo salvo que el
+        # llamador diga otra cosa, que es el caso de uno que abarca dos tratos.
+        for row, explicit in rows:
+            tasa = self._reference_rate(op, row)
+            cubre = (
+                explicit
+                if explicit is not None
+                else (round(float(row.amount or 0) / tasa, 2) if tasa else None)
+            )
+            if cubre is None or cubre <= 0:
+                raise QuoteServiceError(
+                    "no_reference_rate",
+                    f"Sin tasa para valorar el comprobante {row.id}: indícalo a mano",
+                    400,
+                )
+            self._upsert_settlement(row, op, cubre, tasa, actor)
+            self._sync_settlement_totals(row)
+
+        self.db.commit()
+        self.db.refresh(op)
+        return self.operation_coverage(op.uuid)
+
+    def _margin_against_base(self, op: WhatsAppOperation, rate: float) -> Optional[float]:
+        """
+        El margen que esta tasa lleva dentro, **con signo**.
+
+        No pasa por `implied_margin` a propósito: esa función existe para INFERIR el margen de
+        una tasa que llegó de fuera, y por eso devuelve None fuera del rango comercial — ahí
+        «la tasa no salió de este par y afirmar una ganancia sería inventarla». Acá no hay nada
+        que inferir: la tasa sale de los números de la propia operación, el valor lo puso el
+        operador y la suma la ponen sus comprobantes.
+
+        Puede dar NEGATIVO, y se guarda: es cuando se entregó por encima de la base, una
+        pérdida real contra la referencia. Esconderla en un cero sería mentir sobre el trato.
+        """
+        cp = op.currency_pair
+        if cp is None or not cp.from_currency or not cp.to_currency:
+            return None
+        resolver = WhatsAppQuoteService(self.db).resolver
+        entry = resolver.get_rate_entry_for_pair(
+            cp.from_currency.symbol, cp.to_currency.symbol, at=op.created_at
+        )
+        if entry is None or not entry.base_rate:
+            return None
+        base = resolver.apply_rate(1.0, entry.base_rate, entry.inverse_percentage)
+        if base <= 0:
+            return None
+        return round((1 - rate / base) * 100, 4)
 
     def settlement_summary(self, payment_id: int) -> dict:
         """

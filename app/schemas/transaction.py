@@ -8,6 +8,9 @@ from uuid import UUID
 class ProfitSplitBase(BaseModel):
     """Schema base para división de ganancias"""
     user_uuid: UUID
+    #: La PARTE que le toca a este socio (50 = la mitad), no el margen de la operación. Nunca
+    #: es negativa: una operación en pérdida se reparte con el MONTO en negativo, no con la
+    #: parte. Por eso este `ge=0` se queda como está aunque el margen sí pueda ser negativo.
     profit_percentage: float = Field(..., ge=0, le=100, description="Porcentaje de ganancia asignado (0-100)")
 
 class ProfitSplitCreate(ProfitSplitBase):

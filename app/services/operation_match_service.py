@@ -385,6 +385,47 @@ def pick_auto_match(
     return refined[0].uuid if len(refined) == 1 else None
 
 
+#: Cuánto se puede apartar del objetivo un conjunto para seguir contando como "cuadra".
+COMBINATION_TOLERANCE = 0.01
+#: Tope de candidatos que entran a la búsqueda. 2^18 recorre en un parpadeo; más arriba no
+#: aporta nada — un trato pagado con más de 18 comprobantes no lo resuelve una sugerencia.
+COMBINATION_MAX_CANDIDATES = 18
+
+
+def suggest_combination(
+    candidates: Sequence[dict], pending: float, rate: Optional[float]
+) -> list[int]:
+    """
+    El subconjunto de comprobantes cuya suma cuadra con lo que le falta a la operación.
+
+    Es exactamente lo que el operador hace de cabeza cuando un trato se pagó en partes: probar
+    cuáles suman. En el caso 3898 son 6.277 + 250.000 + 65.723 = 322.000, que es 350 a 920.
+
+    Devuelve el conjunto MÁS PEQUEÑO que cuadra —entre dos que cuadran, el de menos piezas es
+    casi siempre el bueno— y `[]` cuando ninguno lo hace: sin propuesta es mejor que con una
+    propuesta a medias, que el operador tendría que deshacer.
+    """
+    if not candidates or not rate or rate <= 0 or pending <= 0:
+        return []
+    objetivo = pending * rate
+    libres = [c for c in candidates if (c.get("free_amount") or 0) > 0][:COMBINATION_MAX_CANDIDATES]
+    if not libres:
+        return []
+
+    margen = max(objetivo * COMBINATION_TOLERANCE, 0.01)
+    mejor: Optional[list[int]] = None
+    for mascara in range(1, 1 << len(libres)):
+        suma = 0.0
+        elegidos: list[int] = []
+        for i, c in enumerate(libres):
+            if mascara >> i & 1:
+                suma += c["free_amount"]
+                elegidos.append(c["payment_id"])
+        if abs(suma - objetivo) <= margen and (mejor is None or len(elegidos) < len(mejor)):
+            mejor = elegidos
+    return mejor or []
+
+
 def pick_forwarded_incoming(
     candidates: Iterable[IncomingCandidate],
     used_source_ids: set[int],

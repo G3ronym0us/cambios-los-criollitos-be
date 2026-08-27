@@ -22,6 +22,7 @@ from app.database.connection import get_db
 from app.models.user import User
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from app.schemas.whatsapp import (
+    OperationCoverageUpdate,
     ProfitAllocationList,
     ProfitAllocationResponse,
     ProfitAllocationUpdate,
@@ -235,6 +236,51 @@ async def update_operation_value(
     service = WhatsAppPaymentService(db)
     try:
         return service.set_operation_value(op_uuid, payload.amount, actor=current_user)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.get("/{op_uuid}/coverage")
+async def get_operation_coverage(
+    op_uuid: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Qué cubre ya la operación y con qué comprobantes del cliente podría terminar de cubrirse.
+
+    Espejo de `/payments/outgoing/{id}/settlements`: la misma tabla leída por la otra columna.
+    Anclar en la operación es lo que permite cuadrar un trato pagado en partes sin llevar la
+    suma de cabeza.
+    """
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.operation_coverage(op_uuid)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.put("/{op_uuid}/coverage")
+async def set_operation_coverage(
+    op_uuid: UUID,
+    payload: OperationCoverageUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Fija con qué comprobantes se cubre la operación. Al cuadrarla la tasa se deriva de la suma;
+    el monto de la pata que sale no se teclea nunca.
+    """
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.set_operation_coverage(
+            op_uuid,
+            payments=[p.dict() for p in payload.payments],
+            value_amount=payload.value_amount,
+            uncovered=payload.uncovered.dict() if payload.uncovered else None,
+            partial=payload.partial,
+            actor=current_user,
+        )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 

@@ -1403,7 +1403,14 @@ class WhatsAppPaymentService:
             op.to_amount = suma
             op.rate_used = nueva_tasa
             op.inverse_percentage = False
-            op.applied_percentage = self._margin_against_base(op, nueva_tasa)
+            # Contra la tasa que regía cuando SE PAGÓ, no cuando se armó la operación. El
+            # trato se pactó el día del comprobante; una op que se arma dos días después
+            # —el caso 3898— mediría contra una base que nadie usó para cotizar.
+            pactado_en = min(
+                (r.created_at for r, _ in rows if r.created_at is not None),
+                default=op.created_at,
+            )
+            op.applied_percentage = self._margin_against_base(op, nueva_tasa, at=pactado_en)
             self.db.flush()
 
         # Se rehace el reparto entero: cada comprobante aporta su monto completo salvo que el
@@ -1428,7 +1435,9 @@ class WhatsAppPaymentService:
         self.db.refresh(op)
         return self.operation_coverage(op.uuid)
 
-    def _margin_against_base(self, op: WhatsAppOperation, rate: float) -> Optional[float]:
+    def _margin_against_base(
+        self, op: WhatsAppOperation, rate: float, at=None
+    ) -> Optional[float]:
         """
         El margen que esta tasa lleva dentro, **con signo**.
 
@@ -1440,13 +1449,17 @@ class WhatsAppPaymentService:
 
         Puede dar NEGATIVO, y se guarda: es cuando se entregó por encima de la base, una
         pérdida real contra la referencia. Esconderla en un cero sería mentir sobre el trato.
+
+        `at` es la fecha contra la que se busca la base — la del PAGO, no la de la operación.
+        Es la misma convención que `create_operation_from_payment`, para que los dos caminos
+        no midan contra bases distintas cuando la op se arma días después de cobrarse.
         """
         cp = op.currency_pair
         if cp is None or not cp.from_currency or not cp.to_currency:
             return None
         resolver = WhatsAppQuoteService(self.db).resolver
         entry = resolver.get_rate_entry_for_pair(
-            cp.from_currency.symbol, cp.to_currency.symbol, at=op.created_at
+            cp.from_currency.symbol, cp.to_currency.symbol, at=at or op.created_at
         )
         if entry is None or not entry.base_rate:
             return None

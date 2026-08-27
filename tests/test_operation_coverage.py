@@ -163,3 +163,45 @@ def test_writing_from_the_operation_reads_back_from_the_payment(svc, db, client,
     desde_el_pago = svc.settlement_summary(a.id)
     assert str(desde_el_pago["settlements"][0]["operation_uuid"]) == str(op["uuid"])
     assert desde_el_pago["settlements"][0]["settled_amount"] == pytest.approx(350.0, abs=0.01)
+
+
+# ---------------------------------------------------------------------------
+# Contra qué base se mide el margen
+# ---------------------------------------------------------------------------
+
+
+def test_the_margin_is_measured_against_the_rate_of_the_payment_date(
+    svc, db, client, pairs, operator
+):
+    """
+    La fecha que manda es la del PAGO, no la de la operación.
+
+    El caso 3898 se pagó el 24 y la op se armó el 26. Contra la base del 26 el margen sale
+    positivo; contra la del 24, que es cuando se pactó, sale negativo. Acá se montan dos tasas
+    del par —una vieja y una de hoy, bien distintas— y se comprueba que el margen sale de la
+    vieja. Es la misma convención que ya usa `create_operation_from_payment`.
+    """
+    from datetime import datetime, timedelta, timezone
+    from app.models.exchange_rate import ExchangeRate
+
+    hace_dos_dias = datetime.now(timezone.utc) - timedelta(days=2)
+    par = pairs["ZELLE-VES"]
+    # La tasa que regía cuando se pagó: base 1.000, muy lejos de la de hoy (782,92).
+    db.add(
+        ExchangeRate(
+            currency_pair_id=par.id, from_currency="ZELLE", to_currency="VES",
+            rate=1_000.0, is_active=True, created_at=hace_dos_dias,
+        )
+    )
+    db.flush()
+
+    pago = f.outgoing(db, 322_000, "VES", phone=TELEFONO, created_at=hace_dos_dias)
+    op = _op(svc, db, pago, salida=322_000, operator=operator)
+    db.flush()
+
+    svc.set_operation_coverage(op["uuid"], payments=[{"payment_id": pago.id}])
+
+    row = _row(db, op)
+    assert row.rate_used == pytest.approx(920.0, abs=0.001)
+    # (1 - 920/1000) x 100 = 8%. Contra la tasa de hoy (782,92) saldría negativo y enorme.
+    assert row.applied_percentage == pytest.approx(8.0, abs=0.01)

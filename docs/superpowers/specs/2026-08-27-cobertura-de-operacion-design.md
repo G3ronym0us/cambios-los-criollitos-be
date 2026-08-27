@@ -281,12 +281,13 @@ op 3898 · to_amount 322.000 · rate_used 920 · applied_percentage 2,6455
 regía en `op.created_at` (26-ago, base 945) y no en la fecha de los comprobantes (24-ago, base
 917). Contra 945 el 920 deja 2,6455% a favor; contra 917 dejaría −0,3272%.
 
-**Pregunta abierta:** `create_operation_from_payment` usa la fecha del COMPROBANTE
-(`at=row.created_at`) para lo mismo, así que los dos caminos miden contra bases distintas cuando
-la operación se arma días después del pago — que es justo el caso de 3898. El trato se pactó el
-24; medir contra el 26 dice que se ganó 2,65% donde en realidad se dio 0,33% por debajo de la
-base del día. No se cambió sin decidirlo: el número guardado hoy es defendible, pero los dos
-caminos deberían medir igual.
+**RESUELTO (usuario, 2026-08-27): manda la fecha de PAGO.** El trato se pactó el día del
+comprobante, así que la base contra la que se mide es la de ese día — la misma convención que ya
+usaba `create_operation_from_payment` (`at=row.created_at`). Con varios comprobantes se toma el
+**más antiguo**: es cuando se pactó la tasa; los que siguen son cuotas del mismo acuerdo.
+
+Con la regla nueva, 3898 pasa de +2,6455% (base del 26) a **−0,3272%** (base del 24) — el primer
+margen negativo real, que es justo el caso para el que se decidió guardarlos con signo.
 
 La operación **3950** se había corregido antes con lo que ya existía (dos comprobantes,
 412,84 + 437,16), porque ahí la tasa estaba bien y sólo fallaba el reparto.

@@ -9,6 +9,8 @@ camino que corre en producción — estos tests la reemplazan. Si aparece una re
 el caso se agrega AQUÍ.
 """
 
+import pytest
+
 from datetime import datetime, timedelta, timezone
 
 from app.services.operation_match_service import (
@@ -357,8 +359,42 @@ def test_forwarded_tolerance_is_tighter_than_the_outgoing_one():
     assert pick_forwarded_incoming([inc(7, 200.0)], set(), fwd(200.1), NOW) == 7
 
 
-def test_forwarded_outside_60_minute_window_does_not_match():
-    assert pick_forwarded_incoming([inc(7, 200.0, minutes_ago=90)], set(), fwd(200.0), NOW) is None
+def test_forwarded_outside_the_window_does_not_match():
+    assert pick_forwarded_incoming([inc(7, 200.0, minutes_ago=8 * 60)], set(), fwd(200.0), NOW) is None
+
+
+def test_forwarded_matches_hours_later_within_the_window():
+    """El reenvío al grupo es un asiento contable que el operador hace cuando puede. Con la
+    ventana de 60 min, el Zelle de $25 del 2026-08-24 23:39 reenviado a las 00:56 (77 min)
+    no calzaba y quedaba un saliente fantasma (pago 4975)."""
+    assert pick_forwarded_incoming([inc(7, 25.0, minutes_ago=77)], set(), fwd(25.0), NOW) == 7
+
+
+def test_forwarded_zelle_matches_when_only_the_forward_has_a_confirmation():
+    """Son dos capturas de la MISMA transferencia: el cliente manda la pantalla en español,
+    sin código a la vista, y el operador reenvía la de su banco, que sí trae
+    'Confirmation: JLXOWIF757BX'. La igualdad estricta rechazaba el par por un dato que sólo
+    un lado tenía (pago 4975)."""
+    candidates = [inc(7, 25.0, reference=None)]
+    criteria = fwd(25.0, reference="JLXOWIF757BX")
+    assert pick_forwarded_incoming(candidates, set(), criteria, NOW) == 7
+
+
+def test_forwarded_rejects_two_different_confirmations():
+    """Aflojar a «sólo cuando la traen los dos» no puede unir transferencias distintas."""
+    candidates = [inc(7, 25.0, reference="OTRACONF99")]
+    criteria = fwd(25.0, reference="JLXOWIF757BX")
+    assert pick_forwarded_incoming(candidates, set(), criteria, NOW) is None
+
+
+def test_forwarded_non_zelle_still_needs_proof_when_only_one_side_has_a_reference():
+    """Fuera de Zelle el monto no basta: sin referencia en los dos lados, la prueba tiene que
+    ser la huella del OCR."""
+    candidates = [inc(7, 500.0, currency="BRL", reference=None, raw_text="Comprovante PIX 14:32")]
+    criteria = fwd(500.0, currency="BRL", reference="E2E-778", raw_text="Comprovante PIX 15:07")
+    assert pick_forwarded_incoming(candidates, set(), criteria, NOW) is None
+    misma = fwd(500.0, currency="BRL", reference="E2E-778", raw_text="Comprovante PIX 14:32")
+    assert pick_forwarded_incoming(candidates, set(), misma, NOW) == 7
 
 
 def test_forwarded_skips_an_already_reused_incoming():
@@ -512,3 +548,57 @@ def test_service_auto_match_reaches_the_anonymous_operations_of_a_partner(db, fu
         OutgoingCriteria(amount=7612.17, currency="VES"), phone=phone
     )
     assert matched is not None and matched.id == op_row.id
+
+
+def test_an_operation_born_from_a_partial_payout_still_suggests_itself_to_its_siblings(
+    db, fund, client, operator
+):
+    """
+    El caso real (op 3898, 2026-08-27): 350 → 315.000 Bs pagados con TRES pagos móviles.
+    El operador arma la operación desde el primero (65.723 Bs, ~73 USD) y luego quiere
+    engancharle los otros dos, pero la operación no aparecía entre las sugeridas.
+
+    Crear la op desde un comprobante de salida afirmaba que ese pago la cubría ENTERA: el
+    pendiente quedaba en cero, el prorrateo de `expected_amount` no se activaba y los otros
+    comprobantes se comparaban contra los 315.000 completos, fuera de toda tolerancia.
+    """
+    from app.services.operation_match_service import OperationMatchService
+    from app.services.whatsapp_payment_service import WhatsAppPaymentService
+    from tests import factories as f
+
+    payment_service = WhatsAppPaymentService(db)
+    primero = f.outgoing(db, 65_723, "VES", phone="584148861273")
+    op = f.create_op_from_payment(
+        payment_service, "outgoing", primero, frm="ZELLE", to="VES",
+        from_amount=350, to_amount=315_000, recorded_by=operator.id,
+    )
+
+    # Cubre lo suyo a la tasa de la op (65.723 / 900 ≈ 73,03), no los 350 enteros.
+    assert op["delivered_amount"] == pytest.approx(73.03, abs=0.01)
+    assert op["pending_amount"] == pytest.approx(276.97, abs=0.01)
+
+    # El segundo pago móvil cubre justo el pendiente prorrateado (315.000 × 276,97/350).
+    segundo = f.outgoing(db, 250_000, "VES", phone="584148861273")
+    db.flush()
+    scored, suggestion = OperationMatchService(db).rank_for_payment(segundo.id, "outgoing")
+
+    assert suggestion is not None, "la op con saldo pendiente tiene que aparecer entre las sugeridas"
+    assert str(suggestion.uuid) == str(op["uuid"])
+
+
+def test_an_operation_paid_in_full_by_one_receipt_is_settled_whole(db, fund, client, operator):
+    """
+    Guardarraíl del corte: cuando el comprobante SÍ es la pata que sale, la operación nace
+    saldada y con el valor que puso el operador —incluido el descuento, que es a propósito—.
+    """
+    from app.services.whatsapp_payment_service import WhatsAppPaymentService
+    from tests import factories as f
+
+    payment_service = WhatsAppPaymentService(db)
+    pago = f.outgoing(db, 315_000, "VES", phone="584148861273")
+    op = f.create_op_from_payment(
+        payment_service, "outgoing", pago, frm="ZELLE", to="VES",
+        from_amount=350, to_amount=315_000, recorded_by=operator.id,
+    )
+    assert op["delivered_amount"] == pytest.approx(350, abs=0.01)
+    assert op["pending_amount"] == pytest.approx(0, abs=0.01)

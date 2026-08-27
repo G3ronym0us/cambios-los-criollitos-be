@@ -57,7 +57,12 @@ OPEN_STATUSES = ("QUOTED", "PENDING")
 
 #: El comprobante reenviado es el MISMO, no uno parecido: tolerancia mucho más dura.
 FORWARDED_TOLERANCE = 0.001
-FORWARDED_WINDOW_MINUTES = 60
+#: El reenvío al grupo es un asiento contable, y el operador lo hace cuando puede — no en la
+#: hora siguiente. Con 60 min el Zelle de $25 del 2026-08-24 23:39 reenviado a las 00:56
+#: (77 min) no calzaba y quedaba un saliente fantasma. Ampliar es barato: cuando dos
+#: candidatas caen dentro de la ventana, el desempate por cédula/teléfono devuelve `None`
+#: antes que adivinar, así que el peor caso sigue siendo "no calza", nunca "calza mal".
+FORWARDED_WINDOW_MINUTES = 6 * 60
 
 
 def receipt_fingerprint(text: Optional[str]) -> str:
@@ -399,14 +404,32 @@ def pick_forwarded_incoming(
     hora son cosa de todos los días, y confundirlos borraría un saliente REAL. Por eso se exige
     una prueba de que es el mismo comprobante: la referencia bancaria, o la huella del texto
     del OCR (reenviar es mandar la misma imagen, así que el texto sale idéntico).
+
+    **La referencia sólo decide cuando la traen LOS DOS.** Un lado sin referencia no es un lado
+    distinto, es un lado que no la pudo leer: el cliente manda la pantalla en español (sin
+    código a la vista) y el operador reenvía la de su banco, que sí trae "Confirmation:". Con
+    la regla de igualdad estricta ese par se rechazaba por un dato que sólo uno tenía.
     """
     if criteria.amount is None or criteria.amount <= 0 or not criteria.currency:
         return None
 
     fingerprint = receipt_fingerprint(criteria.raw_text)
-    #: Sin referencia ni huella no hay forma de afirmar que es el mismo comprobante.
-    needs_proof = criteria.currency != "ZELLE" and not criteria.reference
-    if needs_proof and not fingerprint:
+
+    def same_receipt(c: IncomingCandidate) -> bool:
+        """La prueba de que la candidata es el MISMO comprobante, no uno parecido."""
+        # Dos referencias distintas son dos transferencias distintas, siempre.
+        if criteria.reference and c.reference and c.reference != criteria.reference:
+            return False
+        # Zelle: monto + proveedor + ventana bastan (semántica histórica).
+        if criteria.currency == "ZELLE":
+            return True
+        if criteria.reference and c.reference:
+            return True
+        # Sin referencia en ambos lados, la prueba es la huella del OCR.
+        return bool(fingerprint) and receipt_fingerprint(c.raw_text) == fingerprint
+
+    #: Atajo: fuera de Zelle, sin huella y sin referencia propia no hay prueba posible.
+    if criteria.currency != "ZELLE" and not fingerprint and not criteria.reference:
         return None
 
     since = now - timedelta(minutes=criteria.window_minutes or FORWARDED_WINDOW_MINUTES)
@@ -423,9 +446,7 @@ def pick_forwarded_incoming(
         and c.created_at >= since
         and c.id not in used_source_ids
         and (not criteria.provider or (c.provider or "").lower() == criteria.provider.lower())
-        # Si el comprobante trae referencia, identifica la transferencia: tiene que coincidir.
-        and (not criteria.reference or c.reference == criteria.reference)
-        and (not needs_proof or receipt_fingerprint(c.raw_text) == fingerprint)
+        and same_receipt(c)
     ]
     matches.sort(key=lambda c: c.created_at, reverse=True)
 

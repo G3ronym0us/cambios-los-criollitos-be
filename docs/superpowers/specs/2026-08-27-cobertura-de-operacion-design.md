@@ -218,10 +218,10 @@ El guardarraíl de hoy (un comprobante cubre la op entera sólo si es ≥90% de 
 hacer falta en el camino nuevo, porque `to_amount` ya no se teclea. Se **conserva** para el
 camino viejo: `create_operation_from_payment` sigue existiendo y el bot lo usa.
 
-## Decisión abierta: el margen implícito puede salir negativo
+## El margen implícito puede salir negativo, y se guarda
 
 Derivar la tasa de la suma obliga a recalcular `applied_percentage` contra la base del momento,
-y **puede dar negativo**. No es hipotético: es el primer caso que va a pasar por aquí.
+y **puede dar negativo**. Es el primer caso que va a pasar por aquí:
 
 ```
 op 3898 · base del momento 917,000
@@ -229,17 +229,39 @@ op 3898 · base del momento 917,000
    tasa 920  →  margen  −0,3272 %   (lo correcto: se dio más que la base)
 ```
 
-Hoy el schema lo prohíbe (`applied_percentage: Field(None, ge=0, le=99)`) y la ganancia de la
-transacción se calcula desde ahí. Las dos salidas:
+**Decisión (usuario, 2026-08-27): se guarda tal cual.** Se entregó por encima de la base y eso
+es una pérdida real contra la referencia; esconderla en un cero sería mentir sobre la operación.
 
-- **Guardarlo tal cual.** Ganancia negativa, honesta: se entregó por encima de la base y eso es
-  una pérdida real contra la referencia. Hay que levantar el `ge=0` y revisar que nada aguas
-  abajo asuma margen positivo.
-- **Dejar el margen en 0 y llevar la diferencia a otro sitio.** La operación no miente sobre la
-  tasa, pero la pérdida deja de verse en su ganancia.
+### Por qué esto NO es levantar un `ge=0` y ya
 
-**Sin resolver.** La implementación no está definida hasta que se decida, porque la operación
-3898 —el caso de aceptación— cae justo aquí.
+Hoy el negativo no llega a chocar contra ningún schema: lo come antes
+`WhatsAppRateResolver.implied_margin`, que termina en
+
+```python
+return margin if 0 < margin < 99 else None
+```
+
+y eso es **deliberado**. Su docstring lo dice: fuera de ese rango «la tasa no salió de este par y
+afirmar una ganancia sería inventarla». Convertir ese `None` en un negativo debilitaría el
+guardarraíl — un margen fabricado donde hoy hay un honesto «no sé».
+
+La salida es que **la cobertura no necesita adivinar**. `implied_margin` existe para inferir el
+margen de una tasa que llegó de fuera; aquí la tasa sale de los números de la propia operación
+—el valor lo puso el operador y la suma la ponen sus comprobantes—, así que no hay nada que
+inferir. El camino de cobertura calcula el margen directo contra la base y lo guarda, con signo.
+`implied_margin` se queda exactamente como está para los caminos que sí adivinan.
+
+### Lo que hay que tocar
+
+| dónde | qué |
+|---|---|
+| `WhatsAppOperationUpdate.applied_percentage` | `Field(None, ge=0, le=99)` → admitir negativos (`gt=-100, lt=99`). |
+| `TransactionCreate.profit_percentage` | `Field(..., ge=0, le=100)` → idem. Es donde el dinero aterriza de verdad. |
+| `implied_margin` | **sin cambios.** |
+
+Los dos schemas hay que revisarlos contra lo que consume la ganancia aguas abajo
+(`TransactionProfitSplit`, los repartos del fondo): una ganancia negativa repartida entre socios
+es una pérdida repartida, y hay que confirmar que las sumas no asumen signo.
 
 ## Caso de aceptación
 

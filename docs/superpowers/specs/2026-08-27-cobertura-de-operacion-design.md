@@ -266,14 +266,31 @@ se reparte con el **monto** en negativo —`value_usdt * percentage / 100` con `
 negativo—, no con la parte. Aflojar ese `ge=0` habría debilitado un guardarraíl correcto sin
 ganar nada. El único schema que se toca es el de la operación.
 
-## Caso de aceptación
+## Caso de aceptación — CUMPLIDO 2026-08-27
 
-La operación **3898** queda deliberadamente sin corregir en producción (decisión del usuario,
-2026-08-27): es el caso con el que se valida la feature. Al terminar, cuadrarla desde el panel
-tiene que dar `to_amount` 322.000, tasa 920 y las tres liquidaciones sumando 350,00 exactos.
+```
+op 3898 · to_amount 322.000 · rate_used 920 · applied_percentage 2,6455
+   pago 4935    6.277 Bs → cubre   6,82
+   pago 4937  250.000 Bs → cubre 271,74
+   pago 4938   65.723 Bs → cubre  71,44
+                            ───────────
+                                 350,00
+```
 
-Su hermana **3950** sí se corrigió con lo que ya existía (dos comprobantes, 412,84 + 437,16),
-porque ahí la tasa estaba bien y sólo fallaba el reparto.
+**El margen salió POSITIVO, no el −0,33% previsto.** `_margin_against_base` mira la tasa que
+regía en `op.created_at` (26-ago, base 945) y no en la fecha de los comprobantes (24-ago, base
+917). Contra 945 el 920 deja 2,6455% a favor; contra 917 dejaría −0,3272%.
+
+**Pregunta abierta:** `create_operation_from_payment` usa la fecha del COMPROBANTE
+(`at=row.created_at`) para lo mismo, así que los dos caminos miden contra bases distintas cuando
+la operación se arma días después del pago — que es justo el caso de 3898. El trato se pactó el
+24; medir contra el 26 dice que se ganó 2,65% donde en realidad se dio 0,33% por debajo de la
+base del día. No se cambió sin decidirlo: el número guardado hoy es defendible, pero los dos
+caminos deberían medir igual.
+
+La operación **3950** se había corregido antes con lo que ya existía (dos comprobantes,
+412,84 + 437,16), porque ahí la tasa estaba bien y sólo fallaba el reparto.
+
 
 ## Riesgos
 

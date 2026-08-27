@@ -8,7 +8,7 @@ reason, and declaring it is what lets the deal close.
 `pending_amount` becomes `value - delivered - uncovered`, so an operation whose remainder is
 declared reads as settled even though its receipts do not add up to the whole value.
 
-Revision ID: a1b2c3d4e5f6
+Revision ID: 92c939842296
 Revises: d9e0f1a2b3c4
 Create Date: 2026-08-27 06:30:00.000000
 
@@ -17,7 +17,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = 'a1b2c3d4e5f6'
+revision = '92c939842296'
 down_revision = 'd9e0f1a2b3c4'
 branch_labels = None
 depends_on = None

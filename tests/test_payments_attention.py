@@ -110,15 +110,29 @@ def test_filing_an_outgoing_as_a_fund_deposit_clears_it(service, db, deposits, f
     assert pay.id in {i["id"] for i in service.list_payments_page("outgoing")["items"]}
 
 
-def test_rejecting_the_deposit_brings_the_receipt_back(service, db, deposits, fondo, operator):
-    """Rechazar el pendiente es deshacer la decisión: el comprobante vuelve a la bandeja."""
-    pay = f.outgoing(db, 1_000_000, "COP", phone="573123146340")
-    dep = deposits.create_from_receipt(
-        "outgoing", pay.id, fondo.uuid, operator.uuid, created_by_user_id=operator.id,
-    )
-    assert pay.id not in _attention_ids(service)
+def test_a_rejected_deposit_leaves_the_receipt_in_the_tray(service, db, fondo):
+    """
+    Rechazar es deshacer la decisión, y el comprobante vuelve a la bandeja.
 
-    deposits.reject(dep["uuid"], resolved_by_user_id=operator.id)
+    Hoy no se llega aquí desde Pagos —señalarlo confirma en el acto— pero la regla se afirma
+    igual: si algún día hay un «deshacer» sobre el depósito, la fila tiene que reaparecer sola
+    en vez de quedarse escondida con su decisión ya anulada.
+    """
+    from app.models.fund import (
+        FundPendingDeposit,
+        FundPendingDepositOrigin,
+        FundPendingDepositStatus,
+    )
+
+    pay = f.outgoing(db, 1_000_000, "COP", phone="573123146340")
+    db.add(FundPendingDeposit(
+        group_id=fondo.id, amount=1_000_000, currency="COP",
+        status=FundPendingDepositStatus.REJECTED,
+        origin=FundPendingDepositOrigin.RECEIPT,
+        source_outgoing_payment_id=pay.id,
+    ))
+    db.flush()
+
     assert pay.id in _attention_ids(service)
 
 
@@ -155,3 +169,19 @@ def test_a_duplicate_marker_is_not_a_destination(service, db, deposits, fondo, o
     db.flush()
 
     assert pay.id in _incoming_attention_ids(service)
+
+
+def test_the_row_says_it_became_a_fund_deposit(service, db, deposits, fondo, operator):
+    """
+    Salir de «Por atender» sin decir por qué es el desconcierto de siempre con otra cara: la
+    fila tiene que llevar encima la decisión que la sacó.
+    """
+    pay = f.outgoing(db, 1_000_000, "COP", phone="573123146340")
+    deposits.create_from_receipt(
+        "outgoing", pay.id, fondo.uuid, operator.uuid, created_by_user_id=operator.id,
+    )
+
+    row = next(i for i in service.list_payments_page("outgoing")["items"] if i["id"] == pay.id)
+    assert row["fund_deposit"]["status"] == "CONFIRMED"
+    assert row["fund_deposit"]["group_name"] == "Cambios Colombia"
+    assert row["fund_deposit"]["username"] == operator.username

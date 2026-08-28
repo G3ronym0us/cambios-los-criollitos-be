@@ -335,8 +335,16 @@ class FundPendingDepositService:
         created_by_user_id: int,
     ) -> dict:
         """
-        El comprobante ES el depósito: queda PENDING con monto, moneda y referencia sacados de
-        él, y él enganchado como evidencia. Se confirma en Fondos como cualquier otro.
+        El comprobante ES el depósito: nace con monto, moneda y referencia sacados de él, él
+        enganchado como evidencia, y **ya CONFIRMADO**.
+
+        No pasa por PENDING porque el pendiente existe para que alguien decida, y aquí la
+        decisión ya se tomó: el operador abrió ESE comprobante concreto y dijo que es el
+        depósito. Dejarlo esperando pedía repetir la misma afirmación en /admin/funds y,
+        mientras tanto, el dinero no estaba en el fondo aunque el comprobante ya lo probara.
+
+        Los guardarraíles de `confirm` siguen corriendo enteros: si ese dinero YA está contado
+        —el entrante tiene operación o ya movió el fondo— esto falla con 409 y no se crea nada.
         """
         payment = self._get_payment_or_404(table, payment_id)
         if not payment.amount or payment.amount <= 0:
@@ -368,9 +376,32 @@ class FundPendingDepositService:
             source_outgoing_payment_id=payment.id if table == "outgoing" else None,
         )
         self.db.add(row)
-        self.db.commit()
-        self.db.refresh(row)
-        return row.dict()
+        self.db.flush()
+
+        try:
+            return self.confirm(
+                row.uuid,
+                deposit_method=self._deposit_method_from(payment),
+                recorded_by_user_id=created_by_user_id,
+            )
+        except QuoteServiceError:
+            # El pendiente no llegó a existir: sin esto quedaría una fila PENDING que nadie
+            # puede confirmar, justo el registro huérfano que esta pantalla vino a eliminar.
+            self.db.rollback()
+            raise
+
+    @staticmethod
+    def _deposit_method_from(payment) -> str:
+        """
+        Cómo se movió el dinero lo dice el propio comprobante, no el operador: `provider` es lo
+        que leyó el OCR. Lo que no cae en un método propio es una transferencia — pix, paypal o
+        un comprobante sin proveedor legible entran ahí.
+        """
+        provider = (payment.provider or "").strip().lower()
+        for method in ("zelle", "binance", "kraken"):
+            if method in provider:
+                return method.upper()
+        return "TRANSFER"
 
     def _get_payment_or_404(self, table: str, payment_id: int):
         model = WhatsAppIncomingPayment if table == "incoming" else WhatsAppOutgoingPayment

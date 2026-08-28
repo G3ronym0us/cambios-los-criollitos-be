@@ -112,8 +112,8 @@ async def create_fund_deposit_from_receipt(
     current_user: User = Depends(get_current_user),
 ):
     """
-    El comprobante ES el depósito: queda PENDING con él enganchado como evidencia, y se
-    confirma en Fondos → Depósitos pendientes como cualquier otro.
+    El comprobante ES el depósito: entra al fondo CONFIRMADO, con él enganchado como
+    evidencia. Señalarlo desde aquí ya es la afirmación que el pendiente venía a pedir.
     """
     try:
         return FundPendingDepositService(db).create_from_receipt(

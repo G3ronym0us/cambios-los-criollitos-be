@@ -571,6 +571,8 @@ class WhatsAppPaymentService:
             self._attach_allocations(items)
         if table == "outgoing" and items:
             self._attach_loans(items)
+        if items:
+            self._attach_fund_deposits(items, table)
         return {"items": items, "total": total}
 
     def payments_stats(
@@ -652,6 +654,45 @@ class WhatsAppPaymentService:
         by_payment = {loan.outgoing_payment_id: loan.payment_summary() for loan in loans}
         for item in items:
             item["loan"] = by_payment.get(item["id"])
+
+    def _attach_fund_deposits(self, items: list[dict], table: str) -> None:
+        """
+        Agrega el bloque `fund_deposit` al comprobante que el operador archivó como depósito.
+
+        Va aparte de `_attach_deposits`, que mira el ledger por `FundMovement.incoming_payment_id`
+        —una columna muerta, del mecanismo retirado en julio—. Este mira la afirmación, que es lo
+        que la pantalla necesita poder decir: sin él la fila desaparece de «Por atender» y nada
+        cuenta por qué.
+        """
+        ids = [it["id"] for it in items]
+        source = (
+            FundPendingDeposit.source_outgoing_payment_id
+            if table == "outgoing"
+            else FundPendingDeposit.source_incoming_payment_id
+        )
+        rows = (
+            self.db.query(FundPendingDeposit, FundGroup.name)
+            .outerjoin(FundGroup, FundGroup.id == FundPendingDeposit.group_id)
+            .filter(
+                source.in_(ids),
+                FundPendingDeposit.origin == FundPendingDepositOrigin.RECEIPT,
+                FundPendingDeposit.status != FundPendingDepositStatus.REJECTED,
+            )
+            .all()
+        )
+        by_payment = {
+            (dep.source_outgoing_payment_id if table == "outgoing" else dep.source_incoming_payment_id): {
+                "uuid": dep.uuid,
+                "status": dep.status.value if dep.status else None,
+                "amount": dep.amount,
+                "currency": dep.currency,
+                "group_name": group_name,
+                "username": dep.detected_user.username if dep.detected_user else None,
+            }
+            for dep, group_name in rows
+        }
+        for it in items:
+            it["fund_deposit"] = by_payment.get(it["id"])
 
     def _attach_deposits(self, items: list[dict]) -> None:
         """Agrega a cada pago entrante un bloque `deposit` (o None) si tiene un FundMovement asociado."""

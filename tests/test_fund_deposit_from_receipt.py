@@ -134,7 +134,18 @@ def test_the_receipt_becomes_the_deposit_and_stays_as_evidence(
     assert dep["reference"] == "0000021500"
     assert dep["origin"] == FundPendingDepositOrigin.RECEIPT.value
     assert dep["source_outgoing_payment_id"] == pago.id
-    assert dep["status"] == "PENDING"
+
+    # Señalarlo desde el pago ES la confirmación: no hay un segundo «sí» que dar en Fondos, y
+    # el dinero entra al fondo en el mismo acto.
+    assert dep["status"] == "CONFIRMED"
+    movement = db.query(FundMovement).filter(
+        FundMovement.movement_type == FundMovementType.DEPOSIT
+    ).one()
+    assert movement.amount == 1_000_000
+    assert movement.currency == "COP"
+    assert movement.group_id == colombia.id
+    # El método sale del comprobante, no de una pregunta al operador.
+    assert movement.deposit_method == "TRANSFER"
 
 
 def test_a_receipt_without_a_readable_amount_is_refused(deposits, db, colombia, operator):
@@ -171,11 +182,7 @@ def test_a_loose_matching_incoming_does_not_block_the_deposit(
         "outgoing", pago.id, colombia.uuid, operator.uuid, created_by_user_id=operator.id,
     )
     assert dep["source_incoming_payment_id"] == gemelo.id, "el vínculo se registra igual"
-
-    confirmado = deposits.confirm(
-        dep["uuid"], deposit_method="TRANSFER", recorded_by_user_id=operator.id,
-    )
-    assert confirmado["status"] == "CONFIRMED"
+    assert dep["status"] == "CONFIRMED"
 
 
 def test_an_incoming_already_counted_still_blocks(deposits, db, colombia, operator, pairs):
@@ -191,9 +198,13 @@ def test_an_incoming_already_counted_still_blocks(deposits, db, colombia, operat
     pago = f.outgoing(db, 1_000_000, "COP", phone=DIONIS, reference="0000021500")
     db.flush()
 
-    dep = deposits.create_from_receipt(
-        "outgoing", pago.id, colombia.uuid, operator.uuid, created_by_user_id=operator.id,
-    )
     with pytest.raises(QuoteServiceError) as exc:
-        deposits.confirm(dep["uuid"], deposit_method="TRANSFER", recorded_by_user_id=operator.id)
+        deposits.create_from_receipt(
+            "outgoing", pago.id, colombia.uuid, operator.uuid, created_by_user_id=operator.id,
+        )
     assert exc.value.code == "duplicate_of_incoming"
+
+    # Y no queda rastro: confirmar en el mismo acto significa que un depósito frenado no deja
+    # una fila PENDING que nadie podría confirmar nunca.
+    from app.models.fund import FundPendingDeposit
+    assert db.query(FundPendingDeposit).count() == 0

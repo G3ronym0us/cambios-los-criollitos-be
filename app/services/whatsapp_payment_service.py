@@ -27,7 +27,14 @@ from app.models.whatsapp_operation import (
     WhatsAppOperation,
     WhatsAppOperationStatus,
 )
-from app.models.fund import FundGroup, FundMovement, FundMovementType
+from app.models.fund import (
+    FundGroup,
+    FundMovement,
+    FundMovementType,
+    FundPendingDeposit,
+    FundPendingDepositOrigin,
+    FundPendingDepositStatus,
+)
 from app.models.user import User
 from app.models.whatsapp_balance import WhatsAppBalanceEntry, WhatsAppBalanceEntryType
 from app.models.whatsapp_payment import (
@@ -319,6 +326,35 @@ class WhatsAppPaymentService:
         rows = self._payments_base_query(Model).order_by(Model.created_at.desc()).limit(limit).all()
         return [self._row_to_dict(*r) for r in rows]
 
+    def _filed_as_fund_deposit(self, Model, table: str):
+        """
+        El comprobante que el operador señaló como depósito al fondo YA tiene destino: ese
+        dinero se quedó en el fondo en vez de retirarse, y su pendiente vive en /admin/funds.
+
+        Sólo cuenta `origin=RECEIPT`. En los demás orígenes `source_incoming_payment_id` es
+        marca de DUPLICADO, no de destino — el gestor reenvió al grupo el Zelle de un cliente
+        y el sistema anotó que se parecen; ese entrante sigue esperando su operación y sacarlo
+        de la bandeja por eso lo perdería.
+
+        PENDING cuenta igual que CONFIRMED: la decisión ya se tomó. REJECTED lo devuelve a la
+        bandeja, que es exactamente lo que significa rechazar el pendiente.
+        """
+        source = (
+            FundPendingDeposit.source_outgoing_payment_id
+            if table == "outgoing"
+            else FundPendingDeposit.source_incoming_payment_id
+        )
+        return (
+            select(FundPendingDeposit.id)
+            .where(
+                source == Model.id,
+                FundPendingDeposit.origin == FundPendingDepositOrigin.RECEIPT,
+                FundPendingDeposit.status != FundPendingDepositStatus.REJECTED,
+            )
+            .correlate(Model)
+            .exists()
+        )
+
     def _attention_condition(self, Model, table: str):
         """
         Qué cuenta como «por atender»: comprobantes cuyo dinero todavía no respalda nada.
@@ -326,13 +362,16 @@ class WhatsAppPaymentService:
         Es la misma pregunta que responde el listado fila por fila, pero expresada en SQL
         para poder filtrar y contar sin traerse la tabla entera. Un entrante está por
         atender si el OCR no leyó el monto, si no tiene destino de ningún tipo (ni
-        operación, ni depósito a fondo, ni crédito de saldo), o si tiene destino pero le
-        sobra dinero. Un saliente, si no está clasificado y además le falta el monto o el
-        vínculo con su operación.
+        operación, ni depósito a fondo —movimiento del ledger o pendiente señalado desde
+        esta misma bandeja—, ni crédito de saldo), o si tiene destino pero le sobra dinero.
+        Un saliente, si no está clasificado y además le falta el monto o el vínculo con su
+        operación.
         """
         if table == "outgoing":
-            # Clasificar es una decisión terminal: personal, irrelevante o préstamo ya dicen
-            # dónde acabó ese dinero. Va PRIMERO porque antes mandaba `amount IS NULL` y un
+            # Clasificar es una decisión terminal: personal, irrelevante, préstamo o
+            # depósito al fondo ya dicen dónde acabó ese dinero — el depósito porque no se
+            # retiró, se quedó allí a nombre de quien mandó el comprobante (pago 4928).
+            # Va PRIMERO porque antes mandaba `amount IS NULL` y un
             # comprobante marcado irrelevante seguía contando como «por atender» para
             # siempre: el OCR no va a leer un monto nuevo de una foto que el operador ya
             # descartó, así que la fila no salía nunca de la bandeja (caso saliente #4691).
@@ -340,6 +379,7 @@ class WhatsAppPaymentService:
                 Model.is_personal_expense.is_(True),
                 Model.is_irrelevant.is_(True),
                 exists().where(ClientLoan.outgoing_payment_id == Model.id),
+                self._filed_as_fund_deposit(Model, table),
             )
             return and_(
                 ~classified,
@@ -372,11 +412,12 @@ class WhatsAppPaymentService:
             .correlate(Model)
             .exists()
         )
-        has_deposit = (
+        has_deposit = or_(
             select(FundMovement.id)
             .where(FundMovement.incoming_payment_id == Model.id)
             .correlate(Model)
-            .exists()
+            .exists(),
+            self._filed_as_fund_deposit(Model, table),
         )
 
         # Vínculo directo sin filas de reparto: el implícito de `_default_allocation_amount`.

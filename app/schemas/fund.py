@@ -243,6 +243,18 @@ class FundPendingDepositCreate(BaseModel):
     notes: Optional[str] = None
 
 
+class FundDepositFromReceipt(BaseModel):
+    """
+    Registrar un comprobante de la bandeja como depósito al fondo.
+
+    Monto, moneda, proveedor y referencia salen del comprobante — no viajan. Sólo hace falta
+    decir a qué fondo y a nombre de quién, y las dos cosas vienen propuestas por
+    `GET /payments/{table}/{id}/fund-deposit`.
+    """
+    group_uuid: UUID
+    user_uuid: UUID
+
+
 class FundPendingDepositConfirm(BaseModel):
     """Confirmar un depósito pendiente → crea un FundMovement DEPOSIT."""
     deposit_method: str = Field("ZELLE", description="ZELLE | BINANCE | KRAKEN | TRANSFER | OTHER")

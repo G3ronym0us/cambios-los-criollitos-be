@@ -38,6 +38,8 @@ from app.schemas.operation_match import PaymentSuggestionsRequest
 from app.services.client_loan_service import ClientLoanService
 from app.services.operation_match_service import OperationMatchService
 from app.services.whatsapp_balance_service import WhatsAppBalanceService
+from app.schemas.fund import FundDepositFromReceipt
+from app.services.fund_pending_deposit_service import FundPendingDepositService
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
 from app.services.whatsapp_quote_service import QuoteServiceError
 
@@ -79,6 +81,43 @@ async def create_client_loan(
             notes=payload.notes,
             created_by_user_id=current_user.id,
             client_uuid=payload.client_uuid,
+        )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.get("/{table}/{payment_id}/fund-deposit")
+async def suggest_fund_deposit(
+    table: Literal["incoming", "outgoing"],
+    payment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Qué fondo y qué gestor proponer para registrar este comprobante como depósito.
+    El fondo sale del canal donde llegó; el gestor, de quién lo mandó.
+    """
+    try:
+        return FundPendingDepositService(db).suggest_for_receipt(table, payment_id)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.post("/{table}/{payment_id}/fund-deposit", status_code=201)
+async def create_fund_deposit_from_receipt(
+    table: Literal["incoming", "outgoing"],
+    payment_id: int,
+    payload: FundDepositFromReceipt,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    El comprobante ES el depósito: queda PENDING con él enganchado como evidencia, y se
+    confirma en Fondos → Depósitos pendientes como cualquier otro.
+    """
+    try:
+        return FundPendingDepositService(db).create_from_receipt(
+            table, payment_id, payload.group_uuid, payload.user_uuid, current_user.id,
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)

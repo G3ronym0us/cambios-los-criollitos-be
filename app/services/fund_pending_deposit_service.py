@@ -18,13 +18,14 @@ from sqlalchemy.orm import Session
 from app.models.fund import (
     FundGroup,
     FundGroupMember,
+    FundMovement,
     FundMovementType,
     FundPendingDeposit,
     FundPendingDepositOrigin,
     FundPendingDepositStatus,
 )
 from app.models.user import User
-from app.models.whatsapp_payment import WhatsAppIncomingPayment
+from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from app.repositories.fund_repository import FundRepository
 from app.services.fund_channel import resolve_fund_channel
 from app.services.whatsapp_quote_service import QuoteServiceError
@@ -163,7 +164,26 @@ class FundPendingDepositService:
 
         # Duplicado de un entrante: ese dinero ya entró al fondo como pata USD de un cambio.
         # Se puede forzar (el operador ve el comprobante y decide) pero nunca por defecto.
-        if row.source_incoming_payment_id is not None and not override_duplicate:
+        #
+        # Dos casos se ven idénticos en la base —un entrante suelto que coincide— y sólo los
+        # separa QUIÉN lo afirmó:
+        #   * origen GROUP/MANUAL: nadie afirmó nada. El gestor reenvió al grupo el Zelle de un
+        #     cliente y el bot lo detectó; ese dinero va a ser la pata de un cambio aunque
+        #     todavía no tenga operación. Se frena, como siempre.
+        #   * origen RECEIPT: el operador abrió UN comprobante concreto y dijo que ése es el
+        #     depósito. Ahí no hay nada que adivinar y pedirle que fuerce sobra.
+        # Lo que ya está contado —tiene operación o ya movió el fondo— frena en los dos casos:
+        # ninguna afirmación puede justificar contar el mismo dinero dos veces.
+        ya_contado = (
+            row.source_incoming_payment_id is not None
+            and self._incoming_is_already_counted(row.source_incoming_payment_id)
+        )
+        afirmado_sobre_el_comprobante = row.origin == FundPendingDepositOrigin.RECEIPT
+        if (
+            row.source_incoming_payment_id is not None
+            and not override_duplicate
+            and (ya_contado or not afirmado_sobre_el_comprobante)
+        ):
             src = row.source_incoming_payment
             raise QuoteServiceError(
                 "duplicate_of_incoming",
@@ -226,6 +246,138 @@ class FundPendingDepositService:
         return row.dict()
 
     # ---------- Helpers ----------
+
+    def _incoming_is_already_counted(self, incoming_id: int) -> bool:
+        """
+        ¿Ese entrante ya está contado en algún sitio? Lo está si cuelga de una operación o si
+        ya movió un fondo. Suelto en la bandeja no cuenta como contado: es dinero que entró y
+        que nadie ha atribuido todavía.
+        """
+        row = (
+            self.db.query(WhatsAppIncomingPayment)
+            .filter(WhatsAppIncomingPayment.id == incoming_id)
+            .first()
+        )
+        if row is None:
+            return False
+        if row.whatsapp_operation_id is not None:
+            return True
+        return (
+            self.db.query(FundMovement)
+            .filter(FundMovement.incoming_payment_id == incoming_id)
+            .first()
+            is not None
+        )
+
+    def suggest_for_receipt(self, table: str, payment_id: int) -> dict:
+        """
+        Qué fondo y qué gestor proponer para el depósito de este comprobante.
+
+        Nada se adivina: las dos salen de datos que ya existen.
+          * **El fondo** sale del CANAL — la conversación donde llegó el comprobante—, con la
+            misma `resolve_fund_channel` del reenvío contable. Un chat de cliente no resuelve a
+            ningún fondo y entonces no se propone nada.
+          * **El gestor** sale de QUIÉN LO MANDÓ. En un grupo WhatsApp da el autor y el bot ya
+            lo guarda; en un chat directo no hay autor aparte, pero la dirección lo dice: un
+            entrante lo mandó el dueño del chat, un saliente lo mandó el operador.
+
+        Las dos son propuestas, no candados: el pago 4928 llegó por el chat de Dionis y su
+        depósito es de Diohandres.
+        """
+        payment = self._get_payment_or_404(table, payment_id)
+        canal = payment.client_phone or ""
+        grupo = None
+        try:
+            grupo = resolve_fund_channel(
+                self.db,
+                group_jid=canal if canal.endswith("@g.us") else None,
+                manager_phone=None if canal.endswith("@g.us") else canal,
+            )
+        except QuoteServiceError:
+            grupo = None
+
+        gestor = None
+        if grupo is not None:
+            miembros = [m for m in grupo.members if m.user is not None]
+            if table == "incoming" and not canal.endswith("@g.us"):
+                # Lo mandó el dueño del chat.
+                gestor = next((m.user for m in miembros if m.whatsapp_phone == canal), None)
+            elif table == "outgoing" and not canal.endswith("@g.us"):
+                # Lo mandó el operador: el gestor cuyo teléfono NO es el de este chat.
+                otros = [m.user for m in miembros if m.whatsapp_phone != canal and m.is_fund_manager]
+                gestor = otros[0] if len(otros) == 1 else None
+
+        return {
+            "payment_id": payment.id,
+            "table": table,
+            "amount": payment.amount,
+            "currency": payment.currency,
+            "provider": payment.provider,
+            "reference": payment.reference,
+            "fund_group_uuid": grupo.uuid if grupo else None,
+            "fund_group_name": grupo.name if grupo else None,
+            "fund_currency": grupo.currency if grupo else None,
+            "user_uuid": gestor.uuid if gestor else None,
+            "username": gestor.username if gestor else None,
+            "members": [
+                {"user_uuid": m.user.uuid, "username": m.user.username}
+                for m in (grupo.members if grupo else [])
+                if m.user is not None
+            ],
+        }
+
+    def create_from_receipt(
+        self,
+        table: str,
+        payment_id: int,
+        group_uuid: UUID,
+        user_uuid: UUID,
+        created_by_user_id: int,
+    ) -> dict:
+        """
+        El comprobante ES el depósito: queda PENDING con monto, moneda y referencia sacados de
+        él, y él enganchado como evidencia. Se confirma en Fondos como cualquier otro.
+        """
+        payment = self._get_payment_or_404(table, payment_id)
+        if not payment.amount or payment.amount <= 0:
+            raise QuoteServiceError(
+                "missing_fields",
+                "El comprobante no tiene monto legible: corrígelo en Pagos antes de registrarlo",
+                400,
+            )
+        group = self._resolve_group(None, group_uuid)
+        user = self.db.query(User).filter(User.uuid == str(user_uuid)).first()
+        if user is None:
+            raise QuoteServiceError("user_not_found", "Gestor no encontrado", 404)
+
+        row = FundPendingDeposit(
+            group_id=group.id,
+            detected_user_id=user.id,
+            amount=payment.amount,
+            currency=(payment.currency or group.currency or "").upper() or None,
+            provider=payment.provider,
+            reference=payment.reference,
+            raw_text=payment.raw_text,
+            status=FundPendingDepositStatus.PENDING,
+            origin=FundPendingDepositOrigin.RECEIPT,
+            created_by_user_id=created_by_user_id,
+            source_incoming_payment_id=(
+                payment.id if table == "incoming"
+                else self._find_duplicate_incoming(payment.amount, payment.currency, payment.reference)
+            ),
+            source_outgoing_payment_id=payment.id if table == "outgoing" else None,
+        )
+        self.db.add(row)
+        self.db.commit()
+        self.db.refresh(row)
+        return row.dict()
+
+    def _get_payment_or_404(self, table: str, payment_id: int):
+        model = WhatsAppIncomingPayment if table == "incoming" else WhatsAppOutgoingPayment
+        row = self.db.query(model).filter(model.id == payment_id).first()
+        if row is None:
+            raise QuoteServiceError("payment_not_found", f"Comprobante {payment_id} no encontrado", 404)
+        return row
 
     def _find_duplicate_incoming(
         self,

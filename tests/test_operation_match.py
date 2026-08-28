@@ -602,3 +602,38 @@ def test_an_operation_paid_in_full_by_one_receipt_is_settled_whole(db, fund, cli
     )
     assert op["delivered_amount"] == pytest.approx(350, abs=0.01)
     assert op["pending_amount"] == pytest.approx(0, abs=0.01)
+
+
+def test_the_bank_code_no_longer_drags_the_wrong_operation_back_in():
+    """
+    Caso real (pago 5079, 2026-08-27): dos tratos del mismo monto, mismo banco, personas
+    distintas. La cédula y el teléfono señalan uno solo, pero el 0102 —que comparten— hacía
+    que los dos «coincidieran» y el bot se abstenía. Banco de Venezuela es el 0102: emparejar
+    por ahí no distingue nada.
+    """
+    candidates = [
+        op("op-otra", 15826.496, notes="0102\nV30166167\n04147925265"),
+        op("op-buena", 15826.496, notes="0102\nV14110025\n04221411002"),
+    ]
+    c = criteria(15826.5, identification="V14110025", phone_to="04221411002", bank_to="0102")
+    assert pick_auto_match(candidates, c, NOW) == "op-buena"
+
+
+def test_the_best_match_wins_over_a_partial_one():
+    """Gana la que calza en MÁS datos, no «la única que calza en alguno»."""
+    candidates = [
+        op("op-a-medias", 500.0, notes="0134\nV14110025\n04140000000"),
+        op("op-completa", 500.0, notes="0102\nV14110025\n04221411002"),
+    ]
+    c = criteria(500.0, identification="V14110025", phone_to="04221411002")
+    assert pick_auto_match(candidates, c, NOW) == "op-completa"
+
+
+def test_a_tie_at_the_top_is_still_ambiguous():
+    """Dos que calzan igual de bien siguen siendo dudosas: el bot no adivina."""
+    candidates = [
+        op("op-1", 500.0, notes="V14110025"),
+        op("op-2", 500.0, notes="V14110025"),
+    ]
+    c = criteria(500.0, identification="V14110025")
+    assert pick_auto_match(candidates, c, NOW) is None

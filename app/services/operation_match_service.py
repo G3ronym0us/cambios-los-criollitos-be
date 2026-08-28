@@ -141,10 +141,17 @@ class OutgoingCriteria:
     created_at: Optional[datetime] = None
 
     def tokens(self) -> list[str]:
+        """
+        Lo que identifica a UNA PERSONA en el comprobante: su cédula y su teléfono.
+
+        El banco quedó fuera a propósito. Identifica a un banco entre veinte, y en Venezuela
+        el 0102 es el más común de todos: cuando dos tratos del mismo monto van al mismo
+        banco, ese token los empata a los dos y anula lo que la cédula ya había resuelto sola
+        (pago 5079 contra las ops 3968 y 3975, 2026-08-27). Es la misma lista que usa
+        `ForwardedCriteria`.
+        """
         return [
-            t
-            for t in (self.identification, self.phone_to, self.bank_to)
-            if t and len(t) >= MIN_TOKEN_LENGTH
+            t for t in (self.identification, self.phone_to) if t and len(t) >= MIN_TOKEN_LENGTH
         ]
 
 
@@ -381,8 +388,16 @@ def pick_auto_match(
     tokens = criteria.tokens()
     if not tokens:
         return None
-    refined = [c for c in matches if c.notes and any(t in c.notes for t in tokens)]
-    return refined[0].uuid if len(refined) == 1 else None
+    # Gana la MEJOR coincidencia, no "la única que coincide en algo". Con `any` bastaba que
+    # un dato suelto apareciera para que una candidata sobreviviera, así que la que calzaba
+    # en todo empataba con la que calzaba de casualidad. Un empate arriba sigue siendo
+    # ambiguo y se devuelve None: nadie supervisa al bot y vincular mal corrompe la data.
+    puntuadas = [(sum(1 for t in tokens if t in (c.notes or "")), c) for c in matches]
+    mejor = max(p for p, _ in puntuadas)
+    if mejor == 0:
+        return None
+    top = [c for p, c in puntuadas if p == mejor]
+    return top[0].uuid if len(top) == 1 else None
 
 
 #: Cuánto se puede apartar del objetivo un conjunto para seguir contando como "cuadra".

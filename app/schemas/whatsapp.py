@@ -283,6 +283,14 @@ class WhatsAppStatsResponse(BaseModel):
     quoted: int
     cancelled: int
     completed_today: int
+    # Lo accionable: cuentan TODO, no la página. El listado los usa como filtros.
+    to_settle: int = 0
+    to_settle_amount: float = 0
+    to_deliver: int = 0
+    to_deliver_oldest_at: Optional[datetime] = None
+    without_client: int = 0
+    expiring: int = 0
+    expiring_next_at: Optional[datetime] = None
 
 
 # ===== De qué mensaje nació la operación =====

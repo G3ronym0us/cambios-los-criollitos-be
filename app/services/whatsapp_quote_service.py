@@ -1239,6 +1239,97 @@ class WhatsAppQuoteService:
             "quoted": counts["QUOTED"],
             "cancelled": counts["CANCELLED"],
             "completed_today": completed_today,
+            **self._actionable_stats(),
+        }
+
+    def _actionable_stats(self) -> dict:
+        """
+        Los cuatro números que sí cambian lo que haces al abrir la pantalla.
+
+        El censo por estado no es una bandeja: dice cuántas hay de cada color, no cuál hay
+        que tocar hoy. Estos cuentan TODO, no la página — el listado los usa como filtros.
+
+        `por cuadrar` necesita el valor menos lo ya cubierto, y lo cubierto vive en los
+        settlements, así que se agregan en SQL: recorrerlo en Python obligaría a cargar
+        todas las operaciones abiertas con sus comprobantes.
+        """
+        from sqlalchemy import func as safunc
+
+        from app.models.whatsapp_payment import WhatsAppOutgoingSettlement
+
+        now = datetime.now(timezone.utc)
+        # El valor del trato: `amount` cuando existe, si no el monto de origen.
+        value = safunc.coalesce(WhatsAppOperation.amount, WhatsAppOperation.from_amount)
+        settled = (
+            self.db.query(
+                WhatsAppOutgoingSettlement.whatsapp_operation_id.label("op_id"),
+                safunc.coalesce(safunc.sum(WhatsAppOutgoingSettlement.settled_amount), 0).label("delivered"),
+            )
+            .group_by(WhatsAppOutgoingSettlement.whatsapp_operation_id)
+            .subquery()
+        )
+        delivered = safunc.coalesce(settled.c.delivered, 0)
+        uncovered = safunc.coalesce(WhatsAppOperation.uncovered_amount, 0)
+        missing = value - delivered - uncovered
+
+        # Una operación viva a la que aún le falta comprobante por cubrir.
+        open_ops = (
+            self.db.query(
+                safunc.count(WhatsAppOperation.id),
+                safunc.coalesce(safunc.sum(missing), 0),
+            )
+            .outerjoin(settled, settled.c.op_id == WhatsAppOperation.id)
+            .filter(
+                WhatsAppOperation.status.in_(
+                    [WhatsAppOperationStatus.PENDING, WhatsAppOperationStatus.QUOTED]
+                ),
+                missing > 0,
+            )
+            .one()
+        )
+
+        to_deliver = (
+            self.db.query(
+                safunc.count(WhatsAppOperation.id),
+                safunc.min(WhatsAppOperation.created_at),
+            )
+            .filter(
+                WhatsAppOperation.delivery_status == WhatsAppDeliveryStatus.PENDING,
+                WhatsAppOperation.status != WhatsAppOperationStatus.CANCELLED,
+            )
+            .one()
+        )
+
+        without_client = (
+            self.db.query(safunc.count(WhatsAppOperation.id))
+            .filter(
+                WhatsAppOperation.client_id.is_(None),
+                WhatsAppOperation.status != WhatsAppOperationStatus.CANCELLED,
+            )
+            .scalar()
+        )
+
+        expiring = (
+            self.db.query(
+                safunc.count(WhatsAppOperation.id),
+                safunc.min(WhatsAppOperation.expires_at),
+            )
+            .filter(
+                WhatsAppOperation.status == WhatsAppOperationStatus.QUOTED,
+                WhatsAppOperation.expires_at.isnot(None),
+                WhatsAppOperation.expires_at >= now,
+            )
+            .one()
+        )
+
+        return {
+            "to_settle": open_ops[0] or 0,
+            "to_settle_amount": round(float(open_ops[1] or 0), 2),
+            "to_deliver": to_deliver[0] or 0,
+            "to_deliver_oldest_at": to_deliver[1],
+            "without_client": without_client or 0,
+            "expiring": expiring[0] or 0,
+            "expiring_next_at": expiring[1],
         }
 
     # ---------- Helpers ----------

@@ -104,7 +104,12 @@ def make_op(
     status=WhatsAppOperationStatus.PENDING,
     beneficiary="Yelitza",
     uncovered=None,
+    incoming_at=NOW,
 ):
+    """
+    Una operación del cliente. `incoming_at=None` la deja SIN comprobante entrante, que es
+    como decir «su dinero no ha llegado»: entonces no es deuda por mucho que le falte pago.
+    """
     op = WhatsAppOperation(
         client_id=client.id,
         currency_pair_id=pair.id,
@@ -122,6 +127,12 @@ def make_op(
     )
     db.add(op)
     db.flush()
+    if incoming_at is not None:
+        db.add(WhatsAppIncomingPayment(
+            client_phone=client.phone, amount=amount, currency=currency,
+            whatsapp_operation_id=op.id, created_at=incoming_at,
+        ))
+        db.flush()
     return op
 
 
@@ -195,16 +206,7 @@ class TestAggregation:
     def test_la_antiguedad_sale_del_comprobante_no_de_la_operacion(self, db, world):
         vieja = NOW - timedelta(days=10)
         # Creada a mano hoy, pero el dinero entró hace diez días.
-        op = make_op(db, world["client"], world["usd_ves"], created_at=NOW)
-        db.add(
-            WhatsAppIncomingPayment(
-                client_phone=world["client"].phone,
-                amount=100,
-                currency="USD",
-                whatsapp_operation_id=op.id,
-                created_at=vieja,
-            )
-        )
+        make_op(db, world["client"], world["usd_ves"], created_at=NOW, incoming_at=vieja)
         db.commit()
 
         entry = ClientPendingService(db).pending_by_client_ids([world["client"].id])[
@@ -212,14 +214,11 @@ class TestAggregation:
         ][0]
         assert entry["oldest_at"].replace(tzinfo=timezone.utc) == vieja
 
-    def test_sin_comprobante_se_cae_a_la_fecha_de_la_operacion(self, db, world):
-        make_op(db, world["client"], world["usd_ves"], created_at=NOW)
+    def test_sin_comprobante_entrante_no_hay_deuda(self, db, world):
+        """No le debemos nada hasta que su dinero llega: antes es un trato en el papel."""
+        make_op(db, world["client"], world["usd_ves"], incoming_at=None)
         db.commit()
-
-        entry = ClientPendingService(db).pending_by_client_ids([world["client"].id])[
-            world["client"].id
-        ][0]
-        assert entry["oldest_at"].replace(tzinfo=timezone.utc) == NOW
+        assert ClientPendingService(db).pending_by_client_ids([world["client"].id]) == {}
 
     def test_el_par_acota_la_deuda_que_se_devuelve(self, db, world):
         make_op(db, world["client"], world["usd_ves"], amount=100)
@@ -396,3 +395,31 @@ class TestUndo:
         assert service.pending_by_client_ids([world["client"].id])[world["client"].id][0][
             "amount"
         ] == 100
+
+
+class TestLastOutgoingPaymentAt:
+    """La fecha que el listado de Operaciones enseña: cuándo salió la plata."""
+
+    def test_toma_el_comprobante_de_salida_mas_reciente(self, db, world):
+        op = make_op(db, world["client"], world["usd_ves"], amount=100)
+        for dia, monto in ((10, 20), (2, 30)):
+            pago = WhatsAppOutgoingPayment(
+                client_phone=world["client"].phone, amount=monto * 280, currency="VES",
+                created_at=NOW - timedelta(days=dia),
+            )
+            db.add(pago)
+            db.flush()
+            db.add(WhatsAppOutgoingSettlement(
+                outgoing_payment_id=pago.id, whatsapp_operation_id=op.id, settled_amount=monto,
+            ))
+        db.commit()
+        db.refresh(op)
+
+        # Un trato pagado en dos veces no está pagado hasta el último comprobante.
+        assert op.last_outgoing_payment_at.replace(tzinfo=timezone.utc) == NOW - timedelta(days=2)
+
+    def test_sin_comprobante_de_salida_no_hay_fecha(self, db, world):
+        op = make_op(db, world["client"], world["usd_ves"])
+        db.commit()
+        db.refresh(op)
+        assert op.last_outgoing_payment_at is None

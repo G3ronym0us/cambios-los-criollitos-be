@@ -214,6 +214,26 @@ class WhatsAppOperation(UUIDMixin, Base):
         return len(self.outgoing_settlements or [])
 
     @property
+    def last_outgoing_payment_at(self):
+        """
+        Cuándo se pagó el trato: la fecha del comprobante de SALIDA más reciente.
+
+        Es la fecha que el operador busca en el listado — «cuándo salió esta plata» —, y no
+        coincide con `created_at`, que es cuándo se registró la operación. Una operación que
+        el bot no reconoció se arma a mano días después de haberse pagado.
+
+        Se toma el MÁS RECIENTE y no el primero porque un trato pagado en dos veces no está
+        pagado hasta el último comprobante. `None` mientras no haya ninguno: entonces no hay
+        fecha de pago que enseñar y quien lo consuma se cae a la de la operación.
+        """
+        dates = [
+            s.payment.created_at
+            for s in (self.outgoing_settlements or [])
+            if s.payment is not None and s.payment.created_at
+        ]
+        return max(dates) if dates else None
+
+    @property
     def first_incoming_payment_at(self):
         """
         Cuándo llegó el dinero del cliente: la fecha de su primer comprobante entrante.
@@ -305,6 +325,7 @@ class WhatsAppOperation(UUIDMixin, Base):
             "transaction_uuid": self.transaction.uuid if self.transaction else None,
             "legacy_sqlite_id": self.legacy_sqlite_id,
             "first_incoming_payment_at": self.first_incoming_payment_at,
+            "last_outgoing_payment_at": self.last_outgoing_payment_at,
             "quoted_at": self.quoted_at,
             "expires_at": self.expires_at,
             "approved_at": self.approved_at,

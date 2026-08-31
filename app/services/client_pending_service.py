@@ -9,7 +9,13 @@ cubre todavía — el mismo `missing` que el listado de Operaciones llama «por 
 
 **Cuidado con el nombre**: la tarjeta «por entregar» del listado de Operaciones es OTRA
 cosa (`delivery_status`, el efectivo que falta mover en mano). Aquí, y en el módulo de
-Clientes entero, «por entregar» es `missing > 0`.
+Clientes entero, «por entregar» es `missing > 0` **y su dinero ya entró**.
+
+Esa segunda condición es la que separa una deuda de un trato en el papel. `missing` sale
+de los comprobantes de SALIDA: mide lo que no le hemos pagado. Pero no le debemos nada
+hasta que su plata llega — una operación registrada sin comprobante entrante es una
+cotización o un trato a medio armar, no una deuda. Contarlas mezclaba las dos patas del
+cambio y hacía que la lista pidiera pagar cosas que nadie había pagado todavía.
 
 **La moneda**: `missing` va en la moneda del VALOR del trato (lo que entrega el cliente:
 los USD de un USD/VES), no en la moneda con la que se le paga. Es la cifra exacta, la que
@@ -104,6 +110,10 @@ class ClientPendingService:
 
         Devuelve `(query, missing, since)` para que quien la use elija qué proyectar sin
         rearmar los joins.
+
+        El join con los comprobantes entrantes es INNER a propósito: es lo que implementa
+        «sólo debemos lo que ya nos pagaron». Cambiarlo a outer volvería a meter en la
+        deuda las operaciones que nadie ha pagado.
         """
         settled = self._settled_subquery()
         paid = self._first_incoming_subquery()
@@ -114,15 +124,16 @@ class ClientPendingService:
             - func.coalesce(settled.c.delivered, 0)
             - func.coalesce(WhatsAppOperation.uncovered_amount, 0)
         )
-        # La antigüedad se mide desde que entró el dinero; sin comprobante, desde la
-        # operación. Es la misma regla que ordena la cola de trabajo en el front.
+        # La antigüedad se mide desde que entró el dinero. El `coalesce` es defensivo: el
+        # join de abajo ya garantiza que hay comprobante, así que en la práctica manda
+        # `paid_at`.
         since = func.coalesce(paid.c.paid_at, WhatsAppOperation.created_at)
 
         q = (
             self.db.query(WhatsAppOperation)
             .join(CurrencyPair, CurrencyPair.id == WhatsAppOperation.currency_pair_id)
             .outerjoin(settled, settled.c.op_id == WhatsAppOperation.id)
-            .outerjoin(paid, paid.c.op_id == WhatsAppOperation.id)
+            .join(paid, paid.c.op_id == WhatsAppOperation.id)
             .filter(
                 WhatsAppOperation.status.in_(
                     [WhatsAppOperationStatus.PENDING, WhatsAppOperationStatus.QUOTED]

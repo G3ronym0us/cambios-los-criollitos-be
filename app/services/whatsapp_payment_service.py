@@ -2287,6 +2287,11 @@ class WhatsAppPaymentService:
                 409,
             )
 
+        # Solo salientes: el préstamo es una deuda a nombre del cliente de origen, con su
+        # valuación y sus abonos. Mudar el comprobante dejaría la deuda con quien no la tiene.
+        if table == "outgoing":
+            self._assert_not_loan(row.id)
+
     def transfer_client(
         self,
         table: str,

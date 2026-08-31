@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.currency_pair import CurrencyPair
@@ -740,6 +740,7 @@ class WhatsAppQuoteService:
         offset: int = 0,
         search: Optional[str] = None,
         scenario: Optional[str] = None,
+        needs: Optional[str] = None,
     ) -> tuple[list[WhatsAppOperation], int]:
         """
         Una página de operaciones y el total que hay tras los filtros.
@@ -786,6 +787,8 @@ class WhatsAppQuoteService:
                 raise QuoteServiceError("invalid_delivery_status", f"delivery_status inválido: {delivery_status}", 400)
         if since:
             q = q.filter(WhatsAppOperation.created_at >= since)
+        if needs:
+            q = self._filter_needs_action(q, needs)
 
         # El conteo va sobre los mismos filtros pero sin cargar relaciones ni ordenar.
         total = q.order_by(None).count()
@@ -1242,6 +1245,79 @@ class WhatsAppQuoteService:
             **self._actionable_stats(),
         }
 
+    def _settled_subquery(self):
+        """Cuánto cubren ya los comprobantes de cada operación, agregado en SQL."""
+        from sqlalchemy import func as safunc
+
+        from app.models.whatsapp_payment import WhatsAppOutgoingSettlement
+
+        return (
+            self.db.query(
+                WhatsAppOutgoingSettlement.whatsapp_operation_id.label("op_id"),
+                safunc.coalesce(safunc.sum(WhatsAppOutgoingSettlement.settled_amount), 0).label(
+                    "delivered"
+                ),
+            )
+            .group_by(WhatsAppOutgoingSettlement.whatsapp_operation_id)
+            .subquery()
+        )
+
+    def _filter_needs_action(self, q, needs: str):
+        """
+        Filtra por lo que hace falta HACER, no por el estado.
+
+        Es lo que convierte las tarjetas de la cabecera en una bandeja: cada una aplica su
+        segmento en vez de obligar al operador a armarlo con tres selects. `action` es la
+        unión de las cuatro — todo lo que espera algo de alguien.
+        """
+        from sqlalchemy import func as safunc, or_ as sa_or
+
+        key = needs.strip().lower()
+        valid = {"settle", "deliver", "client", "expiring", "action"}
+        if key not in valid:
+            raise QuoteServiceError(
+                "invalid_needs", f"needs inválido: {needs}. Use uno de {sorted(valid)}", 400
+            )
+
+        now = datetime.now(timezone.utc)
+        settled = self._settled_subquery()
+        value = safunc.coalesce(WhatsAppOperation.amount, WhatsAppOperation.from_amount)
+        missing = value - safunc.coalesce(settled.c.delivered, 0) - safunc.coalesce(
+            WhatsAppOperation.uncovered_amount, 0
+        )
+
+        needs_settle = and_(
+            WhatsAppOperation.status.in_(
+                [WhatsAppOperationStatus.PENDING, WhatsAppOperationStatus.QUOTED]
+            ),
+            missing > 0,
+        )
+        needs_deliver = and_(
+            WhatsAppOperation.delivery_status == WhatsAppDeliveryStatus.PENDING,
+            WhatsAppOperation.status != WhatsAppOperationStatus.CANCELLED,
+        )
+        needs_client = and_(
+            WhatsAppOperation.client_id.is_(None),
+            WhatsAppOperation.status != WhatsAppOperationStatus.CANCELLED,
+        )
+        is_expiring = and_(
+            WhatsAppOperation.status == WhatsAppOperationStatus.QUOTED,
+            WhatsAppOperation.expires_at.isnot(None),
+            WhatsAppOperation.expires_at >= now,
+        )
+
+        # El join va siempre: sin él, `missing` no puede resolverse.
+        q = q.outerjoin(settled, settled.c.op_id == WhatsAppOperation.id)
+        clauses = {
+            "settle": needs_settle,
+            "deliver": needs_deliver,
+            "client": needs_client,
+            "expiring": is_expiring,
+        }
+        if key == "action":
+            return q.filter(sa_or(*clauses.values()))
+        return q.filter(clauses[key])
+
     def _actionable_stats(self) -> dict:
         """
         Los cuatro números que sí cambian lo que haces al abrir la pantalla.
@@ -1255,19 +1331,10 @@ class WhatsAppQuoteService:
         """
         from sqlalchemy import func as safunc
 
-        from app.models.whatsapp_payment import WhatsAppOutgoingSettlement
-
         now = datetime.now(timezone.utc)
         # El valor del trato: `amount` cuando existe, si no el monto de origen.
         value = safunc.coalesce(WhatsAppOperation.amount, WhatsAppOperation.from_amount)
-        settled = (
-            self.db.query(
-                WhatsAppOutgoingSettlement.whatsapp_operation_id.label("op_id"),
-                safunc.coalesce(safunc.sum(WhatsAppOutgoingSettlement.settled_amount), 0).label("delivered"),
-            )
-            .group_by(WhatsAppOutgoingSettlement.whatsapp_operation_id)
-            .subquery()
-        )
+        settled = self._settled_subquery()
         delivered = safunc.coalesce(settled.c.delivered, 0)
         uncovered = safunc.coalesce(WhatsAppOperation.uncovered_amount, 0)
         missing = value - delivered - uncovered

@@ -55,6 +55,10 @@ async def list_operations(
     status_filter: Optional[str] = Query(None, alias="status"),
     delivery_status: Optional[str] = Query(None),
     scenario: Optional[str] = Query(None),
+    needs: Optional[str] = Query(
+        None,
+        description="Filtra por lo que hace falta hacer: settle | deliver | client | expiring | action",
+    ),
     phone: Optional[str] = Query(None),
     search: Optional[str] = Query(None, description="Nombre o teléfono del cliente"),
     since: Optional[datetime] = Query(None),
@@ -80,6 +84,7 @@ async def list_operations(
             offset=(page - 1) * limit,
             search=search,
             scenario=scenario,
+            needs=needs,
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)

@@ -13,7 +13,7 @@ from typing import Optional
 from uuid import UUID
 
 from sqlalchemy import and_, case, exists, func, or_, select
-from sqlalchemy.orm import Session, joinedload, selectinload
+from sqlalchemy.orm import Session, aliased, joinedload, selectinload
 
 from app.core.timezones import CARACAS_TZ
 from dataclasses import dataclass
@@ -42,6 +42,10 @@ from app.models.whatsapp_payment import (
     WhatsAppOutgoingPayment,
     WhatsAppPaymentAllocation,
     WhatsAppOutgoingSettlement,
+)
+from app.models.whatsapp_payment_transfer import (
+    PaymentTransferReason,
+    WhatsAppPaymentTransfer,
 )
 from app.models.client_loan import ClientLoan
 from app.repositories.currency_pair_repository import CurrencyPairRepository
@@ -80,6 +84,18 @@ def _settlement_sql(column):
 
 # Redondeos de OCR y de tasa: por debajo de esto un pago se considera cuadrado.
 AMOUNT_EPSILON = 0.01
+
+# El dueño explícito de un comprobante transferido. Va aliased porque en la misma consulta
+# hace falta el OTRO cliente —el del teléfono del comprobante— y son la misma tabla.
+_OWNER_CLIENT = aliased(WhatsAppClient)
+
+# Los motivos de una mudanza, en las palabras del operador. Viven aquí porque es el backend
+# quien redacta las líneas de la bitácora (el front solo las pinta).
+_TRANSFER_REASON_LABELS = {
+    "THIRD_PARTY": "pagó un tercero",
+    "BOT_MISMATCH": "mal asignado por el bot",
+    "DUPLICATE_CLIENT": "cliente duplicado",
+}
 
 # Los tres estados del filtro de la bandeja.
 ATTENTION_FILTERS = ("ALL", "ATTENTION", "RECONCILED")
@@ -172,11 +188,25 @@ class WhatsAppPaymentService:
             return None, None
         return client.display_name, str(client.uuid)
 
+    def _owner_ref(self, payment) -> tuple[Optional[str], Optional[str]]:
+        """
+        De quién es este comprobante: el dueño explícito si lo transfirieron, y si no el que
+        sale del teléfono que leyó el OCR.
+
+        El override manda pero no borra: `client_phone` sigue siendo el de quien mandó el
+        dinero, que es lo que deja al origen encontrable en la búsqueda de la bandeja.
+        """
+        owner = payment.owner_client
+        if owner is not None:
+            return owner.display_name, str(owner.uuid)
+        return self._client_ref(payment.client_phone)
+
     def _with_name(self, payment) -> dict:
         d = payment.dict()
-        name, client_uuid = self._client_ref(payment.client_phone)
+        name, client_uuid = self._owner_ref(payment)
         d["client_name"] = name
         d["client_uuid"] = client_uuid
+        d["transfer"] = self._transfer_summary(payment)
         return d
 
     def _assert_not_loan(self, payment_id: int) -> None:
@@ -300,15 +330,24 @@ class WhatsAppPaymentService:
         return None, None
 
     def _payments_base_query(self, Model):
-        """Query base con joins a cliente (display_name/uuid) y a la op (status)."""
+        """
+        Query base con joins a cliente (display_name/uuid) y a la op (status).
+
+        Hay DOS clientes por fila y los dos importan. `WhatsAppClient` es el del teléfono que
+        leyó el OCR —quien mandó el dinero—, y `_OWNER_CLIENT` es el dueño explícito que dejó
+        una transferencia. El `coalesce` hace que mande el segundo cuando existe; el primero
+        se conserva en el join porque es lo que mantiene al origen encontrable en la búsqueda
+        (ver `_filtered_payments_query`).
+        """
         return (
             self.db.query(
                 Model,
-                WhatsAppClient.display_name,
-                WhatsAppClient.uuid,
+                func.coalesce(_OWNER_CLIENT.display_name, WhatsAppClient.display_name),
+                func.coalesce(_OWNER_CLIENT.uuid, WhatsAppClient.uuid),
                 WhatsAppOperation.status,
             )
             .outerjoin(WhatsAppClient, WhatsAppClient.phone == Model.client_phone)
+            .outerjoin(_OWNER_CLIENT, _OWNER_CLIENT.id == Model.owner_client_id)
             .outerjoin(WhatsAppOperation, WhatsAppOperation.id == Model.whatsapp_operation_id)
         )
 
@@ -492,8 +531,12 @@ class WhatsAppPaymentService:
         search = (search or "").strip()
         if search:
             like = f"%{search}%"
+            # El nombre del ORIGEN sigue buscándose aunque el pago se haya transferido: el
+            # que lo mandó no puede darlo por perdido sólo porque ahora es de otro. Y el del
+            # destino tiene que encontrarlo porque el dinero es suyo. Los dos, entonces.
             q = q.filter(
                 or_(
+                    _OWNER_CLIENT.display_name.ilike(like),
                     WhatsAppClient.display_name.ilike(like),
                     Model.client_phone.ilike(like),
                     Model.bank_from.ilike(like),
@@ -573,6 +616,7 @@ class WhatsAppPaymentService:
             self._attach_loans(items)
         if items:
             self._attach_fund_deposits(items, table)
+            self._attach_transfers(items, table)
         return {"items": items, "total": total}
 
     def payments_stats(
@@ -1717,11 +1761,18 @@ class WhatsAppPaymentService:
         orphan_action: Optional[str] = None,
         orphan_note: Optional[str] = None,
         settled_amount: Optional[float] = None,
+        allow_orphan: bool = False,
     ) -> dict:
+        """
+        `allow_orphan` salta la pregunta del huérfano y deja la operación sin comprobantes SIN
+        marcarla como asumida. Lo usa la transferencia a otro cliente, donde la política ya
+        está decidida: la operación vuelve a esperar fondos, y esa alarma tiene que seguir
+        encendida para quien la mire.
+        """
         row = self._get_or_404(table, payment_id)
         orphaned_op = (
             self._resolve_orphan(row, table, payment_id, orphan_action, orphan_note, completing_user)
-            if operation_uuid is None
+            if operation_uuid is None and not allow_orphan
             else None
         )
         if table == "outgoing" and operation_uuid is not None:
@@ -2121,6 +2172,326 @@ class WhatsAppPaymentService:
         if orphaned_op is not None:
             WhatsAppQuoteService(self.db).delete_operation(orphaned_op)
         return self._with_name(row)
+
+    # ---------- Transferir el pago a otro cliente ----------
+
+    def _transfer_summary(self, payment) -> Optional[dict]:
+        """
+        El rastro que se pinta en la cabecera y en la insignia del listado.
+
+        Se muestra el PRIMER origen, no el anterior: un pago puede haberse movido varias
+        veces, y lo que hace falta saber de un vistazo es de qué perfil salió el dinero. Los
+        saltos intermedios están en la bitácora. La fecha y el autor sí son los del ÚLTIMO
+        salto — es la respuesta a «¿quién lo movió, y cuándo?».
+        """
+        transfers = list(payment.transfers or [])
+        if not transfers:
+            return None
+        first, last = transfers[0], transfers[-1]
+        d = first.dict()
+        return {
+            "from_client_uuid": d["from_client_uuid"],
+            "from_client_name": d["from_client_name"],
+            "from_client_phone": d["from_client_phone"],
+            "reason": last.reason.value if last.reason else None,
+            "note": last.note,
+            "transferred_at": last.created_at,
+            "transferred_by": last.created_by.username if last.created_by else None,
+            "count": len(transfers),
+        }
+
+    def _attach_transfers(self, items: list[dict], table: str) -> None:
+        """El bloque `transfer` de cada fila, en una sola consulta para toda la página."""
+        ids = [it["id"] for it in items]
+        side = (
+            WhatsAppPaymentTransfer.outgoing_payment_id
+            if table == "outgoing"
+            else WhatsAppPaymentTransfer.incoming_payment_id
+        )
+        rows = (
+            self.db.query(WhatsAppPaymentTransfer)
+            .options(
+                joinedload(WhatsAppPaymentTransfer.from_client),
+                joinedload(WhatsAppPaymentTransfer.created_by),
+            )
+            .filter(side.in_(ids))
+            .order_by(WhatsAppPaymentTransfer.id)
+            .all()
+        )
+        by_payment: dict[int, list] = {}
+        for row in rows:
+            by_payment.setdefault(row.payment_id, []).append(row)
+        for it in items:
+            group = by_payment.get(it["id"])
+            if not group:
+                it["transfer"] = None
+                continue
+            first, last = group[0], group[-1]
+            d = first.dict()
+            it["transfer"] = {
+                "from_client_uuid": d["from_client_uuid"],
+                "from_client_name": d["from_client_name"],
+                "from_client_phone": d["from_client_phone"],
+                "reason": last.reason.value if last.reason else None,
+                "note": last.note,
+                "transferred_at": last.created_at,
+                "transferred_by": last.created_by.username if last.created_by else None,
+                "count": len(group),
+            }
+
+    def _assert_transferable(self, table: str, row) -> None:
+        """
+        Un pago transferible es uno que todavía no movió caja.
+
+        La regla de la que sale todo esto: el pago nunca se duplica ni se anula, sólo cambia
+        de dueño. Un comprobante que ya se contó —entregado, depositado o acreditado— tiene su
+        movimiento a nombre del cliente de origen, y mudarlo dejaría ese movimiento mintiendo.
+        Ahí la salida sigue siendo la de siempre: reversar y volver a empezar.
+        """
+        op = row.operation
+        if op is not None and op.status == WhatsAppOperationStatus.COMPLETED:
+            raise QuoteServiceError(
+                "payment_reconciled",
+                "La operación ya se entregó y se cerró: el pago está conciliado y no se puede "
+                "transferir. Reversa la operación primero.",
+                409,
+            )
+
+        source = (
+            FundPendingDeposit.source_outgoing_payment_id
+            if table == "outgoing"
+            else FundPendingDeposit.source_incoming_payment_id
+        )
+        confirmed_deposit = (
+            self.db.query(FundPendingDeposit.id)
+            .filter(
+                source == row.id,
+                FundPendingDeposit.origin == FundPendingDepositOrigin.RECEIPT,
+                FundPendingDeposit.status == FundPendingDepositStatus.CONFIRMED,
+            )
+            .first()
+        )
+        if confirmed_deposit is not None:
+            raise QuoteServiceError(
+                "payment_deposited",
+                "El comprobante ya se confirmó como depósito al fondo, a nombre de su gestor: "
+                "no se puede transferir.",
+                409,
+            )
+
+        if table == "incoming" and self._credited_to_balance(row.id) > AMOUNT_EPSILON:
+            raise QuoteServiceError(
+                "payment_credited",
+                "Parte del pago ya se acreditó al saldo a favor del cliente de origen: "
+                "no se puede transferir.",
+                409,
+            )
+
+    def transfer_client(
+        self,
+        table: str,
+        payment_id: int,
+        client_uuid: UUID,
+        reason: str,
+        note: Optional[str] = None,
+        actor: Optional[User] = None,
+    ) -> dict:
+        """
+        Muda el comprobante a otro cliente, dejando el rastro.
+
+        Lo que NO pasa, y es lo que hace que esto sea seguro: el pago no se duplica ni se
+        anula (mismo `id`), su fecha no se toca (los reportes del día no se reescriben hacia
+        atrás) y `client_phone` se queda como está (el origen sigue encontrándose al buscar).
+        Lo único que cambia de verdad es `owner_client_id`.
+
+        Si el pago estaba vinculado, se desengancha y su operación vuelve a esperar fondos.
+        Nunca se muda la operación de cliente por su cuenta: es un trato de otra persona, y
+        moverlo sería una segunda decisión que nadie tomó.
+        """
+        row = self._get_or_404(table, payment_id)
+        self._assert_transferable(table, row)
+
+        destination = (
+            self.db.query(WhatsAppClient).filter(WhatsAppClient.uuid == client_uuid).first()
+        )
+        if destination is None:
+            raise QuoteServiceError(
+                "client_not_found", f"Cliente {client_uuid} no encontrado", 404
+            )
+
+        current_name, current_uuid = self._owner_ref(row)
+        if current_uuid == str(destination.uuid):
+            raise QuoteServiceError(
+                "same_client", "El pago ya es de ese cliente", 422
+            )
+
+        try:
+            reason_enum = PaymentTransferReason(reason)
+        except ValueError:
+            raise QuoteServiceError(
+                "invalid_reason",
+                f"Motivo inválido: {reason}. Usa THIRD_PARTY, BOT_MISMATCH o DUPLICATE_CLIENT.",
+                422,
+            )
+
+        # De dónde sale: el dueño efectivo de AHORA, que puede ser un override anterior.
+        origin_client = row.owner_client or (
+            self.db.query(WhatsAppClient)
+            .filter(WhatsAppClient.phone == row.client_phone)
+            .first()
+        )
+        unlinked_op_id = row.whatsapp_operation_id
+
+        if unlinked_op_id is not None:
+            # Se reutiliza el desvinculado de siempre —suelta el reparto, recalcula el FK
+            # principal y sincroniza el fondo—, pero sin la pregunta del huérfano: aquí la
+            # política ya está decidida (la op queda esperando fondos) y no se marca como
+            # «asumida sin pagos», que es justo la señal que tiene que seguir encendida.
+            self.set_operation(
+                table, payment_id, None, completing_user=actor, allow_orphan=True
+            )
+            self.db.refresh(row)
+
+        row.owner_client_id = destination.id
+        self.db.add(
+            WhatsAppPaymentTransfer(
+                incoming_payment_id=row.id if table == "incoming" else None,
+                outgoing_payment_id=row.id if table == "outgoing" else None,
+                from_client_id=origin_client.id if origin_client else None,
+                from_client_phone=row.client_phone,
+                from_client_name=current_name,
+                to_client_id=destination.id,
+                reason=reason_enum,
+                note=(note or "").strip() or None,
+                unlinked_operation_id=unlinked_op_id,
+                created_by_user_id=actor.id if actor else None,
+            )
+        )
+        self.db.commit()
+        self.db.refresh(row)
+        return self._with_name(row)
+
+    def payment_timeline(self, table: str, payment_id: int) -> dict:
+        """
+        Bitácora del comprobante, de lo más reciente a lo más viejo.
+
+        Las mudanzas son historia de verdad —cada una es una fila de
+        `whatsapp_payment_transfers`— y por eso se apilan bien. El resto se DERIVA del estado
+        actual, porque el pago no lleva un log de auditoría general: hay una línea de
+        corrección si `corrected_at` está puesto, una de vínculo si hoy tiene operación, y
+        una de depósito o de saldo si acabó ahí. O sea: se ve QUÉ pasó, no cuántas veces.
+        Cuando exista un log general, esto se sustituye sin tocar el front — es él quien
+        recibe `title` y `detail` ya redactados.
+        """
+        row = self._get_or_404(table, payment_id)
+        items: list[dict] = []
+
+        for tr in row.transfers or []:
+            d = tr.dict()
+            detail = f"{d['from_client_name'] or 'Sin identificar'} → {d['to_client_name'] or ''}".strip()
+            reason_label = _TRANSFER_REASON_LABELS.get(d["reason"], d["reason"])
+            if reason_label:
+                detail = f"{detail}. Motivo: {reason_label}"
+            if d["note"]:
+                detail = f"{detail} — «{d['note']}»"
+            items.append({
+                "uuid": d["uuid"],
+                "kind": "TRANSFER",
+                "title": "Transferido a otro cliente",
+                "detail": detail,
+                "actor": d["transferred_by"],
+                "at": d["transferred_at"],
+            })
+            if d["unlinked_operation_uuid"]:
+                items.append({
+                    "uuid": f"{d['uuid']}:unlink",
+                    "kind": "UNLINK",
+                    "title": f"Desvinculado de {d['unlinked_operation_uuid']}",
+                    "detail": "Automático por la transferencia. La operación vuelve a esperar fondos.",
+                    "actor": None,
+                    "at": d["transferred_at"],
+                })
+
+        if row.corrected_at is not None:
+            items.append({
+                "uuid": f"payment:{row.id}:correction",
+                "kind": "CORRECTION",
+                "title": "Comprobante corregido a mano",
+                "detail": (
+                    f"El OCR había leído: {row.correction_original}"
+                    if row.correction_original else None
+                ),
+                "actor": None,
+                "at": row.corrected_at,
+            })
+
+        if row.operation is not None:
+            items.append({
+                "uuid": f"payment:{row.id}:operation",
+                "kind": "LINK",
+                "title": f"Vinculado a la operación {row.operation.uuid}",
+                "detail": None,
+                "actor": None,
+                "at": row.operation.created_at,
+            })
+
+        if table == "incoming":
+            for entry in (
+                self.db.query(WhatsAppBalanceEntry)
+                .filter(WhatsAppBalanceEntry.incoming_payment_id == row.id)
+                .all()
+            ):
+                items.append({
+                    "uuid": str(entry.uuid),
+                    "kind": "BALANCE",
+                    "title": f"Acreditado al saldo · {entry.amount} {entry.currency}",
+                    "detail": entry.notes,
+                    "actor": entry.created_by.username if entry.created_by else None,
+                    "at": entry.created_at,
+                })
+
+        source = (
+            FundPendingDeposit.source_outgoing_payment_id
+            if table == "outgoing"
+            else FundPendingDeposit.source_incoming_payment_id
+        )
+        for dep in (
+            self.db.query(FundPendingDeposit)
+            .filter(source == row.id, FundPendingDeposit.origin == FundPendingDepositOrigin.RECEIPT)
+            .all()
+        ):
+            items.append({
+                "uuid": str(dep.uuid),
+                "kind": "DEPOSIT",
+                "title": f"Registrado como depósito al fondo ({dep.status.value if dep.status else '—'})",
+                "detail": None,
+                "actor": None,
+                "at": dep.created_at,
+            })
+
+        # Lo más reciente arriba.
+        #
+        # No basta con ordenar por fecha. Las de las mudanzas las pone el servidor
+        # (`func.now()`, que en una transacción es el instante de su inicio) y otras vienen
+        # del proceso que las creó: dos eventos que en la vida real pasaron en orden pueden
+        # llegar con el mismo sello, o incluso invertidos por unos milisegundos. Así que el
+        # orden de emisión desempata —los eventos se generan arriba en orden— y la llegada del
+        # comprobante se ancla al final: nada pudo pasarle antes de existir.
+        for position, item in enumerate(items):
+            item["_seq"] = position
+        items.sort(key=lambda i: (i["at"] is not None, i["at"], i["_seq"]), reverse=True)
+        for item in items:
+            item.pop("_seq")
+
+        items.append({
+            "uuid": f"payment:{row.id}:created",
+            "kind": "OTHER",
+            "title": "Comprobante recibido",
+            "detail": None,
+            "actor": None,
+            "at": row.created_at,
+        })
+        return {"items": items}
 
     def unlink_preview(self, table: str, payment_id: int) -> dict:
         """

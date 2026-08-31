@@ -38,11 +38,28 @@ class WhatsAppIncomingPayment(UUIDMixin, Base):
     whatsapp_operation_id = Column(
         Integer, ForeignKey("whatsapp_operations.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Dueño explícito del comprobante, cuando NO es quien lo mandó (el esposo pagó por la
+    # esposa, el bot lo pegó al cliente equivocado). NULL = el de siempre, el que sale de
+    # `client_phone`. Es un override, no un reemplazo: el teléfono del que mandó el dinero no
+    # se toca nunca — es lo que leyó el OCR, y es lo que mantiene al origen encontrable en la
+    # búsqueda de la bandeja. Se pone desde «Transferir a otro cliente», que deja además su
+    # fila en `whatsapp_payment_transfers`.
+    owner_client_id = Column(
+        Integer, ForeignKey("whatsapp_clients.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     corrected_at = Column(DateTime(timezone=True), nullable=True)
     correction_original = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     operation = relationship("WhatsAppOperation", foreign_keys=[whatsapp_operation_id])
+    owner_client = relationship("WhatsAppClient", foreign_keys=[owner_client_id])
+    # Mudanzas de dueño, de la más vieja a la más nueva: la primera dice de dónde salió.
+    transfers = relationship(
+        "WhatsAppPaymentTransfer",
+        foreign_keys="WhatsAppPaymentTransfer.incoming_payment_id",
+        cascade="all, delete-orphan",
+        order_by="WhatsAppPaymentTransfer.id",
+    )
     # Reparto del pago entre operaciones (un Zelle puede cubrir varios cambios). El FK de
     # arriba es la op principal — la de la asignación mayor — y se mantiene por compatibilidad
     # con el bot y el matcher.
@@ -183,11 +200,27 @@ class WhatsAppOutgoingPayment(UUIDMixin, Base):
     source_payment_id = Column(
         Integer, ForeignKey("whatsapp_incoming_payments.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Dueño explícito del comprobante, cuando NO es quien lo mandó (el esposo pagó por la
+    # esposa, el bot lo pegó al cliente equivocado). NULL = el de siempre, el que sale de
+    # `client_phone`. Es un override, no un reemplazo: el teléfono del que mandó el dinero no
+    # se toca nunca — es lo que leyó el OCR, y es lo que mantiene al origen encontrable en la
+    # búsqueda de la bandeja. Se pone desde «Transferir a otro cliente», que deja además su
+    # fila en `whatsapp_payment_transfers`.
+    owner_client_id = Column(
+        Integer, ForeignKey("whatsapp_clients.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     corrected_at = Column(DateTime(timezone=True), nullable=True)
     correction_original = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     operation = relationship("WhatsAppOperation", foreign_keys=[whatsapp_operation_id])
+    owner_client = relationship("WhatsAppClient", foreign_keys=[owner_client_id])
+    transfers = relationship(
+        "WhatsAppPaymentTransfer",
+        foreign_keys="WhatsAppPaymentTransfer.outgoing_payment_id",
+        cascade="all, delete-orphan",
+        order_by="WhatsAppPaymentTransfer.id",
+    )
     settlements = relationship(
         "WhatsAppOutgoingSettlement",
         back_populates="payment",

@@ -532,6 +532,16 @@ class WhatsAppForwardToGroup(BaseModel):
     manager_phone: Optional[str] = None
 
 
+class WhatsAppPaymentTransferRequest(BaseModel):
+    """
+    Mudar un comprobante a otro cliente. El motivo es obligatorio: es lo que queda en el
+    rastro, y sin él la mudanza es indistinguible de un error.
+    """
+    client_uuid: UUID = Field(..., description="Cliente destino")
+    reason: str = Field(..., description="THIRD_PARTY | BOT_MISMATCH | DUPLICATE_CLIENT")
+    note: Optional[str] = None
+
+
 class WhatsAppBalanceCredit(BaseModel):
     """Acreditar un pago entrante como saldo a favor. Sin amount → usa el del pago."""
     amount: Optional[float] = Field(None, gt=0)

@@ -56,7 +56,10 @@ class CurrencyPairBase(BaseModel):
         # to ensure base_pair exists and is not self-referencing
         return v
 
-    @validator('rounding_amount_side')
+    # `always=True` o el validador se salta justo cuando el lado viene ausente,
+    # que es el caso que existe para rechazar. Sin él, un `rounding_mode="AMOUNT"`
+    # sin lado se guardaba y el bot acababa sin saber qué monto redondear.
+    @validator('rounding_amount_side', always=True)
     def validate_rounding_config(cls, v, values):
         mode = values.get('rounding_mode')
         if mode is not None:
@@ -115,6 +118,25 @@ class CurrencyPairUpdate(BaseModel):
     rounding_amount_side: Optional[Literal["FROM", "TO"]] = None
     negotiation_step: Optional[Decimal] = None
     negotiation_step_side: Optional[Literal["FROM", "TO"]] = None
+
+    # Igual que arriba: el detalle guarda por aquí, así que sin esta copia la
+    # regla no correría en el camino que de hecho edita el redondeo.
+    #
+    # Solo exige la config completa cuando el payload trae `rounding_mode`. Un
+    # update parcial que toque otra cosa —o solo el múltiplo— no dispara nada:
+    # aquí no hay acceso al par guardado, así que exigir campos que el llamante
+    # no está cambiando rechazaría peticiones legítimas.
+    @validator('rounding_amount_side', always=True)
+    def validate_rounding_config(cls, v, values):
+        mode = values.get('rounding_mode')
+        if mode is not None:
+            if not values.get('rounding_step') or values['rounding_step'] <= 0:
+                raise ValueError('rounding_step is required and must be > 0 when rounding_mode is set')
+            if not values.get('rounding_direction'):
+                raise ValueError('rounding_direction is required when rounding_mode is set')
+            if mode == 'AMOUNT' and v is None:
+                raise ValueError("rounding_amount_side is required when rounding_mode is 'AMOUNT'")
+        return v
 
     # El detalle del par guarda por aquí, no por `CurrencyPairCreate`: sin esta
     # copia la validación de arriba no cubriría el único camino que se usa.

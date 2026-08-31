@@ -27,6 +27,8 @@ class CurrencyPairBase(BaseModel):
     rounding_step: Optional[Decimal] = Field(None, description="Multiple to round to (e.g. 100, 5)")
     rounding_direction: Optional[Literal["UP", "DOWN"]] = Field(None, description="Rounding direction")
     rounding_amount_side: Optional[Literal["FROM", "TO"]] = Field(None, description="AMOUNT mode only: which side's amount is rounded (rounded only when it is the calculated side)")
+    negotiation_step: Optional[Decimal] = Field(None, description="Multiple this pair is negotiated in (e.g. 10000). Not applied automatically: only suggests round amounts when an operator creates a quote by hand")
+    negotiation_step_side: Optional[Literal["FROM", "TO"]] = Field(None, description="Which of the pair's currencies negotiation_step is expressed in")
 
     # Un par NO tiene por qué cruzar dos monedas distintas: `USDT-USDT` es una paridad 1:1 y
     # es la única forma de expresar «un porcentaje sobre la par» en un modelo donde todo
@@ -66,6 +68,19 @@ class CurrencyPairBase(BaseModel):
                 raise ValueError("rounding_amount_side is required when rounding_mode is 'AMOUNT'")
         return v
 
+    # `always=True` es imprescindible: sin él el validador no corre cuando el
+    # lado viene ausente, que es justo el caso que hay que rechazar.
+    @validator('negotiation_step_side', always=True)
+    def validate_negotiation_step(cls, v, values):
+        # Declared after negotiation_step, so it is already in `values`.
+        step = values.get('negotiation_step')
+        if step is not None:
+            if step <= 0:
+                raise ValueError('negotiation_step must be > 0')
+            if v is None:
+                raise ValueError('negotiation_step_side is required when negotiation_step is set')
+        return v
+
     @validator('pair_type', pre=True)
     def validate_pair_type(cls, v):
         # Convert string to PairType enum if needed
@@ -98,6 +113,20 @@ class CurrencyPairUpdate(BaseModel):
     rounding_step: Optional[Decimal] = None
     rounding_direction: Optional[Literal["UP", "DOWN"]] = None
     rounding_amount_side: Optional[Literal["FROM", "TO"]] = None
+    negotiation_step: Optional[Decimal] = None
+    negotiation_step_side: Optional[Literal["FROM", "TO"]] = None
+
+    # El detalle del par guarda por aquí, no por `CurrencyPairCreate`: sin esta
+    # copia la validación de arriba no cubriría el único camino que se usa.
+    @validator('negotiation_step_side', always=True)
+    def validate_negotiation_step(cls, v, values):
+        step = values.get('negotiation_step')
+        if step is not None:
+            if step <= 0:
+                raise ValueError('negotiation_step must be > 0')
+            if v is None:
+                raise ValueError('negotiation_step_side is required when negotiation_step is set')
+        return v
 
     @validator('pair_type', pre=True)
     def validate_pair_type(cls, v):
@@ -155,6 +184,8 @@ class CurrencyPairResponse(BaseModel):
     rounding_step: Optional[Decimal] = None
     rounding_direction: Optional[str] = None
     rounding_amount_side: Optional[str] = None
+    negotiation_step: Optional[Decimal] = None
+    negotiation_step_side: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
     # Solo lo llenan los endpoints de listado y de detalle; el resto lo deja en None.

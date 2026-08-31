@@ -38,6 +38,18 @@ class CurrencyPair(UUIDMixin, Base):
     rounding_step = Column(Numeric(15, 4), nullable=True)
     rounding_direction = Column(String(4), nullable=True)
     rounding_amount_side = Column(String(4), nullable=True)
+
+    # Negotiation step — the figures this pair is *talked about* in with the client.
+    # Nothing applies it automatically: unlike rounding_step above (which the bot
+    # applies to every quote), this one only feeds the round-amount suggestions
+    # when an operator creates a quote by hand. The two are independent and are
+    # usually different: VES-COP rounds amounts to 100 COP but is negotiated in
+    # steps of 10.000 COP.
+    #   negotiation_step:      the multiple to suggest (e.g. 10000, 5)
+    #   negotiation_step_side: "FROM" | "TO" — which of the pair's currencies the
+    #                          step is expressed in.
+    negotiation_step = Column(Numeric(15, 4), nullable=True)
+    negotiation_step_side = Column(String(4), nullable=True)
     
     # Pair identifier (e.g., "USDT-VES", "ZELLE-COP")
     pair_symbol = Column(String(20), unique=True, index=True, nullable=False)
@@ -115,6 +127,8 @@ class CurrencyPair(UUIDMixin, Base):
             "rounding_step": float(self.rounding_step) if self.rounding_step is not None else None,
             "rounding_direction": self.rounding_direction,
             "rounding_amount_side": self.rounding_amount_side,
+            "negotiation_step": float(self.negotiation_step) if self.negotiation_step is not None else None,
+            "negotiation_step_side": self.negotiation_step_side,
             "usdt_reference_side": self.usdt_reference_side,
             "usdt_manual_rate": self.usdt_manual_rate,
             "usdt_pair_uuid": self.usdt_pair.uuid if self.usdt_pair else None,

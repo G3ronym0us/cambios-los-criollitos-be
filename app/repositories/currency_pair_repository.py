@@ -136,6 +136,8 @@ class CurrencyPairRepository:
             rounding_step=pair_data.rounding_step,
             rounding_direction=pair_data.rounding_direction,
             rounding_amount_side=pair_data.rounding_amount_side,
+            negotiation_step=pair_data.negotiation_step,
+            negotiation_step_side=pair_data.negotiation_step_side,
         )
         
         # Validate base pair configuration

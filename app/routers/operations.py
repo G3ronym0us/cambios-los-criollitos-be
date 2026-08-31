@@ -54,21 +54,32 @@ router = APIRouter(prefix="/operations", tags=["Operations"])
 async def list_operations(
     status_filter: Optional[str] = Query(None, alias="status"),
     delivery_status: Optional[str] = Query(None),
+    scenario: Optional[str] = Query(None),
     phone: Optional[str] = Query(None),
+    search: Optional[str] = Query(None, description="Nombre o teléfono del cliente"),
     since: Optional[datetime] = Query(None),
+    page: int = Query(1, ge=1),
     limit: int = Query(200, ge=1, le=500),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Lista operaciones del bot. Cualquier operador autenticado puede leer."""
+    """
+    Lista operaciones del bot, paginada. Cualquier operador autenticado puede leer.
+
+    `total` es el total tras los filtros, no el tamaño de la página: el listado del admin
+    lo necesita para dibujar el pie («26–50 de 312») y saber si hay página siguiente.
+    """
     service = WhatsAppQuoteService(db)
     try:
-        ops = service.list_operations(
+        ops, total = service.list_operations(
             phone=phone,
             status=status_filter,
             since=since,
             limit=limit,
             delivery_status=delivery_status,
+            offset=(page - 1) * limit,
+            search=search,
+            scenario=scenario,
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
@@ -94,7 +105,7 @@ async def list_operations(
         d["has_incoming_payment"] = op.id in inc_taken
         d["has_outgoing_payment"] = op.id in out_taken
         items.append(WhatsAppOperationResponse.model_validate(d))
-    return WhatsAppOperationList(operations=items, total=len(items))
+    return WhatsAppOperationList(operations=items, total=total, page=page, limit=limit)
 
 
 @router.post("/match", response_model=OperationRankResponse)

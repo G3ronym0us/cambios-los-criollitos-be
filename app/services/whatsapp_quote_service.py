@@ -737,20 +737,48 @@ class WhatsAppQuoteService:
         since: Optional[datetime] = None,
         limit: int = 100,
         delivery_status: Optional[str] = None,
-    ) -> list[WhatsAppOperation]:
+        offset: int = 0,
+        search: Optional[str] = None,
+        scenario: Optional[str] = None,
+    ) -> tuple[list[WhatsAppOperation], int]:
+        """
+        Una página de operaciones y el total que hay tras los filtros.
+
+        El total viaja aparte porque el listado del admin necesita paginar de verdad: antes
+        se pedían 500 de golpe y se filtraba en el navegador, lo que era una espera larga al
+        entrar y un techo silencioso — la 501 no existía.
+        """
         # `delivered_amount` recorre los comprobantes de salida de cada operación: sin
-        # precargarlos, listar 500 operaciones dispararía 500 consultas sueltas.
+        # precargarlos, listar una página entera dispararía una consulta por fila.
         q = self.db.query(WhatsAppOperation).options(
-            selectinload(WhatsAppOperation.outgoing_payments)
+            selectinload(WhatsAppOperation.outgoing_payments),
+            selectinload(WhatsAppOperation.outgoing_settlements),
         )
+        # El buscador cruza cliente, así que el join tiene que existir aunque no haya phone.
+        if phone or search:
+            q = q.join(WhatsAppClient, WhatsAppClient.id == WhatsAppOperation.client_id)
         if phone:
-            q = q.join(WhatsAppClient, WhatsAppClient.id == WhatsAppOperation.client_id)\
-                 .filter(WhatsAppClient.phone == phone)
+            q = q.filter(WhatsAppClient.phone == phone)
+        if search:
+            like = f"%{search.strip()}%"
+            q = q.filter(
+                or_(
+                    WhatsAppClient.display_name.ilike(like),
+                    WhatsAppClient.phone.ilike(like),
+                )
+            )
         if status:
             try:
                 q = q.filter(WhatsAppOperation.status == WhatsAppOperationStatus(status.upper()))
             except ValueError:
                 raise QuoteServiceError("invalid_status", f"Status inválido: {status}", 400)
+        if scenario:
+            try:
+                q = q.filter(
+                    WhatsAppOperation.scenario == WhatsAppOperationScenario(scenario.upper())
+                )
+            except ValueError:
+                raise QuoteServiceError("invalid_scenario", f"scenario inválido: {scenario}", 400)
         if delivery_status:
             try:
                 q = q.filter(WhatsAppOperation.delivery_status == WhatsAppDeliveryStatus(delivery_status.upper()))
@@ -758,7 +786,16 @@ class WhatsAppQuoteService:
                 raise QuoteServiceError("invalid_delivery_status", f"delivery_status inválido: {delivery_status}", 400)
         if since:
             q = q.filter(WhatsAppOperation.created_at >= since)
-        return q.order_by(WhatsAppOperation.created_at.desc()).limit(limit).all()
+
+        # El conteo va sobre los mismos filtros pero sin cargar relaciones ni ordenar.
+        total = q.order_by(None).count()
+        items = (
+            q.order_by(WhatsAppOperation.created_at.desc())
+            .offset(max(0, offset))
+            .limit(limit)
+            .all()
+        )
+        return items, total
 
     def mark_delivered(self, op_uuid: UUID, completed_by_user: User) -> WhatsAppOperation:
         """Recibe los USD físicos y cierra contablemente la operación.

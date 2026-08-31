@@ -195,11 +195,30 @@ class WhatsAppOperation(UUIDMixin, Base):
             2,
         )
 
+    @property
+    def payments_count(self) -> int:
+        """Cuántos comprobantes de salida cubren esta operación."""
+        return len(self.outgoing_settlements or [])
+
+    def real_rate(self, value: float | None, delivered: float) -> float | None:
+        """
+        La tasa que de verdad salió del trato: lo entregado entre el valor.
+
+        `rate_used` es la que se COTIZÓ; esta es la que resulta de los comprobantes, y su
+        desviación es lo que el listado y la franja de cuadre necesitan mostrar. Sin valor
+        o sin nada entregado todavía no hay tasa real que enseñar.
+        """
+        if not value or value <= 0 or delivered <= 0:
+            return None
+        return round(delivered / value, 6)
+
     def dict(self):
         cp = self.currency_pair
         value = self.amount if self.amount is not None else self.from_amount
         delivered = self.delivered_amount
         return {
+            "payments_count": self.payments_count,
+            "real_rate": self.real_rate(value, delivered),
             "uuid": self.uuid,
             "client_uuid": self.client.uuid if self.client else None,
             "client_phone": self.client.phone if self.client else None,

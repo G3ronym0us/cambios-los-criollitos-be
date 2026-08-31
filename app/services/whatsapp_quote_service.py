@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.currency_pair import CurrencyPair
@@ -737,20 +737,49 @@ class WhatsAppQuoteService:
         since: Optional[datetime] = None,
         limit: int = 100,
         delivery_status: Optional[str] = None,
-    ) -> list[WhatsAppOperation]:
+        offset: int = 0,
+        search: Optional[str] = None,
+        scenario: Optional[str] = None,
+        needs: Optional[str] = None,
+    ) -> tuple[list[WhatsAppOperation], int]:
+        """
+        Una página de operaciones y el total que hay tras los filtros.
+
+        El total viaja aparte porque el listado del admin necesita paginar de verdad: antes
+        se pedían 500 de golpe y se filtraba en el navegador, lo que era una espera larga al
+        entrar y un techo silencioso — la 501 no existía.
+        """
         # `delivered_amount` recorre los comprobantes de salida de cada operación: sin
-        # precargarlos, listar 500 operaciones dispararía 500 consultas sueltas.
+        # precargarlos, listar una página entera dispararía una consulta por fila.
         q = self.db.query(WhatsAppOperation).options(
-            selectinload(WhatsAppOperation.outgoing_payments)
+            selectinload(WhatsAppOperation.outgoing_payments),
+            selectinload(WhatsAppOperation.outgoing_settlements),
         )
+        # El buscador cruza cliente, así que el join tiene que existir aunque no haya phone.
+        if phone or search:
+            q = q.join(WhatsAppClient, WhatsAppClient.id == WhatsAppOperation.client_id)
         if phone:
-            q = q.join(WhatsAppClient, WhatsAppClient.id == WhatsAppOperation.client_id)\
-                 .filter(WhatsAppClient.phone == phone)
+            q = q.filter(WhatsAppClient.phone == phone)
+        if search:
+            like = f"%{search.strip()}%"
+            q = q.filter(
+                or_(
+                    WhatsAppClient.display_name.ilike(like),
+                    WhatsAppClient.phone.ilike(like),
+                )
+            )
         if status:
             try:
                 q = q.filter(WhatsAppOperation.status == WhatsAppOperationStatus(status.upper()))
             except ValueError:
                 raise QuoteServiceError("invalid_status", f"Status inválido: {status}", 400)
+        if scenario:
+            try:
+                q = q.filter(
+                    WhatsAppOperation.scenario == WhatsAppOperationScenario(scenario.upper())
+                )
+            except ValueError:
+                raise QuoteServiceError("invalid_scenario", f"scenario inválido: {scenario}", 400)
         if delivery_status:
             try:
                 q = q.filter(WhatsAppOperation.delivery_status == WhatsAppDeliveryStatus(delivery_status.upper()))
@@ -758,7 +787,18 @@ class WhatsAppQuoteService:
                 raise QuoteServiceError("invalid_delivery_status", f"delivery_status inválido: {delivery_status}", 400)
         if since:
             q = q.filter(WhatsAppOperation.created_at >= since)
-        return q.order_by(WhatsAppOperation.created_at.desc()).limit(limit).all()
+        if needs:
+            q = self._filter_needs_action(q, needs)
+
+        # El conteo va sobre los mismos filtros pero sin cargar relaciones ni ordenar.
+        total = q.order_by(None).count()
+        items = (
+            q.order_by(WhatsAppOperation.created_at.desc())
+            .offset(max(0, offset))
+            .limit(limit)
+            .all()
+        )
+        return items, total
 
     def mark_delivered(self, op_uuid: UUID, completed_by_user: User) -> WhatsAppOperation:
         """Recibe los USD físicos y cierra contablemente la operación.
@@ -1202,6 +1242,161 @@ class WhatsAppQuoteService:
             "quoted": counts["QUOTED"],
             "cancelled": counts["CANCELLED"],
             "completed_today": completed_today,
+            **self._actionable_stats(),
+        }
+
+    def _settled_subquery(self):
+        """Cuánto cubren ya los comprobantes de cada operación, agregado en SQL."""
+        from sqlalchemy import func as safunc
+
+        from app.models.whatsapp_payment import WhatsAppOutgoingSettlement
+
+        return (
+            self.db.query(
+                WhatsAppOutgoingSettlement.whatsapp_operation_id.label("op_id"),
+                safunc.coalesce(safunc.sum(WhatsAppOutgoingSettlement.settled_amount), 0).label(
+                    "delivered"
+                ),
+            )
+            .group_by(WhatsAppOutgoingSettlement.whatsapp_operation_id)
+            .subquery()
+        )
+
+    def _filter_needs_action(self, q, needs: str):
+        """
+        Filtra por lo que hace falta HACER, no por el estado.
+
+        Es lo que convierte las tarjetas de la cabecera en una bandeja: cada una aplica su
+        segmento en vez de obligar al operador a armarlo con tres selects. `action` es la
+        unión de las cuatro — todo lo que espera algo de alguien.
+        """
+        from sqlalchemy import func as safunc, or_ as sa_or
+
+        key = needs.strip().lower()
+        valid = {"settle", "deliver", "client", "expiring", "action"}
+        if key not in valid:
+            raise QuoteServiceError(
+                "invalid_needs", f"needs inválido: {needs}. Use uno de {sorted(valid)}", 400
+            )
+
+        now = datetime.now(timezone.utc)
+        settled = self._settled_subquery()
+        value = safunc.coalesce(WhatsAppOperation.amount, WhatsAppOperation.from_amount)
+        missing = value - safunc.coalesce(settled.c.delivered, 0) - safunc.coalesce(
+            WhatsAppOperation.uncovered_amount, 0
+        )
+
+        needs_settle = and_(
+            WhatsAppOperation.status.in_(
+                [WhatsAppOperationStatus.PENDING, WhatsAppOperationStatus.QUOTED]
+            ),
+            missing > 0,
+        )
+        needs_deliver = and_(
+            WhatsAppOperation.delivery_status == WhatsAppDeliveryStatus.PENDING,
+            WhatsAppOperation.status != WhatsAppOperationStatus.CANCELLED,
+        )
+        needs_client = and_(
+            WhatsAppOperation.client_id.is_(None),
+            WhatsAppOperation.status != WhatsAppOperationStatus.CANCELLED,
+        )
+        is_expiring = and_(
+            WhatsAppOperation.status == WhatsAppOperationStatus.QUOTED,
+            WhatsAppOperation.expires_at.isnot(None),
+            WhatsAppOperation.expires_at >= now,
+        )
+
+        # El join va siempre: sin él, `missing` no puede resolverse.
+        q = q.outerjoin(settled, settled.c.op_id == WhatsAppOperation.id)
+        clauses = {
+            "settle": needs_settle,
+            "deliver": needs_deliver,
+            "client": needs_client,
+            "expiring": is_expiring,
+        }
+        if key == "action":
+            return q.filter(sa_or(*clauses.values()))
+        return q.filter(clauses[key])
+
+    def _actionable_stats(self) -> dict:
+        """
+        Los cuatro números que sí cambian lo que haces al abrir la pantalla.
+
+        El censo por estado no es una bandeja: dice cuántas hay de cada color, no cuál hay
+        que tocar hoy. Estos cuentan TODO, no la página — el listado los usa como filtros.
+
+        `por cuadrar` necesita el valor menos lo ya cubierto, y lo cubierto vive en los
+        settlements, así que se agregan en SQL: recorrerlo en Python obligaría a cargar
+        todas las operaciones abiertas con sus comprobantes.
+        """
+        from sqlalchemy import func as safunc
+
+        now = datetime.now(timezone.utc)
+        # El valor del trato: `amount` cuando existe, si no el monto de origen.
+        value = safunc.coalesce(WhatsAppOperation.amount, WhatsAppOperation.from_amount)
+        settled = self._settled_subquery()
+        delivered = safunc.coalesce(settled.c.delivered, 0)
+        uncovered = safunc.coalesce(WhatsAppOperation.uncovered_amount, 0)
+        missing = value - delivered - uncovered
+
+        # Una operación viva a la que aún le falta comprobante por cubrir.
+        open_ops = (
+            self.db.query(
+                safunc.count(WhatsAppOperation.id),
+                safunc.coalesce(safunc.sum(missing), 0),
+            )
+            .outerjoin(settled, settled.c.op_id == WhatsAppOperation.id)
+            .filter(
+                WhatsAppOperation.status.in_(
+                    [WhatsAppOperationStatus.PENDING, WhatsAppOperationStatus.QUOTED]
+                ),
+                missing > 0,
+            )
+            .one()
+        )
+
+        to_deliver = (
+            self.db.query(
+                safunc.count(WhatsAppOperation.id),
+                safunc.min(WhatsAppOperation.created_at),
+            )
+            .filter(
+                WhatsAppOperation.delivery_status == WhatsAppDeliveryStatus.PENDING,
+                WhatsAppOperation.status != WhatsAppOperationStatus.CANCELLED,
+            )
+            .one()
+        )
+
+        without_client = (
+            self.db.query(safunc.count(WhatsAppOperation.id))
+            .filter(
+                WhatsAppOperation.client_id.is_(None),
+                WhatsAppOperation.status != WhatsAppOperationStatus.CANCELLED,
+            )
+            .scalar()
+        )
+
+        expiring = (
+            self.db.query(
+                safunc.count(WhatsAppOperation.id),
+                safunc.min(WhatsAppOperation.expires_at),
+            )
+            .filter(
+                WhatsAppOperation.status == WhatsAppOperationStatus.QUOTED,
+                WhatsAppOperation.expires_at.isnot(None),
+                WhatsAppOperation.expires_at >= now,
+            )
+            .one()
+        )
+
+        return {
+            "to_settle": open_ops[0] or 0,
+            "to_settle_amount": round(float(open_ops[1] or 0), 2),
+            "to_deliver": to_deliver[0] or 0,
+            "to_deliver_oldest_at": to_deliver[1],
+            "without_client": without_client or 0,
+            "expiring": expiring[0] or 0,
+            "expiring_next_at": expiring[1],
         }
 
     # ---------- Helpers ----------

@@ -336,7 +336,8 @@ def list_operations(
 ):
     service = WhatsAppQuoteService(db)
     try:
-        ops = service.list_operations(
+        # El bot no pagina: se queda con la página que pide y descarta el total.
+        ops, _total = service.list_operations(
             phone=phone, status=status_filter, since=since, limit=limit, delivery_status=delivery_status
         )
     except QuoteServiceError as exc:

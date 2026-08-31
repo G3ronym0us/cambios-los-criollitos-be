@@ -236,3 +236,91 @@ def test_timeline_of_an_untouched_payment_only_has_its_arrival(service, db, clie
     pay = f.incoming(db, 220.0)
     items = service.payment_timeline("incoming", pay.id)["items"]
     assert [i["kind"] for i in items] == ["OTHER"]
+
+
+# --------------------------------------------------------------------- salientes
+#
+# El comprobante de SALIDA también se pega al cliente equivocado, y ahí el error escuece más:
+# es dinero que ya salió. Las reglas son las mismas salvo una propia — el préstamo.
+
+
+def test_outgoing_receipt_can_be_transferred_too(service, db, client, destination, operator):
+    pay = f.outgoing(db, 914.04, "BRL")
+
+    out = service.transfer_client(
+        "outgoing", pay.id, destination.uuid, "BOT_MISMATCH", None, actor=operator
+    )
+
+    assert out["client_uuid"] == str(destination.uuid)
+    assert out["transfer"]["from_client_name"] == client.display_name
+    db.refresh(pay)
+    assert pay.client_phone == client.phone  # el comprobante no se toca
+
+
+def test_outgoing_listing_and_search_behave_like_the_incoming_one(
+    service, db, client, destination, operator
+):
+    pay = f.outgoing(db, 914.04, "BRL")
+    service.transfer_client(
+        "outgoing", pay.id, destination.uuid, "THIRD_PARTY", None, actor=operator
+    )
+
+    def ids(search=None):
+        return {
+            i["id"] for i in service.list_payments_page("outgoing", search=search)["items"]
+        }
+
+    assert pay.id in ids(client.display_name)  # el origen sigue encontrándose
+    assert pay.id in ids("Marielys")           # y el destino también
+
+    item = next(i for i in service.list_payments_page("outgoing")["items"] if i["id"] == pay.id)
+    assert item["transfer"]["count"] == 1
+
+
+def test_cannot_transfer_an_outgoing_registered_as_a_loan(
+    service, db, client, destination, operator
+):
+    """
+    La deuda quedó a nombre del cliente de origen, con su valuación y sus abonos. Mudar el
+    comprobante la dejaría con quien no la tiene.
+    """
+    from datetime import datetime, timezone
+    from app.models.client_loan import (
+        ClientLoan,
+        ClientLoanPreferredValue,
+        ClientLoanStatus,
+    )
+
+    pay = f.outgoing(db, 5000, "VES", phone=client.phone)
+    # El préstamo se inserta directo: lo que se prueba es el candado, no la valuación, y
+    # montarla entera arrastraría las tasas VES/USDT y BCV sin añadir nada al caso.
+    db.add(ClientLoan(
+        client_id=client.id,
+        outgoing_payment_id=pay.id,
+        fiat_amount=5000, fiat_currency="VES",
+        usdt_amount=10, usdt_rate=500,
+        valuation_at=datetime.now(timezone.utc),
+        preferred_value=ClientLoanPreferredValue.FIAT,
+        status=ClientLoanStatus.OPEN,
+    ))
+    db.flush()
+
+    with pytest.raises(QuoteServiceError) as exc:
+        service.transfer_client(
+            "outgoing", pay.id, destination.uuid, "THIRD_PARTY", None, actor=operator
+        )
+    assert exc.value.http_status == 409
+    db.refresh(pay)
+    assert pay.owner_client_id is None
+
+
+def test_outgoing_timeline_reads_the_move(service, db, client, destination, operator):
+    pay = f.outgoing(db, 914.04, "BRL")
+    service.transfer_client(
+        "outgoing", pay.id, destination.uuid, "DUPLICATE_CLIENT", "misma persona", actor=operator
+    )
+
+    items = service.payment_timeline("outgoing", pay.id)["items"]
+    move = next(i for i in items if i["kind"] == "TRANSFER")
+    assert "cliente duplicado" in move["detail"]
+    assert "misma persona" in move["detail"]

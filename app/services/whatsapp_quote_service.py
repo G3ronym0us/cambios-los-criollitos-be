@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, func as safunc, or_
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.currency_pair import CurrencyPair
@@ -27,6 +27,7 @@ from app.models.whatsapp_client import WhatsAppClient
 from app.models.whatsapp_payment import (
     WhatsAppIncomingPayment,
     WhatsAppOutgoingPayment,
+    WhatsAppOutgoingSettlement,
     WhatsAppPaymentAllocation,
 )
 from app.models.whatsapp_operation_message import WhatsAppOperationMessage
@@ -745,6 +746,7 @@ class WhatsAppQuoteService:
         search: Optional[str] = None,
         scenario: Optional[str] = None,
         needs: Optional[str] = None,
+        order_by: str = "created",
     ) -> tuple[list[WhatsAppOperation], int]:
         """
         Una página de operaciones y el total que hay tras los filtros.
@@ -752,13 +754,27 @@ class WhatsAppQuoteService:
         El total viaja aparte porque el listado del admin necesita paginar de verdad: antes
         se pedían 500 de golpe y se filtraba en el navegador, lo que era una espera larga al
         entrar y un techo silencioso — la 501 no existía.
+
+        `order_by` elige por qué fecha se ordena:
+
+        - `created` — cuándo se registró la operación. Es el histórico y sigue siendo el
+          predeterminado, porque el bot depende de él.
+        - `paid` — cuándo salió la plata: la fecha del comprobante de salida más reciente,
+          cayendo a la de la operación mientras no haya ninguno. Es lo que pide el listado
+          del admin, donde la pregunta es «qué se pagó últimamente» y una operación armada
+          a mano hoy por un pago de la semana pasada no debe colarse arriba.
+
+        El orden tiene que resolverse ACÁ y no en el navegador: la lista viene paginada, y
+        reordenar una página ya recortada sólo reordena esas 25 filas, no la lista.
         """
         # `delivered_amount` recorre los comprobantes de salida de cada operación, y
         # `first_incoming_payment_at` los de entrada: sin precargarlos, listar una página
         # entera dispararía varias consultas por fila.
         q = self.db.query(WhatsAppOperation).options(
             selectinload(WhatsAppOperation.outgoing_payments),
-            selectinload(WhatsAppOperation.outgoing_settlements),
+            selectinload(WhatsAppOperation.outgoing_settlements).selectinload(
+                WhatsAppOutgoingSettlement.payment
+            ),
             selectinload(WhatsAppOperation.incoming_payments),
             selectinload(WhatsAppOperation.incoming_allocations).selectinload(
                 WhatsAppPaymentAllocation.payment
@@ -799,15 +815,46 @@ class WhatsAppQuoteService:
         if needs:
             q = self._filter_needs_action(q, needs)
 
-        # El conteo va sobre los mismos filtros pero sin cargar relaciones ni ordenar.
+        if order_by == "paid":
+            paid = self._last_outgoing_subquery()
+            q = q.outerjoin(paid, paid.c.op_id == WhatsAppOperation.id)
+            # Coalesce y no `paid_at` a secas: si no, las que aún no se han pagado —que son
+            # justo las que hay que atender— se irían todas al fondo con fecha nula.
+            ordering = safunc.coalesce(paid.c.paid_at, WhatsAppOperation.created_at).desc()
+        elif order_by != "created":
+            raise QuoteServiceError(
+                "invalid_order_by", f"order_by inválido: {order_by}. Use created | paid", 400
+            )
+        else:
+            ordering = WhatsAppOperation.created_at.desc()
+
+        # El conteo va sobre los mismos filtros pero sin cargar relaciones ni ordenar. El
+        # outerjoin de arriba agrega por operación, así que no multiplica filas.
         total = q.order_by(None).count()
         items = (
-            q.order_by(WhatsAppOperation.created_at.desc())
+            q.order_by(ordering)
             .offset(max(0, offset))
             .limit(limit)
             .all()
         )
         return items, total
+
+    def _last_outgoing_subquery(self):
+        """La fecha del comprobante de salida más reciente de cada operación."""
+        from app.models.whatsapp_payment import WhatsAppOutgoingSettlement
+
+        return (
+            self.db.query(
+                WhatsAppOutgoingSettlement.whatsapp_operation_id.label("op_id"),
+                safunc.max(WhatsAppOutgoingPayment.created_at).label("paid_at"),
+            )
+            .join(
+                WhatsAppOutgoingPayment,
+                WhatsAppOutgoingPayment.id == WhatsAppOutgoingSettlement.outgoing_payment_id,
+            )
+            .group_by(WhatsAppOutgoingSettlement.whatsapp_operation_id)
+            .subquery()
+        )
 
     def mark_delivered(self, op_uuid: UUID, completed_by_user: User) -> WhatsAppOperation:
         """Recibe los USD físicos y cierra contablemente la operación.

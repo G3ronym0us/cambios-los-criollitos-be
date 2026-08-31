@@ -62,6 +62,10 @@ async def list_operations(
     phone: Optional[str] = Query(None),
     search: Optional[str] = Query(None, description="Nombre o teléfono del cliente"),
     since: Optional[datetime] = Query(None),
+    order_by: str = Query(
+        "paid",
+        description="Fecha por la que ordenar: paid (comprobante de salida) | created",
+    ),
     page: int = Query(1, ge=1),
     limit: int = Query(200, ge=1, le=500),
     db: Session = Depends(get_db),
@@ -85,6 +89,7 @@ async def list_operations(
             search=search,
             scenario=scenario,
             needs=needs,
+            order_by=order_by,
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)

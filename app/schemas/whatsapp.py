@@ -152,6 +152,11 @@ class WhatsAppOperationResponse(BaseModel):
     no_payments_ack_note: Optional[str] = None
     transaction_uuid: Optional[UUID] = None
     legacy_sqlite_id: Optional[str] = None
+    # Las dos fechas que de verdad sitúan la operación en el tiempo, y que no son
+    # `created_at`: cuándo entró el dinero del cliente y cuándo salió el nuestro. Una
+    # operación que el bot no reconoció se arma a mano días después de las dos.
+    first_incoming_payment_at: Optional[datetime] = None
+    last_outgoing_payment_at: Optional[datetime] = None
     quoted_at: datetime
     expires_at: datetime
     approved_at: Optional[datetime] = None

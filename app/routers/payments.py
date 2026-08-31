@@ -18,7 +18,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user, get_root_user
 from app.database.connection import get_db
 from app.models.user import User
 from app.schemas.whatsapp import (
@@ -31,6 +31,7 @@ from app.schemas.whatsapp import (
     WhatsAppPaymentLink,
     WhatsAppPaymentUpdate,
     WhatsAppPersonalExpense,
+    WhatsAppPaymentTransferRequest,
     ClientLoanCreate,
 )
 from app.core.timezones import day_bounds
@@ -345,6 +346,57 @@ async def set_outgoing_settlements(
     service = WhatsAppPaymentService(db)
     try:
         return service.set_settlements(payment_id, payload.settlements, actor=current_user)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.patch("/{table}/{payment_id}/client")
+async def transfer_payment_client(
+    table: Literal["incoming", "outgoing"],
+    payment_id: int,
+    payload: WhatsAppPaymentTransferRequest,
+    db: Session = Depends(get_db),
+    # ROOT, no MODERATOR: todo /admin ya exige moderador, así que pedirlo aquí no gatearía
+    # nada. Mudar un comprobante de perfil es de la misma familia que las acciones que el
+    # fondo ya reserva a ROOT.
+    current_user: User = Depends(get_root_user),
+):
+    """
+    Muda el comprobante a otro cliente y deja el rastro.
+
+    El pago no se duplica ni se anula —mismo id, misma fecha, mismo `client_phone`—: lo único
+    que cambia es de quién es. Si estaba vinculado se desengancha y su operación vuelve a
+    esperar fondos; nunca se muda la operación de cliente por su cuenta.
+
+    409 si el pago ya movió caja (operación conciliada, depósito confirmado, saldo acreditado).
+    """
+    try:
+        return WhatsAppPaymentService(db).transfer_client(
+            table,
+            payment_id,
+            payload.client_uuid,
+            payload.reason,
+            payload.note,
+            actor=current_user,
+        )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.get("/{table}/{payment_id}/timeline")
+async def get_payment_timeline(
+    table: Literal["incoming", "outgoing"],
+    payment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Bitácora del comprobante, de lo más reciente a lo más viejo. Cada línea viene con su
+    `title` y su `detail` ya redactados: el front solo los pinta, así que una clase de evento
+    nueva aparece sin tocarlo.
+    """
+    try:
+        return WhatsAppPaymentService(db).payment_timeline(table, payment_id)
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 

@@ -17,6 +17,7 @@ from .bcv_rate import BcvRate
 from .whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from .whatsapp_payment_transfer import WhatsAppPaymentTransfer, PaymentTransferReason
 from .whatsapp_balance import WhatsAppBalanceEntry, WhatsAppBalanceEntryType
+from .whatsapp_pending_delivery import WhatsAppPendingDelivery, WhatsAppPendingDeliveryItem
 from .whatsapp_operation_message import WhatsAppOperationMessage
 from .whatsapp_message_analysis import WhatsAppMessageAnalysis
 from .client_loan import (

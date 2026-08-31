@@ -18,9 +18,16 @@ from app.database.connection import get_db
 from app.models.user import User
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.repositories.whatsapp_client_repository import WhatsAppClientRepository
-from app.schemas.client import ClientCreate, ClientList, ClientResponse, ClientUpdate
+from app.schemas.client import (
+    ClientCreate,
+    ClientList,
+    ClientResponse,
+    ClientUpdate,
+    PendingDeliveryCreate,
+)
 from app.schemas.whatsapp import ClientLoanManualCreate, ClientLoanRepaymentCreate, WhatsAppBalanceAdjust
 from app.services.client_entity_service import ClientEntityService
+from app.services.client_pending_service import ClientPendingService
 from app.services.client_loan_service import ClientLoanService
 from app.services.whatsapp_balance_service import WhatsAppBalanceService
 from app.services.whatsapp_client_account_service import WhatsAppClientAccountService
@@ -125,18 +132,46 @@ async def list_clients(
     search: Optional[str] = Query(None, description="Filtra por nombre o teléfono"),
     is_blocked: Optional[bool] = Query(None),
     is_tracked: Optional[bool] = Query(None),
+    has_pending: Optional[bool] = Query(
+        None, description="Sólo los clientes a los que les debemos algo (o sólo los que no)"
+    ),
+    pair: Optional[str] = Query(
+        None, description="Acota `has_pending` y `pending_by_pair` a un par ('USD/VES')"
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Lista clientes del bot. Cualquier operador autenticado puede leer."""
+    """
+    Lista clientes del bot. Cualquier operador autenticado puede leer.
+
+    `pair` recorta lo que se ve del cliente, no sólo qué clientes salen: con `USD/VES`, uno
+    que además deba en VES/COP devuelve sólo la entrada de USD/VES.
+    """
     repo = WhatsAppClientRepository(db)
+    pending_service = ClientPendingService(db)
+
+    pending_ids = (
+        pending_service.client_ids_with_pending(pair) if has_pending is not None else None
+    )
     items, total = repo.list(
         skip=skip, limit=limit, search=search,
         is_blocked=is_blocked, is_tracked=is_tracked,
+        has_pending=has_pending, pending_client_ids=pending_ids,
     )
-    balances = WhatsAppBalanceService(db).balances_by_client_ids([c.id for c in items])
+
+    client_ids = [c.id for c in items]
+    balances = WhatsAppBalanceService(db).balances_by_client_ids(client_ids)
+    # Una sola consulta agregada para toda la página, no una por cliente.
+    pending = pending_service.pending_by_client_ids(client_ids, pair)
     return ClientList(
-        items=[ClientResponse(**c.dict(), balance=balances.get(c.id, 0.0)) for c in items],
+        items=[
+            ClientResponse(
+                **c.dict(),
+                balance=balances.get(c.id, 0.0),
+                pending_by_pair=pending.get(c.id, []),
+            )
+            for c in items
+        ],
         total=total, skip=skip, limit=limit,
     )
 
@@ -151,7 +186,10 @@ async def get_client(
     if client is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cliente no encontrado")
     balance = WhatsAppBalanceService(db).get_balance(client.id)
-    return ClientResponse(**client.dict(), balance=balance)
+    pending = ClientPendingService(db).pending_by_client_ids([client.id])
+    return ClientResponse(
+        **client.dict(), balance=balance, pending_by_pair=pending.get(client.id, [])
+    )
 
 
 @router.get("/{client_uuid}/balance")
@@ -223,3 +261,59 @@ async def update_client(
     db.commit()
     db.refresh(client)
     return ClientResponse(**client.dict())
+
+
+@router.get("/{client_uuid}/pending/deliveries")
+async def list_pending_deliveries(
+    client_uuid: UUID,
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Las entregas marcadas del cliente, con lo que había antes de cada una."""
+    try:
+        return ClientPendingService(db).history(client_uuid, limit=limit)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.post("/{client_uuid}/pending/deliver", status_code=status.HTTP_201_CREATED)
+async def deliver_pending(
+    client_uuid: UUID,
+    payload: PendingDeliveryCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),  # mutación: moderador+
+):
+    """
+    Marca como entregado en efectivo un lote de operaciones sin cubrir.
+
+    O todas o ninguna: una entrega a medias deja dinero marcado sin que nadie sepa cuánto.
+    Devuelve el lote con su uuid, que es lo que hace falta para deshacerlo.
+    """
+    try:
+        return ClientPendingService(db).deliver(
+            client_uuid,
+            [item.model_dump() for item in payload.operations],
+            payload.note,
+            actor=current_user,
+        )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.post("/{client_uuid}/pending/deliveries/{delivery_uuid}/undo")
+async def undo_pending_delivery(
+    client_uuid: UUID,
+    delivery_uuid: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),  # mutación: moderador+
+):
+    """
+    Devuelve las operaciones del lote a como estaban, sin borrar el rastro.
+
+    Sin límite de tiempo: si el error se descubre mañana, se deshace mañana.
+    """
+    try:
+        return ClientPendingService(db).undo(client_uuid, delivery_uuid, actor=current_user)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)

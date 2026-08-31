@@ -24,7 +24,11 @@ from app.models.transaction import Transaction, TransactionProfitSplit, Transact
 from app.models.user import User
 from app.models.whatsapp_balance import WhatsAppBalanceEntry
 from app.models.whatsapp_client import WhatsAppClient
-from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
+from app.models.whatsapp_payment import (
+    WhatsAppIncomingPayment,
+    WhatsAppOutgoingPayment,
+    WhatsAppPaymentAllocation,
+)
 from app.models.whatsapp_operation_message import WhatsAppOperationMessage
 from app.models.whatsapp_operation import (
     WhatsAppAmountSide,
@@ -749,11 +753,16 @@ class WhatsAppQuoteService:
         se pedían 500 de golpe y se filtraba en el navegador, lo que era una espera larga al
         entrar y un techo silencioso — la 501 no existía.
         """
-        # `delivered_amount` recorre los comprobantes de salida de cada operación: sin
-        # precargarlos, listar una página entera dispararía una consulta por fila.
+        # `delivered_amount` recorre los comprobantes de salida de cada operación, y
+        # `first_incoming_payment_at` los de entrada: sin precargarlos, listar una página
+        # entera dispararía varias consultas por fila.
         q = self.db.query(WhatsAppOperation).options(
             selectinload(WhatsAppOperation.outgoing_payments),
             selectinload(WhatsAppOperation.outgoing_settlements),
+            selectinload(WhatsAppOperation.incoming_payments),
+            selectinload(WhatsAppOperation.incoming_allocations).selectinload(
+                WhatsAppPaymentAllocation.payment
+            ),
         )
         # El buscador cruza cliente, así que el join tiene que existir aunque no haya phone.
         if phone or search:

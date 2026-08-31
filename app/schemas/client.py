@@ -13,6 +13,25 @@ from uuid import UUID
 from pydantic import BaseModel
 
 
+class ClientPendingByPair(BaseModel):
+    """
+    Lo que le debemos al cliente en un par.
+
+    Los montos van en la moneda del VALOR del trato (lo que entrega el cliente), que es la
+    unidad de lo que falta por cubrir. `payout_*` es el equivalente en la moneda con la que
+    se le paga, derivado de la proporción del propio trato: se enseña con «≈» y no se suma.
+    `None` cuando alguna operación del grupo no se puede convertir.
+    """
+    pair_symbol: Optional[str] = None
+    currency: Optional[str] = None
+    amount: float
+    operations: int
+    #: La más vieja sin cubrir, medida desde que entró el dinero (no desde la operación).
+    oldest_at: Optional[datetime] = None
+    payout_currency: Optional[str] = None
+    payout_amount: Optional[float] = None
+
+
 class ClientResponse(BaseModel):
     uuid: UUID
     phone: str
@@ -29,6 +48,8 @@ class ClientResponse(BaseModel):
     linked_group_jid: Optional[str] = None
     # Saldo a favor en USD (ledger whatsapp_balance_entries); 0 si no tiene.
     balance: float = 0.0
+    # Deuda por entregar agrupada por par; lista vacía —no null— si no debe nada.
+    pending_by_pair: List[ClientPendingByPair] = []
     last_seen_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -65,3 +86,14 @@ class ClientCreate(BaseModel):
     """
     display_name: str
     linked_group_jid: Optional[str] = None
+
+
+class PendingDeliveryItem(BaseModel):
+    """Una operación del lote. Sin `amount` se entrega todo lo que le falte."""
+    operation_uuid: UUID
+    amount: Optional[float] = None
+
+
+class PendingDeliveryCreate(BaseModel):
+    operations: List[PendingDeliveryItem]
+    note: Optional[str] = None

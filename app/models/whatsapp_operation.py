@@ -167,6 +167,19 @@ class WhatsAppOperation(UUIDMixin, Base):
         primaryjoin="WhatsAppOperation.id == foreign(WhatsAppOutgoingSettlement.whatsapp_operation_id)",
         viewonly=True,
     )
+    # Los comprobantes de ENTRADA: cuándo llegó el dinero del cliente. Un pago puede
+    # apuntar a la operación por su FK o por el reparto (`WhatsAppPaymentAllocation`), y hay
+    # que mirar los dos — un Zelle repartido entre dos cambios sólo tiene FK a uno.
+    incoming_payments = relationship(
+        "WhatsAppIncomingPayment",
+        primaryjoin="WhatsAppOperation.id == foreign(WhatsAppIncomingPayment.whatsapp_operation_id)",
+        viewonly=True,
+    )
+    incoming_allocations = relationship(
+        "WhatsAppPaymentAllocation",
+        primaryjoin="WhatsAppOperation.id == foreign(WhatsAppPaymentAllocation.whatsapp_operation_id)",
+        viewonly=True,
+    )
     currency_pair = relationship("CurrencyPair", lazy="joined")
     # Quién se queda con cada pedazo del margen cobrado (fondos, cliente).
     profit_allocations = relationship(
@@ -199,6 +212,28 @@ class WhatsAppOperation(UUIDMixin, Base):
     def payments_count(self) -> int:
         """Cuántos comprobantes de salida cubren esta operación."""
         return len(self.outgoing_settlements or [])
+
+    @property
+    def first_incoming_payment_at(self):
+        """
+        Cuándo llegó el dinero del cliente: la fecha de su primer comprobante entrante.
+
+        Es lo que mide de verdad cuánto lleva esperando, y no es lo mismo que `created_at`.
+        Cuando el bot no reconoce un comprobante, el operador crea la operación a mano días
+        después (`POST /payments/{table}/{id}/create-operation`, que no lleva fecha): la
+        operación nace hoy aunque el dinero entrara la semana pasada. Ordenar por la
+        operación manda esas al final de la cola justo cuando son las más viejas.
+
+        `None` si no tiene ningún entrante; entonces la fecha de la operación es lo mejor
+        que hay y quien lo consuma se cae a ella.
+        """
+        dates = [p.created_at for p in (self.incoming_payments or []) if p.created_at]
+        dates += [
+            a.payment.created_at
+            for a in (self.incoming_allocations or [])
+            if a.payment is not None and a.payment.created_at
+        ]
+        return min(dates) if dates else None
 
     def real_rate(self, value: float | None, delivered: float) -> float | None:
         """
@@ -269,6 +304,7 @@ class WhatsAppOperation(UUIDMixin, Base):
             "no_payments_ack_note": self.no_payments_ack_note,
             "transaction_uuid": self.transaction.uuid if self.transaction else None,
             "legacy_sqlite_id": self.legacy_sqlite_id,
+            "first_incoming_payment_at": self.first_incoming_payment_at,
             "quoted_at": self.quoted_at,
             "expires_at": self.expires_at,
             "approved_at": self.approved_at,

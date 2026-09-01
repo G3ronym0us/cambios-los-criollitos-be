@@ -280,6 +280,9 @@ class WhatsAppOperation(UUIDMixin, Base):
             "client_display_name": self.client.display_name if self.client else None,
             "currency_pair_uuid": cp.uuid if cp else None,
             "pair_symbol": cp.pair_symbol if cp else None,
+            # El par se cambia en efectivo: no hay ni habrá comprobante entrante, así que
+            # `first_incoming_payment_at` en None NO significa que el cliente no haya pagado.
+            "settles_in_cash": bool(cp.settles_in_cash) if cp else False,
             "from_currency": cp.from_currency.symbol if cp and cp.from_currency else None,
             "to_currency": cp.to_currency.symbol if cp and cp.to_currency else None,
             "amount": self.amount,

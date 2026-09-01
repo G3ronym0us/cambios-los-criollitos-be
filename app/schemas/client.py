@@ -23,6 +23,10 @@ class ClientPendingByPair(BaseModel):
     `None` cuando alguna operación del grupo no se puede convertir.
     """
     pair_symbol: Optional[str] = None
+    #: El par se cambia en efectivo. Entonces esto NO es lo que debemos sino lo que nos
+    #: deben: los bolívares ya salieron y falta el efectivo del cliente. Quien lo pinte
+    #: tiene que rotularlo distinto.
+    settles_in_cash: bool = False
     currency: Optional[str] = None
     amount: float
     operations: int

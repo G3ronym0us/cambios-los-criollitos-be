@@ -16,6 +16,10 @@ class CurrencyPairBase(BaseModel):
     description: Optional[str] = None
     is_active: bool = True
     is_monitored: bool = True
+    #: El par se cambia en efectivo, mano a mano: no hay comprobante entrante ni lo habrá.
+    #: «Por entregar» deja de exigirlo en este par —si no, el par entero sale vacío— y lo
+    #: que quede sin cuadrar se lee al revés: no es lo que debemos, es lo que nos deben.
+    settles_in_cash: bool = False
     binance_tracked: bool = False
     banks_to_track: Optional[List[str]] = None
     amount_to_track: Optional[Decimal] = None
@@ -105,6 +109,7 @@ class CurrencyPairUpdate(BaseModel):
     description: Optional[str] = None
     is_active: Optional[bool] = None
     is_monitored: Optional[bool] = None
+    settles_in_cash: Optional[bool] = None
     binance_tracked: Optional[bool] = None
     banks_to_track: Optional[List[str]] = None
     amount_to_track: Optional[Decimal] = None
@@ -194,6 +199,7 @@ class CurrencyPairResponse(BaseModel):
     description: Optional[str] = None
     is_active: bool
     is_monitored: bool
+    settles_in_cash: bool = False
     binance_tracked: bool
     banks_to_track: Optional[List[str]] = None
     amount_to_track: Optional[Decimal] = None

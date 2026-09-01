@@ -118,6 +118,12 @@ class WhatsAppOperationResponse(BaseModel):
     amount: Optional[float] = None
     currency: Optional[str] = None
     delivered_amount: Optional[float] = None
+    #: El hueco declarado sin comprobante (efectivo). NO está en `delivered_amount` —que
+    #: sólo cuenta comprobantes— pero SÍ está descontado de `pending_amount`. Sin este
+    #: campo, una operación de 75 con 40 entregados en efectivo llega al front como si
+    #: valiera 35 desde el principio, y los 40 desaparecen de la pantalla.
+    uncovered_amount: Optional[float] = None
+    uncovered_reason: Optional[str] = None
     pending_amount: Optional[float] = None
     # Cuántos comprobantes cubren la operación, y la tasa que resulta de ellos
     # (entregado ÷ valor). `rate_used` es la que se cotizó; esta es la que salió.
@@ -156,6 +162,9 @@ class WhatsAppOperationResponse(BaseModel):
     # `created_at`: cuándo entró el dinero del cliente y cuándo salió el nuestro. Una
     # operación que el bot no reconoció se arma a mano días después de las dos.
     first_incoming_payment_at: Optional[datetime] = None
+    #: Su par se cambia en efectivo. Entonces `first_incoming_payment_at` vacío no dice que
+    #: el cliente no haya pagado: dice que de un billete no hay comprobante que adjuntar.
+    settles_in_cash: bool = False
     last_outgoing_payment_at: Optional[datetime] = None
     quoted_at: datetime
     expires_at: datetime

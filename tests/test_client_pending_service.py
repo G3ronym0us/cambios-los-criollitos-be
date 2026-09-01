@@ -46,6 +46,7 @@ from app.models.whatsapp_payment import (
     WhatsAppOutgoingPayment,
     WhatsAppOutgoingSettlement,
 )
+from app.schemas.whatsapp import WhatsAppOperationResponse
 from app.services.client_pending_service import ClientPendingService
 from app.services.whatsapp_quote_service import QuoteServiceError
 
@@ -423,3 +424,179 @@ class TestLastOutgoingPaymentAt:
         db.commit()
         db.refresh(op)
         assert op.last_outgoing_payment_at is None
+
+
+@pytest.fixture()
+def cash_pair(db, world):
+    """
+    Un par que se cambia en efectivo, mano a mano.
+
+    Hace de USD-VES de producción: el cliente llega con billetes, así que no hay comprobante
+    entrante que adjuntar ni lo habrá. Va sobre COP porque un par es único por combinación de
+    monedas y el USD/VES normal ya ocupa la suya — y precisamente hace falta que los dos
+    convivan, porque la regla tiene que indultar a uno sin indultar al otro.
+    """
+    usd = db.query(Currency).filter(Currency.symbol == "USD").one()
+    cop = db.query(Currency).filter(Currency.symbol == "COP").one()
+    pair = CurrencyPair(
+        from_currency_id=usd.id,
+        to_currency_id=cop.id,
+        pair_symbol="USD-COP efectivo",
+        is_active=True,
+        settles_in_cash=True,
+    )
+    db.add(pair)
+    db.flush()
+    db.commit()
+    return pair
+
+
+class TestParesDeEfectivo:
+    """
+    La excepción a «sólo debemos lo que ya nos pagaron».
+
+    Exigir el comprobante entrante es correcto en Zelle o PayPal, donde siempre está. En un
+    par de efectivo no existe, y exigirlo borraba el par ENTERO de la pantalla: en producción
+    USD-VES tenía 134 operaciones sin cuadrar y cero con entrante.
+    """
+
+    def test_una_pendiente_sin_comprobante_si_cuenta(self, db, world, cash_pair):
+        make_op(db, world["client"], cash_pair, amount=100, incoming_at=None)
+        db.commit()
+
+        entries = ClientPendingService(db).pending_by_client_ids([world["client"].id])[
+            world["client"].id
+        ]
+        assert [(e["pair_symbol"], e["amount"], e["operations"]) for e in entries] == [
+            ("USD-COP efectivo", 100, 1)
+        ]
+
+    def test_una_cotizacion_sin_comprobante_no_cuenta(self, db, world, cash_pair):
+        """
+        Sin entrante, lo único que separa el trato hecho de la cotización abandonada es el
+        estado. Contar las QUOTED metía 106 cotizaciones muertas como deuda.
+        """
+        make_op(
+            db, world["client"], cash_pair, amount=500,
+            incoming_at=None, status=WhatsAppOperationStatus.QUOTED,
+        )
+        db.commit()
+        assert ClientPendingService(db).pending_by_client_ids([world["client"].id]) == {}
+
+    def test_una_cotizacion_con_comprobante_sigue_contando(self, db, world, cash_pair):
+        """El estado sólo manda cuando falta el entrante: si el entrante está, es deuda."""
+        make_op(
+            db, world["client"], cash_pair, amount=80,
+            status=WhatsAppOperationStatus.QUOTED, incoming_at=NOW,
+        )
+        db.commit()
+
+        entries = ClientPendingService(db).pending_by_client_ids([world["client"].id])[
+            world["client"].id
+        ]
+        assert entries[0]["amount"] == 80
+
+    def test_el_indulto_no_alcanza_a_los_demas_pares(self, db, world, cash_pair):
+        """Tener un par de efectivo no relaja la regla en los que sí llevan comprobante."""
+        make_op(db, world["client"], cash_pair, amount=100, incoming_at=None)
+        make_op(db, world["client"], world["usd_ves"], amount=70, incoming_at=None)
+        db.commit()
+
+        entries = ClientPendingService(db).pending_by_client_ids([world["client"].id])[
+            world["client"].id
+        ]
+        assert [e["pair_symbol"] for e in entries] == ["USD-COP efectivo"]
+
+    def test_la_entrada_dice_de_que_lado_esta_la_deuda(self, db, world, cash_pair):
+        """
+        La misma cifra con el rótulo opuesto: en efectivo los bolívares ya salieron y lo que
+        falta es el dinero del cliente. La pantalla necesita el dato para no decirlo al revés.
+        """
+        make_op(db, world["client"], cash_pair, amount=100, incoming_at=None)
+        make_op(db, world["client"], world["usd_ves"], amount=70)
+        db.commit()
+
+        entries = {
+            e["pair_symbol"]: e
+            for e in ClientPendingService(db).pending_by_client_ids([world["client"].id])[
+                world["client"].id
+            ]
+        }
+        assert entries["USD-COP efectivo"]["settles_in_cash"] is True
+        assert entries["USD/VES"]["settles_in_cash"] is False
+
+    def test_sin_comprobante_la_antiguedad_sale_de_la_operacion(self, db, world, cash_pair):
+        """No hay entrante del que sacar la fecha, y la de la operación es lo mejor que hay."""
+        nacio = NOW - timedelta(days=6)
+        make_op(db, world["client"], cash_pair, amount=100, created_at=nacio, incoming_at=None)
+        db.commit()
+
+        entry = ClientPendingService(db).pending_by_client_ids([world["client"].id])[
+            world["client"].id
+        ][0]
+        assert entry["oldest_at"].replace(tzinfo=timezone.utc) == nacio
+
+    def test_lo_ya_entregado_se_descuenta_igual(self, db, world, cash_pair):
+        make_op(db, world["client"], cash_pair, amount=100, uncovered=40, incoming_at=None)
+        db.commit()
+
+        entry = ClientPendingService(db).pending_by_client_ids([world["client"].id])[
+            world["client"].id
+        ][0]
+        assert entry["amount"] == 60
+
+    def test_lo_entregado_del_todo_desaparece(self, db, world, cash_pair):
+        make_op(db, world["client"], cash_pair, amount=100, uncovered=100, incoming_at=None)
+        db.commit()
+        assert ClientPendingService(db).pending_by_client_ids([world["client"].id]) == {}
+
+    def test_entregar_y_deshacer_funcionan_sin_comprobante(self, db, world, cash_pair):
+        """La entrega en lote es lo que se usa justamente aquí: cobrar efectivo a mano."""
+        op = make_op(db, world["client"], cash_pair, amount=100, incoming_at=None)
+        db.commit()
+        service = ClientPendingService(db)
+
+        batch = service.deliver(
+            world["client"].uuid, [{"operation_uuid": str(op.uuid)}], None, world["actor"]
+        )
+        assert service.pending_by_client_ids([world["client"].id]) == {}
+
+        service.undo(world["client"].uuid, batch["uuid"], world["actor"])
+        assert service.pending_by_client_ids([world["client"].id])[world["client"].id][0][
+            "amount"
+        ] == 100
+
+    def test_client_ids_with_pending_los_ve(self, db, world, cash_pair):
+        make_op(db, world["client"], cash_pair, amount=100, incoming_at=None)
+        db.commit()
+        assert ClientPendingService(db).client_ids_with_pending() == [world["client"].id]
+
+
+class TestLoQueLlegaAlFront:
+    """Lo que la operación serializa: sin esto la pantalla no puede aplicar la regla."""
+
+    def test_la_operacion_dice_si_su_par_es_de_efectivo(self, db, world, cash_pair):
+        efectivo = make_op(db, world["client"], cash_pair, amount=100, incoming_at=None)
+        normal = make_op(db, world["client"], world["usd_ves"], amount=100)
+        db.commit()
+
+        assert efectivo.dict()["settles_in_cash"] is True
+        assert normal.dict()["settles_in_cash"] is False
+
+    def test_la_respuesta_no_se_come_lo_declarado_en_efectivo(self, db, world, cash_pair):
+        """
+        `uncovered_amount` no está en `delivered_amount` —que sólo cuenta comprobantes— pero
+        sí está descontado de `pending_amount`. Si el esquema no lo deja pasar, una operación
+        de 75 con 40 entregados llega al front como si valiera 35 desde el principio y los 40
+        no aparecen en ninguna parte.
+        """
+        op = make_op(db, world["client"], cash_pair, amount=75, uncovered=40, incoming_at=None)
+        db.commit()
+
+        response = WhatsAppOperationResponse.model_validate(op.dict())
+        assert response.amount == 75
+        assert response.uncovered_amount == 40
+        assert response.uncovered_reason is None
+        assert response.pending_amount == 35
+        assert response.settles_in_cash is True
+        assert response.first_incoming_payment_at is None

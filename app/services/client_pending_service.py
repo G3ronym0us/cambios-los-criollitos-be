@@ -17,6 +17,17 @@ hasta que su plata llega — una operación registrada sin comprobante entrante 
 cotización o un trato a medio armar, no una deuda. Contarlas mezclaba las dos patas del
 cambio y hacía que la lista pidiera pagar cosas que nadie había pagado todavía.
 
+**Salvo en los pares que se cambian en efectivo** (`CurrencyPair.settles_in_cash`). Ahí no
+hay comprobante entrante ni lo habrá —nadie fotografía un billete—, así que exigirlo borra
+el par entero: USD-VES tenía 134 operaciones sin cuadrar y CERO con entrante, y la pantalla
+salía vacía. En esos pares el filtro lo hace el ESTADO: cuenta lo que está en PENDING —un
+trato registrado— y no lo que sigue en QUOTED, que es una cotización que nadie confirmó.
+
+En un par de efectivo el saldo pendiente NO significa lo mismo, y quien lo pinte tiene que
+decirlo: ahí los bolívares ya salieron y lo que falta es el efectivo del cliente. Por eso
+el par viaja en cada entrada (`settles_in_cash`), para que la pantalla sepa si eso que
+enseña es lo que debemos o lo que nos deben.
+
 **La moneda**: `missing` va en la moneda del VALOR del trato (lo que entrega el cliente:
 los USD de un USD/VES), no en la moneda con la que se le paga. Es la cifra exacta, la que
 se suma y por la que se ordena. El equivalente en moneda de pago sale de la proporción del
@@ -111,9 +122,10 @@ class ClientPendingService:
         Devuelve `(query, missing, since)` para que quien la use elija qué proyectar sin
         rearmar los joins.
 
-        El join con los comprobantes entrantes es INNER a propósito: es lo que implementa
-        «sólo debemos lo que ya nos pagaron». Cambiarlo a outer volvería a meter en la
-        deuda las operaciones que nadie ha pagado.
+        El filtro sobre los comprobantes entrantes es lo que implementa «sólo debemos lo
+        que ya nos pagaron». Quitarlo volvería a meter en la deuda las operaciones que nadie
+        ha pagado; el único que se libra es el par de efectivo, donde ese comprobante no
+        existe por definición.
         """
         settled = self._settled_subquery()
         paid = self._first_incoming_subquery()
@@ -124,21 +136,35 @@ class ClientPendingService:
             - func.coalesce(settled.c.delivered, 0)
             - func.coalesce(WhatsAppOperation.uncovered_amount, 0)
         )
-        # La antigüedad se mide desde que entró el dinero. El `coalesce` es defensivo: el
-        # join de abajo ya garantiza que hay comprobante, así que en la práctica manda
-        # `paid_at`.
+        # La antigüedad se mide desde que entró el dinero. En los pares de efectivo no hay
+        # comprobante del que sacarla, y ahí el `coalesce` sí trabaja: manda la fecha de la
+        # operación, que es lo mejor que existe.
         since = func.coalesce(paid.c.paid_at, WhatsAppOperation.created_at)
 
         q = (
             self.db.query(WhatsAppOperation)
             .join(CurrencyPair, CurrencyPair.id == WhatsAppOperation.currency_pair_id)
             .outerjoin(settled, settled.c.op_id == WhatsAppOperation.id)
-            .join(paid, paid.c.op_id == WhatsAppOperation.id)
+            .outerjoin(paid, paid.c.op_id == WhatsAppOperation.id)
             .filter(
                 WhatsAppOperation.status.in_(
                     [WhatsAppOperationStatus.PENDING, WhatsAppOperationStatus.QUOTED]
                 ),
                 missing > EPSILON,
+                # «Sólo debemos lo que ya nos pagaron», excepto en los pares de efectivo,
+                # donde el comprobante entrante no existe y exigirlo borraría el par entero.
+                #
+                # Ahí el comprobante deja de poder separar el trato hecho de la cotización
+                # abandonada, así que lo separa el estado: sólo PENDING. Una QUOTED de un par
+                # de efectivo no tiene NINGUNA evidencia de que pasara nada — en USD-VES son
+                # 106 cotizaciones muertas que se colarían como deuda.
+                or_(
+                    paid.c.paid_at.isnot(None),
+                    and_(
+                        CurrencyPair.settles_in_cash.is_(True),
+                        WhatsAppOperation.status == WhatsAppOperationStatus.PENDING,
+                    ),
+                ),
             )
         )
         if pair:
@@ -210,6 +236,9 @@ class ClientPendingService:
             result.setdefault(row.client_id, []).append(
                 {
                     "pair_symbol": cp.pair_symbol if cp else None,
+                    # En un par de efectivo esto no es lo que debemos sino lo que nos deben:
+                    # la pantalla necesita el dato para no rotularlo al revés.
+                    "settles_in_cash": bool(cp.settles_in_cash) if cp else False,
                     "currency": cp.from_currency.symbol if cp and cp.from_currency else None,
                     "amount": round(float(row.amount or 0), 2),
                     "operations": int(row.operations or 0),

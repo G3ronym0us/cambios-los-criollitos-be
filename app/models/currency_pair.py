@@ -57,6 +57,11 @@ class CurrencyPair(UUIDMixin, Base):
     # Pair type (base, derived, cross)
     pair_type = Column(SQLEnum(PairType), nullable=False, default=PairType.BASE)
 
+    # Se cambia en efectivo, mano a mano: en este par NO existe comprobante entrante y
+    # nunca lo habrá. Lo lee `ClientPendingService` para no exigirlo al decidir qué se debe;
+    # sin esto, un par como USD-VES desaparece entero de «por entregar».
+    settles_in_cash = Column(Boolean, default=False, nullable=False, server_default="false")
+
     # Configuration
     is_active = Column(Boolean, default=True, nullable=False)
     is_monitored = Column(Boolean, default=True, nullable=False)  # Para scraping automático
@@ -115,6 +120,7 @@ class CurrencyPair(UUIDMixin, Base):
             "display_name": self.display_name,
             "is_active": self.is_active,
             "is_monitored": self.is_monitored,
+            "settles_in_cash": self.settles_in_cash,
             "binance_tracked": self.binance_tracked,
             "banks_to_track": self.banks_to_track,
             "amount_to_track": float(self.amount_to_track) if self.amount_to_track else None,

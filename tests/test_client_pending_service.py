@@ -571,6 +571,37 @@ class TestParesDeEfectivo:
         db.commit()
         assert ClientPendingService(db).client_ids_with_pending() == [world["client"].id]
 
+    def test_se_entrega_sin_beneficiario(self, db, world, cash_pair):
+        """
+        El gesto está invertido: los bolívares ya salieron y lo que se marca es que el
+        CLIENTE pagó. A quién se le entregó lo dice el comprobante saliente, que ya cuelga
+        de la operación, así que el campo sobra. Exigirlo trababa 117 de las 120 filas de
+        USD-VES en producción con «Falta dato», y dejaba la cola sin usar.
+        """
+        op = make_op(
+            db, world["client"], cash_pair, amount=100, beneficiary=None, incoming_at=None
+        )
+        db.commit()
+
+        batch = ClientPendingService(db).deliver(
+            world["client"].uuid, [{"operation_uuid": str(op.uuid)}], None, world["actor"]
+        )
+
+        db.refresh(op)
+        assert op.uncovered_amount == 100
+        assert batch["operations"] == 1
+
+    def test_en_un_par_normal_el_beneficiario_se_sigue_exigiendo(self, db, world, cash_pair):
+        """La exención es del efectivo, no de todos: allí sí vamos a mandarle plata a alguien."""
+        op = make_op(db, world["client"], world["usd_ves"], amount=100, beneficiary=None)
+        db.commit()
+
+        with pytest.raises(QuoteServiceError) as exc:
+            ClientPendingService(db).deliver(
+                world["client"].uuid, [{"operation_uuid": str(op.uuid)}], None, world["actor"]
+            )
+        assert exc.value.code == "operation_without_beneficiary"
+
 
 class TestLoQueLlegaAlFront:
     """Lo que la operación serializa: sin esto la pantalla no puede aplicar la regla."""

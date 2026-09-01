@@ -346,7 +346,14 @@ class ClientPendingService:
                 )
             # Entregarle a alguien que no sabemos quién es no es entregar. La regla vive
             # acá y no sólo en el front: el front la usa para no ofrecerlas.
-            if not op.beneficiary_alias and op.beneficiary_account_id is None:
+            #
+            # **Salvo en los pares de efectivo**, donde el gesto está invertido: los bolívares
+            # ya salieron y lo que se registra es que el CLIENTE pagó. A quién se le entregó
+            # lo dice el comprobante saliente, que ya cuelga de la operación; el campo sobra.
+            # Exigirlo aquí trababa 117 de 120 filas de USD-VES con «Falta dato».
+            cp = op.currency_pair
+            en_efectivo = bool(cp.settles_in_cash) if cp else False
+            if not en_efectivo and not op.beneficiary_alias and op.beneficiary_account_id is None:
                 raise QuoteServiceError(
                     "operation_without_beneficiary",
                     f"La operación {op_uuid} no tiene beneficiario: falta el dato",

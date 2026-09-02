@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional, Sequence
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.whatsapp_operation import WhatsAppOperation, WhatsAppOperationScenario
@@ -63,6 +64,15 @@ FORWARDED_TOLERANCE = 0.001
 #: candidatas caen dentro de la ventana, el desempate por cédula/teléfono devuelve `None`
 #: antes que adivinar, así que el peor caso sigue siendo "no calza", nunca "calza mal".
 FORWARDED_WINDOW_MINUTES = 6 * 60
+
+#: Candidatas que puntúa una página de `POST /operations/match`. Es el mismo tope (500) que
+#: ya usaba `rank_for_payment` cuando cargaba SIEMPRE las últimas operaciones de todo el
+#: sistema; la diferencia es que ahora se aplica DESPUÉS del filtro (`phone`/`search`/
+#: `status`), no antes. Sin filtro (alcance "Ver todas") sigue siendo un recorte real de las
+#: más recientes — el mismo que ya asumía el front al pedir un lote global—; con `phone` casi
+#: nunca muerde: acota al historial de UN cliente, que en producción no ha pasado de unos
+#: pocos cientos de operaciones.
+MATCH_POOL_LIMIT = 500
 
 
 def receipt_fingerprint(text: Optional[str]) -> str:
@@ -219,6 +229,27 @@ class Suggestion:
     uuid: str
     #: Gana con claridad: el front puede preseleccionarla sin arriesgar un vínculo por inercia.
     confident: bool
+
+
+@dataclass
+class MatchPage:
+    """
+    Una página de `OperationMatchService.rank_for_payment`: candidatas YA filtradas, puntuadas
+    y ordenadas — lo que antes armaba el navegador cruzando dos peticiones (`GET /operations`
+    + `POST /operations/match`) y ordenando/recortando él mismo (`sortScored` /
+    `buildOperationQuery` en `LinkOperationPanel.tsx`).
+
+    `items` trae la operación real junto a su puntaje, no solo el uuid: así el router arma la
+    respuesta completa (lo que hoy pinta cada tarjeta del cajón) sin una segunda consulta.
+    """
+
+    items: list[tuple[WhatsAppOperation, MatchScore]]
+    suggestion: Optional[Suggestion]
+    #: Total tras el filtro — NO el tamaño de `MATCH_POOL_LIMIT` ni el de la página — para que
+    #: el pie del cajón pueda decir "26–50 de 312" igual que ya hace `GET /operations`.
+    total: int
+    page: int
+    limit: int
 
 
 # ---------------------------------------------------------------------------
@@ -556,15 +587,25 @@ class OperationMatchService:
         ]
         return [phone, *(f"anon:partner:{uid}" for uid in user_ids)]
 
-    def _load_operations(
+    def _operations_query(
         self,
         *,
         phone: Optional[str] = None,
+        search: Optional[str] = None,
         group_jid: Optional[str] = None,
         scenario: Optional[WhatsAppOperationScenario] = None,
         statuses: Optional[Sequence[str]] = None,
-        limit: int = 200,
-    ) -> list[OperationCandidate]:
+    ):
+        """
+        La consulta filtrada, SIN ordenar ni recortar — la comparten quien cuenta el total
+        (`_count_operations`) y quien carga el lote a puntuar (`_load_operation_models`), para
+        que "cuántas hay tras el filtro" y "cuáles se puntúan" nunca diverjan por tener cada
+        una su propia copia de los mismos `filter()`.
+
+        `search` es nuevo aquí: antes solo lo sabía `WhatsAppQuoteService.list_operations`
+        (`GET /operations`). El cajón de "vincular pago" ahora pide filtro Y puntuación al
+        mismo endpoint (`POST /operations/match`), así que tiene que poder buscar igual.
+        """
         from app.models.fund import FundGroup
         from app.models.whatsapp_client import WhatsAppClient
         from app.models.whatsapp_operation import WhatsAppOperationStatus
@@ -572,9 +613,19 @@ class OperationMatchService:
         q = self.db.query(WhatsAppOperation).options(
             selectinload(WhatsAppOperation.outgoing_payments)
         )
+        # El buscador cruza cliente (nombre o teléfono), así que el join tiene que existir
+        # aunque no haya `phone` — mismo criterio que `list_operations`.
+        if phone or search:
+            q = q.join(WhatsAppClient, WhatsAppClient.id == WhatsAppOperation.client_id)
         if phone:
-            q = q.join(WhatsAppClient).filter(
-                WhatsAppClient.phone.in_(self._client_phones_for(phone))
+            q = q.filter(WhatsAppClient.phone.in_(self._client_phones_for(phone)))
+        if search:
+            like = f"%{search.strip()}%"
+            q = q.filter(
+                or_(
+                    WhatsAppClient.display_name.ilike(like),
+                    WhatsAppClient.phone.ilike(like),
+                )
             )
         if scenario:
             q = q.filter(WhatsAppOperation.scenario == scenario)
@@ -591,11 +642,25 @@ class OperationMatchService:
                 .all()
             ]
             if not group_ids:
-                return []
+                return None
             q = q.filter(WhatsAppOperation.fund_group_id.in_(group_ids))
+        return q
 
-        ops = q.order_by(WhatsAppOperation.created_at.desc()).limit(limit).all()
-        return self._to_candidates(ops)
+    def _load_operation_models(self, *, limit: int = 200, **filters) -> list[WhatsAppOperation]:
+        q = self._operations_query(**filters)
+        if q is None:
+            return []
+        return q.order_by(WhatsAppOperation.created_at.desc()).limit(limit).all()
+
+    def _count_operations(self, **filters) -> int:
+        """Total tras el filtro, SIN el tope de `limit` — lo que necesita el pie de página."""
+        q = self._operations_query(**filters)
+        if q is None:
+            return 0
+        return q.order_by(None).count()
+
+    def _load_operations(self, *, limit: int = 200, **filters) -> list[OperationCandidate]:
+        return self._to_candidates(self._load_operation_models(limit=limit, **filters))
 
     def _to_candidates(self, ops: Sequence[WhatsAppOperation]) -> list[OperationCandidate]:
         op_ids = [o.id for o in ops]
@@ -687,15 +752,34 @@ class OperationMatchService:
     # -- Política del front -----------------------------------------------
 
     def rank_for_payment(
-        self, payment_id: int, table: str, *, limit: int = 500
-    ) -> tuple[list[MatchScore], Optional[Suggestion]]:
-        """Puntúa las operaciones recientes contra un comprobante ya guardado."""
+        self,
+        payment_id: int,
+        table: str,
+        *,
+        phone: Optional[str] = None,
+        search: Optional[str] = None,
+        status: Optional[str] = None,
+        order_by: str = "suggested",
+        page: int = 1,
+        limit: int = 200,
+    ) -> MatchPage:
+        """
+        Una página de operaciones YA filtradas, puntuadas contra el comprobante y ordenadas
+        según `order_by` — lo que antes resolvía el navegador sobre un lote sin filtrar
+        (`sortScored` + `buildOperationQuery` en `LinkOperationPanel.tsx`).
+
+        Los filtros son LOS MISMOS que `GET /operations` (`phone`, `search`, `status`) a
+        propósito: es la misma pregunta —"qué operaciones ve el operador en el cajón de
+        vincular"— con una columna más (la puntuación contra este comprobante). Así el cajón
+        vive de UN solo endpoint: ya no hace falta pedir el listado y el ranking por separado
+        y cruzarlos por uuid en el cliente.
+        """
         model = (
             WhatsAppIncomingPayment if table == "incoming" else WhatsAppOutgoingPayment
         )
         payment = self.db.query(model).filter(model.id == payment_id).first()
         if payment is None:
-            return [], None
+            return MatchPage(items=[], suggestion=None, total=0, page=page, limit=limit)
 
         criteria = OutgoingCriteria(
             amount=payment.amount,
@@ -705,10 +789,75 @@ class OperationMatchService:
             bank_to=payment.bank_to,
             created_at=_aware(payment.created_at),
         )
-        candidates = self._load_operations(limit=limit)
+        filters = dict(phone=phone, search=search, statuses=[status] if status else None)
+
+        # El total cuenta sobre TODO lo que cumple el filtro, sin el tope de seguridad de
+        # `MATCH_POOL_LIMIT`: el pie del cajón no debe decir "26 de 200" solo porque el
+        # ranking no puntúa más de 500 candidatas de una sentada (ver la nota de
+        # `MATCH_POOL_LIMIT` sobre cuándo ese tope sí muerde).
+        total = self._count_operations(**filters)
+
+        ops = self._load_operation_models(limit=MATCH_POOL_LIMIT, **filters)
+        candidates = self._to_candidates(ops)
+        by_uuid_op = {str(o.uuid): o for o in ops}
+        by_uuid_cand = {c.uuid: c for c in candidates}
+
         now = datetime.now(timezone.utc)
         scored = rank_candidates(candidates, criteria, table, now)
-        return scored, pick_suggestion(scored)
+        suggestion = pick_suggestion(scored)
+        ordered = self._order_scores(scored, order_by, suggestion, by_uuid_cand)
+
+        start = max(0, (page - 1) * limit)
+        page_scores = ordered[start : start + limit]
+        items = [(by_uuid_op[s.uuid], s) for s in page_scores]
+        return MatchPage(items=items, suggestion=suggestion, total=total, page=page, limit=limit)
+
+    @staticmethod
+    def _order_scores(
+        scored: Sequence[MatchScore],
+        order_by: str,
+        suggestion: Optional[Suggestion],
+        by_uuid_cand: dict,
+    ) -> list[MatchScore]:
+        """
+        Los tres botones del cajón ("sugerida" / "monto" / "hora"), ahora resueltos aquí en
+        vez de en `sortScored` (front). `scored` ya viene de `rank_candidates` ordenado por
+        (-score, -created_at desc); ese orden se reutiliza tal cual para "sugerida".
+        """
+        epoch = datetime.min.replace(tzinfo=timezone.utc)
+
+        def created_at(s: MatchScore) -> datetime:
+            cand = by_uuid_cand.get(s.uuid)
+            return cand.created_at if cand and cand.created_at else epoch
+
+        if order_by == "time":
+            # "hora": recencia pura, sin mirar el comprobante — el orden que había antes de
+            # que existiera la puntuación.
+            return sorted(scored, key=created_at, reverse=True)
+
+        if order_by == "amount":
+            # "monto": cercanía relativa al comprobante (`score.relative`, igual que leía el
+            # front). Sin comparación posible (`relative` None) al final; empate por
+            # recencia, el mismo desempate que usaba `sortScored`.
+            return sorted(
+                scored,
+                key=lambda s: (
+                    s.relative if s.relative is not None else float("inf"),
+                    -created_at(s).timestamp(),
+                ),
+            )
+
+        # "suggested" (default): el orden de `scored` ya es por puntaje combinado, pero la
+        # sugerida se sube al frente si no encabezaba — puede no hacerlo, porque
+        # `pick_suggestion` solo compite ENTRE las candidatas dentro de tolerancia, mientras
+        # que `rank_candidates` no distingue eso al ordenar (ver el test de este módulo que lo
+        # fuerza). Es exactamente lo que hacía `sortScored` en el front con `suggestionUuid`.
+        ordered = list(scored)
+        if suggestion is not None:
+            idx = next((i for i, s in enumerate(ordered) if s.uuid == suggestion.uuid), -1)
+            if idx > 0:
+                ordered.insert(0, ordered.pop(idx))
+        return ordered
 
     def suggest_for_payments(
         self, payment_ids: Sequence[int], table: str, *, limit: int = 500

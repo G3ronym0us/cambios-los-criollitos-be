@@ -4,6 +4,7 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from app.schemas.whatsapp import WhatsAppOperationResponse
 from app.services.operation_match_service import DEFAULT_WINDOW_HOURS, FORWARDED_WINDOW_MINUTES
 
 
@@ -60,9 +61,27 @@ class ForwardedMatchResponse(BaseModel):
 
 
 class OperationRankRequest(BaseModel):
+    """
+    El cajón de "vincular pago" en UNA sola petición: los mismos filtros de `GET /operations`
+    (`phone`, `search`, `status`, `page`, `limit`) más `order_by`, que reemplaza a los tres
+    botones que hoy ordenan en el navegador ("sugerida" / "monto" / "hora" en
+    `LinkOperationPanel.tsx`). Antes el front pedía el listado aparte y cruzaba por uuid con
+    lo que devolvía este endpoint; ahora la respuesta ya trae la operación completa.
+    """
+
     payment_id: int
     table: str = Field(..., pattern="^(incoming|outgoing)$")
-    limit: int = Field(500, ge=1, le=500)
+    #: Igual que `GET /operations`: sin `phone` ni `search` el alcance es todo el sistema
+    #: (recortado por `MATCH_POOL_LIMIT`, ver operation_match_service.py).
+    phone: Optional[str] = None
+    search: Optional[str] = None
+    status: Optional[str] = None
+    #: suggested (score combinado, con la sugerida al frente) | amount (cercanía al monto,
+    #: `score.relative`) | time (fecha descendente). "suggested" es lo que pintaba el front
+    #: por defecto.
+    order_by: str = Field("suggested", pattern="^(suggested|amount|time)$")
+    page: int = Field(1, ge=1)
+    limit: int = Field(200, ge=1, le=500)
 
 
 class OperationScoreResponse(BaseModel):
@@ -82,9 +101,22 @@ class SuggestionResponse(BaseModel):
     confident: bool
 
 
+class OperationMatchItem(BaseModel):
+    """Una candidata lista para pintar: la operación entera junto a su puntaje contra este
+    comprobante — ya no hace falta pedir `GET /operations` aparte y cruzar por `uuid`."""
+
+    operation: WhatsAppOperationResponse
+    score: OperationScoreResponse
+
+
 class OperationRankResponse(BaseModel):
     suggestion: Optional[SuggestionResponse] = None
-    candidates: list[OperationScoreResponse]
+    items: list[OperationMatchItem]
+    #: Total tras el filtro (no el tamaño de la página) — para el pie del cajón, igual que en
+    #: `WhatsAppOperationList`.
+    total: int
+    page: int
+    limit: int
 
 
 class PaymentSuggestionsRequest(BaseModel):

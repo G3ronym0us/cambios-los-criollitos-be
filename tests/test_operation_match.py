@@ -443,19 +443,23 @@ def test_service_ranks_a_real_payment_against_real_operations(db, fund, client, 
     out = f.outgoing(db, 1005.44, "BRL")
     db.flush()
 
-    scored, suggestion = OperationMatchService(db).rank_for_payment(out.id, "outgoing")
+    result = OperationMatchService(db).rank_for_payment(out.id, "outgoing")
 
-    assert scored, "el servicio debe devolver candidatas desde la BD"
-    assert suggestion is not None
-    assert str(suggestion.uuid) == str(created["uuid"])
-    assert suggestion.confident
+    assert result.items, "el servicio debe devolver candidatas desde la BD"
+    assert result.total == len(result.items)
+    assert result.suggestion is not None
+    assert str(result.suggestion.uuid) == str(created["uuid"])
+    assert result.suggestion.confident
+    # La sugerida encabeza la página en el orden por defecto ("suggested").
+    top_op, _ = result.items[0]
+    assert str(top_op.uuid) == str(created["uuid"])
 
 
 def test_service_returns_nothing_for_an_unknown_payment(db):
     from app.services.operation_match_service import OperationMatchService
 
-    scored, suggestion = OperationMatchService(db).rank_for_payment(999_999, "outgoing")
-    assert scored == [] and suggestion is None
+    result = OperationMatchService(db).rank_for_payment(999_999, "outgoing")
+    assert result.items == [] and result.suggestion is None and result.total == 0
 
 
 def test_service_auto_match_finds_the_operation_by_client_phone(db, fund, client, operator):
@@ -580,10 +584,10 @@ def test_an_operation_born_from_a_partial_payout_still_suggests_itself_to_its_si
     # El segundo pago móvil cubre justo el pendiente prorrateado (315.000 × 276,97/350).
     segundo = f.outgoing(db, 250_000, "VES", phone="584148861273")
     db.flush()
-    scored, suggestion = OperationMatchService(db).rank_for_payment(segundo.id, "outgoing")
+    result = OperationMatchService(db).rank_for_payment(segundo.id, "outgoing")
 
-    assert suggestion is not None, "la op con saldo pendiente tiene que aparecer entre las sugeridas"
-    assert str(suggestion.uuid) == str(op["uuid"])
+    assert result.suggestion is not None, "la op con saldo pendiente tiene que aparecer entre las sugeridas"
+    assert str(result.suggestion.uuid) == str(op["uuid"])
 
 
 def test_an_operation_paid_in_full_by_one_receipt_is_settled_whole(db, fund, client, operator):

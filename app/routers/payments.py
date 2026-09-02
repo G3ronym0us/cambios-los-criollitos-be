@@ -6,7 +6,8 @@ bajo `/payments/{table}` — sin el prefijo `whatsapp`. Solo lectura: la captura
 de comprobantes (OCR) y el matching los hace el bot vía `/whatsapp/payments/*`
 (X-Bot-Token). Reusa WhatsAppPaymentService.
 
-- incoming = pagos que el cliente reporta haber enviado.
+- incoming = pagos que el cliente reporta haber enviado (también puede marcarse
+  irrelevante: un comprobante que llegó al chat sin ser en realidad un pago al negocio).
 - outgoing = pagos que el operador emite (con flags personal/irrelevante y
   posible cadena source_payment_id desde un incoming).
 """
@@ -441,17 +442,24 @@ async def mark_personal_expense(
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
 
-@router.patch("/outgoing/{payment_id}/irrelevant")
+@router.patch("/{table}/{payment_id}/irrelevant")
 async def mark_irrelevant(
+    table: Literal["incoming", "outgoing"],
     payment_id: int,
     payload: WhatsAppIrrelevant,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Marca/desmarca un pago saliente como irrelevante (auto-desvincula la op). Operador JWT."""
+    """
+    Marca/desmarca un pago como irrelevante (auto-desvincula la op). Operador JWT.
+
+    En saliente es dinero nuestro que salió por algo que no es un cambio; en entrante es un
+    comprobante que llegó al chat sin ser en realidad un pago al negocio (duplicado, ajeno).
+    """
     service = WhatsAppPaymentService(db)
     try:
         return service.set_irrelevant(
+            table,
             payment_id,
             payload.is_irrelevant,
             payload.irrelevant_description,

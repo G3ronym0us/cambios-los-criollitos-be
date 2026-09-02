@@ -25,10 +25,12 @@ from app.models.whatsapp_operation import (
     WhatsAppAmountSide,
     WhatsAppDeliveryStatus,
     WhatsAppOperation,
+    WhatsAppOperationScenario,
     WhatsAppOperationStatus,
 )
 from app.models.fund import (
     FundGroup,
+    FundGroupMember,
     FundMovement,
     FundMovementType,
     FundPendingDeposit,
@@ -2059,6 +2061,76 @@ class WhatsAppPaymentService:
             )
             op.fund_group_out_id = group.id if group else None
 
+    def _sole_fund_partner(self, fund_group_id: Optional[int]) -> Optional[User]:
+        """
+        El socio de un fondo (Jean en Zelle/Paypal, Dionis en Cambios Colombia...): el
+        miembro con `FundGroupMember.whatsapp_phone` seteado, que es la columna que el
+        propio modelo ya documenta como "el socio" y que `resolve_fund_channel` usa para
+        reconocer sus mensajes directos (escenario VIA_PARTNER).
+
+        No sirve `is_fund_manager`: el operador (Diohandres) también queda marcado como
+        gestor de su propio fondo (ver `app/cli/seed_fund_movements.py`), así que ese campo
+        NO distingue al socio del operador — sólo `whatsapp_phone` sí, porque se llena
+        nada más que para el socio con canal propio.
+
+        Cero candidatos (fondo con un único miembro, o ninguno con teléfono propio) o más
+        de uno (varios socios posibles) es "no sé": adivinar mal le atribuye la ganancia de
+        la operación a quien no gestionó el cambio, así que no se elige nadie.
+        """
+        if fund_group_id is None:
+            return None
+        candidates = (
+            self.db.query(FundGroupMember)
+            .filter(
+                FundGroupMember.group_id == fund_group_id,
+                FundGroupMember.is_fund_manager.is_(True),
+                FundGroupMember.whatsapp_phone.isnot(None),
+            )
+            .all()
+        )
+        if len(candidates) != 1:
+            return None
+        return candidates[0].user
+
+    def _resolve_scenario_for_new_op(self, op: WhatsAppOperation, table: str) -> None:
+        """
+        Clasifica por defecto el escenario (y el receptor del entrante) de una op que nace
+        de un comprobante. Mismo patrón que `_resolve_fund_legs_for_new_op`: corre UNA vez,
+        al nacer la operación, y sólo rellena lo que el caller dejó en blanco — nunca pisa
+        un escenario o receptor que ya vinieron puestos (a mano, o heredados del payload).
+
+        El negocio (ver CLAUDE.md, "Quién manda qué al grupo de WhatsApp"): todos los
+        comprobantes al grupo los sube Diohandres, el operador — quién los sube no es
+        señal de nada. Lo que distingue es el CONTENIDO, que acá es justo lo que dice
+        `table`:
+          - Captura ENTRANTE (`table == "incoming"`): el cliente se la mandó directo a
+            Diohandres. ZELLE_DIRECT, sin receptor (NULL = operador, como documenta el
+            modelo).
+          - Comprobante SALIENTE (`table == "outgoing"`): como el socio cobra al cliente
+            en su propio WhatsApp, el entrante nunca llega al operador — la operación nace
+            directo del saliente. VIA_PARTNER, con `received_by_user_id` = el socio del
+            fondo, sólo si hay exactamente uno identificable.
+        """
+        if op.scenario != WhatsAppOperationScenario.NORMAL or op.received_by_user_id is not None:
+            return
+        cp = op.currency_pair
+        if cp is None or cp.settles_in_cash:
+            # Los pares en efectivo (USD-VES) se pagan en mano, directo con Diohandres: no
+            # hay socio de por medio aunque el par comparta fondo con Zelle/Paypal por
+            # moneda (ver CLAUDE.md, "Los pares que se cambian en efectivo").
+            return
+        if op.fund_group_id is None:
+            # Sin fondo detrás no hay grupo ni socio de qué hablar: queda NORMAL, el
+            # default histórico de "cliente <-> operador, sin grupo".
+            return
+        if table == "incoming":
+            op.scenario = WhatsAppOperationScenario.ZELLE_DIRECT
+        elif table == "outgoing":
+            partner = self._sole_fund_partner(op.fund_group_id)
+            if partner is not None:
+                op.scenario = WhatsAppOperationScenario.VIA_PARTNER
+                op.received_by_user_id = partner.id
+
     def _trim_settlements_to_value(self, op: WhatsAppOperation, value: float) -> None:
         """
         Recorta cuánto cubren los salientes cuando el valor baja por debajo de lo entregado:
@@ -2807,6 +2879,9 @@ class WhatsAppPaymentService:
         # La op nace con los dos fondos resueltos por moneda; lo que ya vino puesto (el
         # entrante explícito o el heredado del comprobante) no se toca.
         self._resolve_fund_legs_for_new_op(op)
+        # Y con el escenario/receptor por defecto que el CONTENIDO del comprobante ya
+        # delata (entrante vs. saliente) — también sólo relleno, nunca pisa lo puesto a mano.
+        self._resolve_scenario_for_new_op(op, table)
         self.db.flush()
         row.whatsapp_operation_id = op.id
         # El entrante estrena su parte del reparto: lo que pide la op, y si el comprobante

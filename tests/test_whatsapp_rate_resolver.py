@@ -227,6 +227,51 @@ class TestInverseFallbackCorrectness:
         assert got_via_inverse == pytest.approx(amount * 36.5)
 
 
+class TestConvencionDeProduccion:
+    """
+    La forma REAL en que producción guarda las tasas, que no es la de los otros fixtures.
+
+    Medido el 2026-09-02 en la base de producción:
+
+        USDT→VES   rate=960  inverse=False   →  VES = USDT × 960
+        VES→USDT   rate=967  inverse=True    →  USDT = VES / 967
+
+    Las dos filas llevan la MISMA magnitud —«VES por USDT»— y lo único que cambia es el
+    flag, que decide multiplicar o dividir. Eso es justo lo que hace que derivar un sentido
+    del otro tenga que conservar la tasa y voltear sólo el flag; el código roto producía
+    `1/967` con el flag volteado, que es dos veces la recíproca.
+
+    Los demás fixtures del fichero guardan `VES→USDT` con `inverse=False` y la tasa ya
+    invertida (1/36.5). La aritmética sale igual porque el resolver es agnóstico, pero no
+    retrata la convención real, así que este caso la fija aparte.
+    """
+
+    def test_la_fila_inversa_de_produccion_se_lee_bien(self, db_session):
+        # Sólo VES→USDT cargada, tal cual la guarda producción.
+        _add_rate(db_session, "VES", "USDT", 967.0, inverse=True)
+        r = WhatsAppRateResolver(db_session)
+
+        entry = r.get_rate_entry_for_pair("USDT", "VES")
+        assert entry is not None
+        # Se conserva la magnitud y se voltea el flag: NO 1/967.
+        assert entry.rate == pytest.approx(967.0)
+        assert entry.inverse_percentage is False
+        # Y lo que importa: 1 USDT son 967 VES, no 0,00103.
+        assert WhatsAppRateResolver.apply_rate(1.0, entry.rate, entry.inverse_percentage) == pytest.approx(967.0)
+
+    def test_los_dos_sentidos_reales_coinciden(self, db_session):
+        """
+        Con las dos filas de producción cargadas, ir por el directo o por el inverso tiene
+        que dar lo mismo. Es la propiedad que el bug rompía.
+        """
+        _add_rate(db_session, "USDT", "VES", 960.0)
+        r = WhatsAppRateResolver(db_session)
+        directo = r.get_rate_entry_for_pair("USDT", "VES")
+        assert directo is not None
+        ves_por_usdt = WhatsAppRateResolver.apply_rate(1.0, directo.rate, directo.inverse_percentage)
+        assert ves_por_usdt == pytest.approx(960.0)
+
+
 class TestRealAffectedPairs:
     """
     Los dos pares que HOY en producción sólo tienen tasa activa en un sentido, así que

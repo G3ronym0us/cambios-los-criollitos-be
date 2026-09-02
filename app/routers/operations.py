@@ -36,6 +36,7 @@ from app.schemas.whatsapp import (
     WhatsAppStatsResponse,
 )
 from app.schemas.operation_match import (
+    OperationMatchItem,
     OperationRankRequest,
     OperationRankResponse,
     OperationScoreResponse,
@@ -94,9 +95,24 @@ async def list_operations(
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
-    # Marca qué operaciones ya tienen un pago entrante/saliente vinculado, para que el
-    # selector de "vincular pago" pueda ocultar las que ya están tomadas de ese lado.
-    op_ids = [op.id for op in ops]
+    inc_taken, out_taken = _payment_link_flags(db, [op.id for op in ops])
+    items = []
+    for op in ops:
+        d = op.dict()
+        d["has_incoming_payment"] = op.id in inc_taken
+        d["has_outgoing_payment"] = op.id in out_taken
+        items.append(WhatsAppOperationResponse.model_validate(d))
+    return WhatsAppOperationList(operations=items, total=total, page=page, limit=limit)
+
+
+def _payment_link_flags(db: Session, op_ids: list[int]) -> tuple[set[int], set[int]]:
+    """
+    Qué operaciones de este lote ya tienen un pago entrante/saliente vinculado.
+
+    Lo comparten `list_operations` (para que el listado pueda ocultarlas) y `/match` (para
+    que el cajón de "vincular pago" sepa qué candidatas ya están tomadas de ese lado) — antes
+    era el mismo bloque copiado en el primero; aquí se factoriza en vez de repetirlo.
+    """
     inc_taken: set[int] = set()
     out_taken: set[int] = set()
     if op_ids:
@@ -108,14 +124,7 @@ async def list_operations(
             r[0] for r in db.query(WhatsAppOutgoingPayment.whatsapp_operation_id)
             .filter(WhatsAppOutgoingPayment.whatsapp_operation_id.in_(op_ids)).distinct().all()
         }
-
-    items = []
-    for op in ops:
-        d = op.dict()
-        d["has_incoming_payment"] = op.id in inc_taken
-        d["has_outgoing_payment"] = op.id in out_taken
-        items.append(WhatsAppOperationResponse.model_validate(d))
-    return WhatsAppOperationList(operations=items, total=total, page=page, limit=limit)
+    return inc_taken, out_taken
 
 
 @router.post("/match", response_model=OperationRankResponse)
@@ -125,22 +134,55 @@ async def rank_operations_for_payment(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Puntúa las operaciones recientes contra un comprobante, para que el selector de "vincular
-    pago" las ordene y marque la más probable. Misma implementación que usa el matcher
-    automático del bot (`app/services/operation_match_service.py`), con la política del
-    operador: aquí se sugiere y él confirma, así que es más permisiva que la del bot.
+    Filtra, puntúa contra el comprobante y ordena en un solo viaje: el cajón de "vincular
+    pago" ya no pide `GET /operations` aparte y cruza por `uuid` con lo que devolvía este
+    endpoint — los filtros (`phone`/`search`/`status`/`page`/`limit`) son los mismos que
+    `GET /operations`, y `order_by` reemplaza a los tres botones que antes ordenaban en el
+    navegador ("sugerida" / "monto" / "hora", `sortScored` en `LinkOperationPanel.tsx`).
+
+    La puntuación es la misma implementación que usa el matcher automático del bot
+    (`app/services/operation_match_service.py`), con la política del operador: aquí se
+    sugiere y él confirma, así que es más permisiva que la del bot.
     """
     service = OperationMatchService(db)
-    scored, suggestion = service.rank_for_payment(
-        payload.payment_id, payload.table, limit=payload.limit
+    result = service.rank_for_payment(
+        payload.payment_id,
+        payload.table,
+        phone=payload.phone,
+        search=payload.search,
+        status=payload.status,
+        order_by=payload.order_by,
+        page=payload.page,
+        limit=payload.limit,
     )
+
+    inc_taken, out_taken = _payment_link_flags(db, [op.id for op, _ in result.items])
+    items = []
+    for op, score in result.items:
+        d = op.dict()
+        d["has_incoming_payment"] = op.id in inc_taken
+        d["has_outgoing_payment"] = op.id in out_taken
+        items.append(
+            OperationMatchItem(
+                operation=WhatsAppOperationResponse.model_validate(d),
+                score=OperationScoreResponse(**vars(score)),
+            )
+        )
+
     return OperationRankResponse(
         suggestion=(
-            SuggestionResponse(uuid=suggestion.uuid, confident=suggestion.confident)
-            if suggestion
+            SuggestionResponse(uuid=result.suggestion.uuid, confident=result.suggestion.confident)
+            if result.suggestion
             else None
         ),
-        candidates=[OperationScoreResponse(**vars(s)) for s in scored],
+        items=items,
+        total=result.total,
+        page=result.page,
+        limit=result.limit,
+        # En desuso: el front desplegado hace `match?.candidates ?? []`. Mientras conviva con
+        # el nuevo —el backend recarga al instante y Vercel tarda minutos— sin esto perdería
+        # el sello «SUGERIDA» y el orden por monto sin dar un solo error.
+        candidates=[item.score for item in items],
     )
 
 

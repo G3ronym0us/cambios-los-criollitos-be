@@ -15,6 +15,7 @@ class WhatsAppClientUpsert(BaseModel):
     is_tracked: Optional[bool] = None
     is_blocked: Optional[bool] = None
     is_usdt_authorized: Optional[bool] = None
+    is_rate_setter: Optional[bool] = None
     default_payment_info: Optional[str] = None
     default_payment_currency: Optional[str] = None
 
@@ -32,6 +33,7 @@ class WhatsAppClientResponse(BaseModel):
     is_tracked: bool
     is_blocked: bool
     is_usdt_authorized: bool
+    is_rate_setter: bool = False
     default_payment_info: Optional[str] = None
     default_payment_currency: Optional[str] = None
     last_seen_at: Optional[datetime] = None

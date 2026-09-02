@@ -250,3 +250,45 @@ def test_match_endpoint_returns_operations_with_scores_paginated(db, fund, pairs
     assert item["operation"]["uuid"] == str(op_a.uuid)
     assert item["operation"]["from_amount"] == pytest.approx(100.0)
     assert item["score"]["within_tolerance"] is True
+
+
+def test_el_contrato_viejo_sigue_respondido(db, fund, pairs, operator):
+    """
+    `candidates` sigue poblado aunque ya nadie deba usarlo.
+
+    El front que está en producción hace `match?.candidates ?? []`. Si el endpoint deja de
+    mandarlo mientras ese front sigue vivo —y sigue vivo durante todo el despliegue, porque
+    el backend recarga al instante y Vercel tarda minutos— se queda sin el sello «SUGERIDA»
+    y sin el orden por monto **en silencio**: una lista vacía no da error.
+
+    Se borran el campo y este test cuando el front nuevo esté desplegado en todas partes.
+    """
+    from app.core.dependencies import get_current_user
+    from app.database.connection import get_db
+    from app.main import app
+    from starlette.testclient import TestClient
+
+    svc = WhatsAppPaymentService(db)
+    phone = "584140000031"
+    _make_op(svc, db, phone=phone, to_amount=1000.0, created_at=NOW, operator=operator)
+    _make_op(svc, db, phone=phone, to_amount=2000.0, created_at=NOW, operator=operator)
+    pago = _outgoing_payment(db, phone=phone, amount=1000.0, created_at=NOW)
+    db.flush()
+
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: operator
+    try:
+        with TestClient(app, raise_server_exceptions=False) as api:
+            r = api.post(
+                "/operations/match",
+                json={"payment_id": pago.id, "table": "outgoing", "phone": phone},
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["candidates"], "el alias en desuso no puede llegar vacío"
+    # Y tiene que decir lo mismo que `items`, en el mismo orden: si divergen, el front viejo
+    # y el nuevo pintarían cosas distintas sobre la misma respuesta.
+    assert [c["uuid"] for c in body["candidates"]] == [i["score"]["uuid"] for i in body["items"]]

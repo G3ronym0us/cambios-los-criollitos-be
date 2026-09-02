@@ -117,6 +117,12 @@ class OperationRankResponse(BaseModel):
     total: int
     page: int
     limit: int
+    #: **En desuso.** Las puntuaciones sueltas que devolvía este endpoint antes de traer la
+    #: operación entera dentro de `items`. Se mantiene poblado sólo para no romper el front
+    #: que ya está en producción, que hace `match?.candidates ?? []` y, sin esto, se quedaría
+    #: sin el sello «SUGERIDA» y sin el orden por monto — en silencio, porque la lista vacía
+    #: no da error. Se borra cuando el front nuevo esté desplegado en todas partes.
+    candidates: list[OperationScoreResponse] = Field(default_factory=list)
 
 
 class PaymentSuggestionsRequest(BaseModel):

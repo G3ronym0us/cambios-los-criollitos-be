@@ -179,6 +179,10 @@ async def rank_operations_for_payment(
         total=result.total,
         page=result.page,
         limit=result.limit,
+        # En desuso: el front desplegado hace `match?.candidates ?? []`. Mientras conviva con
+        # el nuevo —el backend recarga al instante y Vercel tarda minutos— sin esto perdería
+        # el sello «SUGERIDA» y el orden por monto sin dar un solo error.
+        candidates=[item.score for item in items],
     )
 
 

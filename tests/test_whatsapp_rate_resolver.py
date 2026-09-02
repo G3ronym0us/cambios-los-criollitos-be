@@ -123,13 +123,22 @@ class TestResolverDirect:
         assert entry.inverse_percentage is False
 
     def test_inverse_lookup(self, db_session):
-        # Solo cargamos VES->USDT; al pedir USDT->VES debe invertir
+        # Solo cargamos VES->USDT; al pedir USDT->VES debe voltear el flag, NO la tasa.
+        # VES->USDT con rate=1/36.5, inverse=False significa: USDT = VES * (1/36.5)
+        # (36.5 VES * 1/36.5 = 1 USDT). Leído al revés (USDT->VES) es la MISMA tasa
+        # con el flag volteado a True: USDT / (1/36.5) = USDT * 36.5 = VES. Antes del
+        # fix esta rama invertía también la tasa (rate=1/(1/36.5)=36.5), lo que hacía
+        # que USDT->VES aplicara `amount / 36.5` en vez de `amount * 36.5` — este mismo
+        # test daba por buena esa conducta rota afirmando entry.rate == 36.5.
         _add_rate(db_session, "VES", "USDT", 1 / 36.5)
         r = WhatsAppRateResolver(db_session)
         entry = r.get_rate_entry_for_pair("USDT", "VES")
         assert entry is not None
-        assert entry.rate == pytest.approx(36.5)
+        assert entry.rate == pytest.approx(1 / 36.5)
         assert entry.inverse_percentage is True  # flag se invierte
+        # La propiedad que hace obvio el bug: aplicar la entry inversa a 1 USDT
+        # debe dar lo mismo que el par directo real (1 USDT = 36.5 VES).
+        assert WhatsAppRateResolver.apply_rate(1.0, entry.rate, entry.inverse_percentage) == pytest.approx(36.5)
 
     def test_no_rate_available(self, db_session):
         r = WhatsAppRateResolver(db_session)
@@ -151,6 +160,101 @@ class TestResolverCross:
         # No debe activar bridge si uno ya es USDT
         r = WhatsAppRateResolver(db_session)
         assert r.get_rate_entry_for_pair("USDT", "COP") is None
+
+    def test_cross_via_usdt_with_one_leg_only_inverse(self, db_session):
+        """
+        Puente USD -> USDT -> VES donde la pata USD->USDT NO está cargada directa,
+        sólo su inverso (USDT->USD) — exactamente el escenario que dispara el bug de
+        `_get_direct_entry` dentro de una de las patas del cruce.
+        """
+        _add_rate(db_session, "USDT", "USD", 0.98)  # sólo USDT->USD; USD->USDT cae al fallback
+        _add_rate(db_session, "USDT", "VES", 36.0)
+        r = WhatsAppRateResolver(db_session)
+        entry = r.get_rate_entry_for_pair("USD", "VES")
+        assert entry is not None
+        # leg1 (USD->USDT, vía fallback del inverso): 1 USD / 0.98 = 1.020408... USDT
+        # leg2 (USDT->VES, directo): * 36.0
+        # Con el bug (rate invertido dos veces en leg1) esto daba 0.98 * 36 = 35.28
+        # en vez de (1/0.98) * 36 ≈ 36.7347 — casi un 4% de diferencia, silenciosa.
+        assert entry.rate == pytest.approx((1.0 / 0.98) * 36.0)
+        assert entry.rate != pytest.approx(0.98 * 36.0)  # eso sería el resultado del bug
+
+
+class TestInverseFallbackCorrectness:
+    """
+    Casos centrados en el bug de reciprocidad doble en `_get_direct_entry`: cuando un
+    par sólo está cargado en el sentido inverso al pedido, la entrada resuelta debe
+    voltear únicamente el flag `inverse_percentage`, conservando `rate`/`base_rate`
+    tal cual — no aplicar la recíproca otra vez.
+    """
+
+    def test_inverse_only_pair_resolves_to_the_correct_numeric_rate(self, db_session):
+        # Sólo VES->USDT cargado (1 USDT = 36.5 VES → VES->USDT rate = 1/36.5).
+        _add_rate(db_session, "VES", "USDT", 1 / 36.5, percentage=8.0)
+        entry = WhatsAppRateResolver(db_session).get_rate_entry_for_pair("USDT", "VES")
+        assert entry is not None
+        # `rate` NO se invierte: sigue siendo 1/36.5, sólo cambia el flag.
+        assert entry.rate == pytest.approx(1 / 36.5)
+        assert entry.inverse_percentage is True
+        assert entry.base_percentage == 8.0
+        # 1 USDT debe rendir 36.5 VES (aplicando la entry resuelta), no 36.5² ni 1/36.5².
+        assert WhatsAppRateResolver.apply_rate(1.0, entry.rate, entry.inverse_percentage) == pytest.approx(36.5)
+
+    def test_inverse_fallback_matches_the_direct_pair_when_both_exist(self, db_session):
+        """
+        La propiedad que hace obvio el bug: resolver un par SÓLO por su inverso debe dar
+        exactamente el mismo resultado numérico que resolverlo cuando el par directo sí
+        está cargado (misma tasa de negocio, mismo día).
+        """
+        # Sesión de la fixture: sólo el inverso.
+        _add_rate(db_session, "VES", "USDT", 1 / 36.5)
+        via_inverse = WhatsAppRateResolver(db_session).get_rate_entry_for_pair("USDT", "VES")
+        assert via_inverse is not None
+
+        # Sesión aparte con el par cargado directo, para comparar.
+        engine2 = create_engine("sqlite:///:memory:")
+        TestBase.metadata.create_all(engine2)
+        session2 = sessionmaker(bind=engine2)()
+        _add_rate(session2, "USDT", "VES", 36.5)
+        via_direct = WhatsAppRateResolver(session2).get_rate_entry_for_pair("USDT", "VES")
+        session2.close()
+        assert via_direct is not None
+
+        amount = 250.0
+        got_via_inverse = WhatsAppRateResolver.apply_rate(amount, via_inverse.rate, via_inverse.inverse_percentage)
+        got_via_direct = WhatsAppRateResolver.apply_rate(amount, via_direct.rate, via_direct.inverse_percentage)
+        assert got_via_inverse == pytest.approx(got_via_direct)
+        assert got_via_inverse == pytest.approx(amount * 36.5)
+
+
+class TestRealAffectedPairs:
+    """
+    Los dos pares que HOY en producción sólo tienen tasa activa en un sentido, así que
+    el sentido contrario pasa obligatoriamente por el fallback de `_get_direct_entry`
+    (ver informe del bug): USD->VES (afecta VES->USD) y ZELLE->USDT (afecta USDT->ZELLE).
+    """
+
+    def test_ves_to_usd(self, db_session):
+        # Sólo USD->VES está cargado en prod.
+        _add_rate(db_session, "USD", "VES", 190.0)
+        r = WhatsAppRateResolver(db_session)
+        entry = r.get_rate_entry_for_pair("VES", "USD")
+        assert entry is not None
+        assert entry.rate == pytest.approx(190.0)
+        assert entry.inverse_percentage is True
+        # 190 VES deben rendir 1 USD, no 190² (36.100) ni 1/190.
+        assert WhatsAppRateResolver.apply_rate(190.0, entry.rate, entry.inverse_percentage) == pytest.approx(1.0)
+
+    def test_usdt_to_zelle(self, db_session):
+        # Sólo ZELLE->USDT está cargado en prod.
+        _add_rate(db_session, "ZELLE", "USDT", 0.93)  # ZELLE con margen: 1 ZELLE = 0.93 USDT
+        r = WhatsAppRateResolver(db_session)
+        entry = r.get_rate_entry_for_pair("USDT", "ZELLE")
+        assert entry is not None
+        assert entry.rate == pytest.approx(0.93)
+        assert entry.inverse_percentage is True
+        # 0.93 USDT deben rendir 1 ZELLE, no 0.93² ni 1/0.93.
+        assert WhatsAppRateResolver.apply_rate(0.93, entry.rate, entry.inverse_percentage) == pytest.approx(1.0)
 
 
 class TestResolverPercentageHandling:

@@ -39,3 +39,4 @@ docker-compose.override.yml
 
 # graphify: grafo de conocimiento, se regenera con scripts/graphify_all.py
 graphify-out/
+.claude/worktrees/

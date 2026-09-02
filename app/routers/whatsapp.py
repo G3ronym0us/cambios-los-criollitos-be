@@ -537,6 +537,8 @@ def upsert_client(
         client.is_blocked = payload.is_blocked
     if payload.is_usdt_authorized is not None:
         client.is_usdt_authorized = payload.is_usdt_authorized
+    if payload.is_rate_setter is not None:
+        client.is_rate_setter = payload.is_rate_setter
     if "default_payment_info" in payload.model_fields_set:
         WhatsAppClientAccountService(db).set_default_account(
             client, payload.default_payment_info, payload.default_payment_currency

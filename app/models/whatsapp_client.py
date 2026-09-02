@@ -30,6 +30,16 @@ class WhatsAppClient(UUIDMixin, Base):
     is_tracked = Column(Boolean, default=False, nullable=False)
     is_blocked = Column(Boolean, default=False, nullable=False)
     is_usdt_authorized = Column(Boolean, default=False, nullable=False)
+    # Intermediario: fija él la tasa a la que le compramos. Un mensaje suelto con un número
+    # que cuadra con la tasa del par es una INSTRUCCIÓN suya, no un monto — sin esto se
+    # cotizaban 935 y 940 dólares que nadie pidió. Ver `is_usdt_authorized`, mismo patrón.
+    #
+    # **Por qué un número cerca de la tasa no se confunde con un monto**, medido sobre 45
+    # días de producción: la tasa se mueve un 2,2 % de un día para otro como mucho (0,55 %
+    # de media), y en 45 días USD-VES fue de 812 a 939. Los montos que piden estos mismos
+    # clientes van de 10 a 300. O sea que la banda alrededor de la tasa y el rango de los
+    # montos ni se rozan, y por eso la regla puede ser exacta en vez de heurística.
+    is_rate_setter = Column(Boolean, default=False, nullable=False, server_default="false")
 
     # Cuenta de pago predeterminada del cliente (una sola). `default_payment_info`
     # es el bloque de datos (banco/cédula/teléfono, cuenta, o llave Pix) en texto;
@@ -68,6 +78,7 @@ class WhatsAppClient(UUIDMixin, Base):
             "is_tracked": self.is_tracked,
             "is_blocked": self.is_blocked,
             "is_usdt_authorized": self.is_usdt_authorized,
+            "is_rate_setter": self.is_rate_setter,
             # Derivados de la cuenta predeterminada de la libreta (whatsapp_client_accounts).
             # Las columnas homónimas quedan sin uso hasta que una migración posterior las borre.
             "default_payment_info": next(

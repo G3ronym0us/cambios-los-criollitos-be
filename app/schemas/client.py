@@ -45,6 +45,7 @@ class ClientResponse(BaseModel):
     is_tracked: bool
     is_blocked: bool
     is_usdt_authorized: bool
+    is_rate_setter: bool = False
     # Cuenta de pago predeterminada del cliente (bloque de datos + moneda fiat).
     default_payment_info: Optional[str] = None
     default_payment_currency: Optional[str] = None
@@ -67,6 +68,7 @@ class ClientUpdate(BaseModel):
     is_tracked: Optional[bool] = None
     is_blocked: Optional[bool] = None
     is_usdt_authorized: Optional[bool] = None
+    is_rate_setter: Optional[bool] = None
     # Par preferido por uuid; enviar null para desasignar.
     preferred_pair_uuid: Optional[UUID] = None
     # Cuenta de pago predeterminada; enviar null para borrarla.

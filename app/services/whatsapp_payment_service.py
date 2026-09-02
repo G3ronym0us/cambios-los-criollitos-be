@@ -220,6 +220,23 @@ class WhatsAppPaymentService:
                 409,
             )
 
+    def _assert_not_credited(self, payment_id: int) -> None:
+        """
+        Solo entrantes: si ya se acreditó (total o parcialmente) como saldo a favor del
+        cliente, el ledger de `whatsapp_balance_entries` ya asume que ese dinero SÍ es del
+        negocio y quedó en cuenta del cliente. Declarar el comprobante irrelevante después
+        dejaría esa promesa sin respaldo, así que se rechaza — igual que un saliente que ya
+        es préstamo no puede reclasificarse (`_assert_not_loan`). Si el crédito fue un error,
+        se resuelve desde el saldo del cliente antes de tocar la clasificación del pago.
+        """
+        if self._credited_to_balance(payment_id) > 0:
+            raise QuoteServiceError(
+                "payment_is_credited",
+                "Este pago ya se acreditó como saldo a favor del cliente y no puede marcarse "
+                "irrelevante; resuelve el saldo primero",
+                409,
+            )
+
     # ---------- Crear / listar ----------
 
     def create_payment(self, table: str, payload) -> dict:
@@ -402,11 +419,11 @@ class WhatsAppPaymentService:
 
         Es la misma pregunta que responde el listado fila por fila, pero expresada en SQL
         para poder filtrar y contar sin traerse la tabla entera. Un entrante está por
-        atender si el OCR no leyó el monto, si no tiene destino de ningún tipo (ni
-        operación, ni depósito a fondo —movimiento del ledger o pendiente señalado desde
-        esta misma bandeja—, ni crédito de saldo), o si tiene destino pero le sobra dinero.
-        Un saliente, si no está clasificado y además le falta el monto o el vínculo con su
-        operación.
+        atender si NO se marcó irrelevante y además el OCR no leyó el monto, si no tiene
+        destino de ningún tipo (ni operación, ni depósito a fondo —movimiento del ledger o
+        pendiente señalado desde esta misma bandeja—, ni crédito de saldo), o si tiene
+        destino pero le sobra dinero. Un saliente, si no está clasificado y además le falta
+        el monto o el vínculo con su operación.
         """
         if table == "outgoing":
             # Clasificar es una decisión terminal: personal, irrelevante, préstamo o
@@ -480,28 +497,34 @@ class WhatsAppPaymentService:
             .scalar_subquery()
         )
 
-        return or_(
-            Model.amount.is_(None),
-            and_(
-                Model.whatsapp_operation_id.is_(None),
-                ~has_deposit,
-                ~has_allocation,
-                credited <= 0,
-            ),
-            and_(
-                Model.amount.isnot(None),
-                has_allocation,
-                allocated + credited < Model.amount - AMOUNT_EPSILON,
-            ),
-            and_(
-                Model.amount.isnot(None),
-                Model.currency.isnot(None),
-                Model.whatsapp_operation_id.isnot(None),
-                ~has_allocation,
-                op_from_amount.isnot(None),
-                op_from_symbol.isnot(None),
-                _settlement_sql(op_from_symbol) == _settlement_sql(Model.currency),
-                op_from_amount + credited < Model.amount - AMOUNT_EPSILON,
+        # Igual que el saliente (caso #4691): marcarlo irrelevante es terminal y va PRIMERO,
+        # o un entrante sin monto (el OCR nunca lo va a leer de una foto ya descartada)
+        # quedaría "por atender" para siempre por la primera rama de abajo.
+        return and_(
+            ~Model.is_irrelevant.is_(True),
+            or_(
+                Model.amount.is_(None),
+                and_(
+                    Model.whatsapp_operation_id.is_(None),
+                    ~has_deposit,
+                    ~has_allocation,
+                    credited <= 0,
+                ),
+                and_(
+                    Model.amount.isnot(None),
+                    has_allocation,
+                    allocated + credited < Model.amount - AMOUNT_EPSILON,
+                ),
+                and_(
+                    Model.amount.isnot(None),
+                    Model.currency.isnot(None),
+                    Model.whatsapp_operation_id.isnot(None),
+                    ~has_allocation,
+                    op_from_amount.isnot(None),
+                    op_from_symbol.isnot(None),
+                    _settlement_sql(op_from_symbol) == _settlement_sql(Model.currency),
+                    op_from_amount + credited < Model.amount - AMOUNT_EPSILON,
+                ),
             ),
         )
 
@@ -548,8 +571,12 @@ class WhatsAppPaymentService:
                 )
             )
 
-        # Clasificación solo aplica a salientes (las columnas existen únicamente ahí).
-        if table == "outgoing" and out_class and out_class != "ALL":
+        # Personal/préstamo/operativo/sin-vincular son conceptos exclusivos del saliente (esas
+        # columnas y esa tabla no existen del otro lado). "Irrelevante" sí es de los dos —
+        # el entrante lo estrenó después—, así que tiene su propia rama más abajo.
+        if table == "incoming" and out_class == "IRRELEVANT":
+            q = q.filter(Model.is_irrelevant.is_(True))
+        elif table == "outgoing" and out_class and out_class != "ALL":
             if out_class == "PERSONAL":
                 q = q.filter(Model.is_personal_expense.is_(True))
             elif out_class == "IRRELEVANT":
@@ -2218,6 +2245,7 @@ class WhatsAppPaymentService:
 
     def set_irrelevant(
         self,
+        table: str,
         payment_id: int,
         is_irrelevant: bool,
         description: Optional[str] = None,
@@ -2225,11 +2253,40 @@ class WhatsAppPaymentService:
         orphan_action: Optional[str] = None,
         orphan_note: Optional[str] = None,
     ) -> dict:
-        row = self._get_or_404("outgoing", payment_id)
+        """
+        Marca/desmarca un comprobante —de cualquier lado— como irrelevante para las
+        operaciones. Antes solo existía para SALIENTES; esto lo lleva a ENTRANTES.
+
+        El significado no es el mismo de los dos lados:
+        - SALIENTE irrelevante: dinero NUESTRO que salió por algo que no es un cambio (un
+          pago aparte del operador, un reenvío duplicado).
+        - ENTRANTE irrelevante: un comprobante que llegó al chat sin ser en realidad un pago
+          AL negocio — una captura reenviada por error, el duplicado del mismo Zelle, plata
+          que el cliente mandó por otra cosa. Nunca fue nuestro, así que no hay nada que
+          "sacar" de la caja; solo se declara que ese papel no cuenta.
+
+        En los dos casos la clasificación es terminal (no vuelve a pedir atención mientras
+        siga marcada, ver `_attention_condition`) y desvincula la operación primaria del
+        comprobante — igual que el saliente, no toca el reparto que tenga con OTRAS
+        operaciones (`allocations`/`settlements`), solo la relación principal.
+
+        La pregunta del huérfano (`orphan_action`) SÍ se reutiliza tal cual para entrantes,
+        pero no dispara igual de seguido: `_resolve_orphan` cuenta comprobantes de los dos
+        lados, así que una operación de socio o de un par en efectivo —que nunca tiene
+        entrante— no se considera huérfana solo por perder este; hace falta que se quede sin
+        NINGÚN comprobante, que es el mismo caso que ya era un problema para el saliente.
+
+        Un entrante ya acreditado al saldo del cliente no puede marcarse irrelevante
+        (`_assert_not_credited`): el ledger de abonos ya asume que ese dinero es del negocio.
+        """
+        row = self._get_or_404(table, payment_id)
         if is_irrelevant:
-            self._assert_not_loan(payment_id)
+            if table == "outgoing":
+                self._assert_not_loan(payment_id)
+            else:
+                self._assert_not_credited(payment_id)
         orphaned_op = (
-            self._resolve_orphan(row, "outgoing", payment_id, orphan_action, orphan_note, actor)
+            self._resolve_orphan(row, table, payment_id, orphan_action, orphan_note, actor)
             if is_irrelevant
             else None
         )

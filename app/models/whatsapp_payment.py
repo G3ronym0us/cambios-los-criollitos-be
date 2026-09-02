@@ -47,6 +47,13 @@ class WhatsAppIncomingPayment(UUIDMixin, Base):
     owner_client_id = Column(
         Integer, ForeignKey("whatsapp_clients.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Comprobante que llegó al chat pero NO es en realidad un pago al negocio (captura
+    # reenviada por error, duplicado del mismo Zelle, plata que el cliente mandó por otra
+    # cosa). Espejo del mismo flag en `WhatsAppOutgoingPayment`, pero el significado es
+    # distinto: ahí es dinero NUESTRO que salió por algo que no es un cambio; aquí es dinero
+    # que NUNCA fue nuestro. Marcarlo desvincula la operación (ver `set_irrelevant`).
+    is_irrelevant = Column(Boolean, nullable=False, server_default="false")
+    irrelevant_description = Column(Text, nullable=True)
     corrected_at = Column(DateTime(timezone=True), nullable=True)
     correction_original = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -109,6 +116,8 @@ class WhatsAppIncomingPayment(UUIDMixin, Base):
             "operation_uuid": self.operation.uuid if self.operation else None,
             "fund_group_uuid": self.fund_group.uuid if self.fund_group else None,
             "fund_group_name": self.fund_group.name if self.fund_group else None,
+            "is_irrelevant": 1 if self.is_irrelevant else 0,
+            "irrelevant_description": self.irrelevant_description,
             "corrected_at": self.corrected_at,
             "correction_original": self.correction_original,
             "created_at": self.created_at,

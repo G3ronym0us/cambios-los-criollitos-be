@@ -174,6 +174,10 @@ class WhatsAppOperationResponse(BaseModel):
     #: Su par se cambia en efectivo. Entonces `first_incoming_payment_at` vacío no dice que
     #: el cliente no haya pagado: dice que de un billete no hay comprobante que adjuntar.
     settles_in_cash: bool = False
+    # Distinto de `first_incoming_payment_at`: ese mide antigüedad (primer pago), este es
+    # el pago más reciente — lo que un listado debe mostrar como "fecha del pago" cuando
+    # el cliente pagó en varias partes. Ver el docstring de la property en el modelo.
+    last_incoming_payment_at: Optional[datetime] = None
     last_outgoing_payment_at: Optional[datetime] = None
     quoted_at: datetime
     expires_at: datetime

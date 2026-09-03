@@ -292,6 +292,35 @@ class TransactionRepository:
         self.db.commit()
         return True
 
+    def get_user_profit_usdt_summary(
+        self, user_id: int, start_date: datetime, end_date: datetime
+    ) -> Dict:
+        """
+        Ganancia de un usuario en USDT (la referencia universal, no `profit_amount` —que va
+        en la moneda de cada trato y no se puede sumar entre pares distintos) para un rango.
+
+        Mismo filtro que `get_user_profit_report` (split del usuario, transacción COMPLETED)
+        pero sin traerse ninguna transacción: es lo único que necesita `/admin/overview`.
+        """
+        agg = self.db.query(
+            func.coalesce(func.sum(TransactionProfitSplit.profit_amount_usdt), 0.0).label(
+                "total_profit_usdt"
+            ),
+            func.count(TransactionProfitSplit.transaction_id.distinct()).label(
+                "transaction_count"
+            ),
+        ).join(Transaction).filter(
+            TransactionProfitSplit.user_id == user_id,
+            Transaction.status == TransactionStatus.COMPLETED,
+            Transaction.created_at >= start_date,
+            Transaction.created_at < end_date,
+        ).first()
+
+        return {
+            "total_profit_usdt": float(agg.total_profit_usdt or 0),
+            "transaction_count": int(agg.transaction_count or 0),
+        }
+
     def get_user_profit_report(self,
                                 user_id: int,
                                 start_date: Optional[datetime] = None,

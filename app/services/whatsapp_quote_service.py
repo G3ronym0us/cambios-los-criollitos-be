@@ -1292,12 +1292,25 @@ class WhatsAppQuoteService:
             )
             .count()
         )
+        # Semana corrida (hoy + 6 atrás), mismo corte UTC que `completed_today`: es lo que
+        # necesita `/admin/overview` para el ritmo («7 hoy, 5.4 en promedio»). Extra sobre
+        # `WhatsAppStatsResponse` (pydantic lo ignora en el endpoint viejo).
+        week_start = today_start - timedelta(days=6)
+        completed_week = (
+            self.db.query(WhatsAppOperation)
+            .filter(
+                WhatsAppOperation.status == WhatsAppOperationStatus.COMPLETED,
+                WhatsAppOperation.completed_at >= week_start,
+            )
+            .count()
+        )
         return {
             "pending": counts["PENDING"],
             "completed": counts["COMPLETED"],
             "quoted": counts["QUOTED"],
             "cancelled": counts["CANCELLED"],
             "completed_today": completed_today,
+            "completed_daily_avg_week": round(completed_week / 7, 2),
             **self._actionable_stats(),
         }
 
@@ -1395,11 +1408,16 @@ class WhatsAppQuoteService:
         uncovered = safunc.coalesce(WhatsAppOperation.uncovered_amount, 0)
         missing = value - delivered - uncovered
 
-        # Una operación viva a la que aún le falta comprobante por cubrir.
+        # Una operación viva a la que aún le falta comprobante por cubrir. Se agregan también
+        # el valor total y lo ya cubierto (no solo lo que falta) en la MISMA consulta: es lo
+        # que necesita `/admin/overview` para pintar «4.920 cubiertos de 7.230 · faltan 2.310»
+        # sin disparar una segunda query idéntica con una proyección distinta.
         open_ops = (
             self.db.query(
                 safunc.count(WhatsAppOperation.id),
                 safunc.coalesce(safunc.sum(missing), 0),
+                safunc.coalesce(safunc.sum(value), 0),
+                safunc.coalesce(safunc.sum(delivered + uncovered), 0),
             )
             .outerjoin(settled, settled.c.op_id == WhatsAppOperation.id)
             .filter(
@@ -1448,6 +1466,11 @@ class WhatsAppQuoteService:
         return {
             "to_settle": open_ops[0] or 0,
             "to_settle_amount": round(float(open_ops[1] or 0), 2),
+            # Extra sobre `WhatsAppStatsResponse` (pydantic los ignora): total del trato y lo
+            # ya cubierto, para el overview. OJO nombre: `to_settle_amount` de este dict es lo
+            # que FALTA (missing); estos dos son otra cosa.
+            "to_settle_total_amount": round(float(open_ops[2] or 0), 2),
+            "to_settle_covered_amount": round(float(open_ops[3] or 0), 2),
             "to_deliver": to_deliver[0] or 0,
             "to_deliver_oldest_at": to_deliver[1],
             "without_client": without_client or 0,

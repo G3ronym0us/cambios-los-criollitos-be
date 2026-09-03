@@ -154,6 +154,21 @@ class _RateProbe:
     amount: Optional[float] = None
 
 
+@dataclass
+class _IncomingCoverageSignals:
+    """Subconsultas SQL (no valores) que describen hasta dónde cubre un entrante.
+
+    Ver `WhatsAppPaymentService._incoming_coverage_signals`.
+    """
+
+    allocated: object
+    credited: object
+    has_allocation: object
+    has_deposit: object
+    op_from_amount: object
+    op_from_symbol: object
+
+
 class WhatsAppPaymentService:
     def __init__(self, db: Session):
         self.db = db
@@ -413,6 +428,84 @@ class WhatsAppPaymentService:
             .exists()
         )
 
+    def _incoming_coverage_signals(self, Model):
+        """
+        Subconsultas que miden hasta dónde cubre un entrante: si tiene reparto explícito, si
+        ese reparto (más el saldo acreditado) alcanza el monto, si entró como depósito de
+        fondo, y con qué operación se compara cuando el vínculo es directo (sin fila de
+        reparto).
+
+        Un solo lugar donde se define "cubierto": lo comparten `_attention_condition` y el
+        desglose de motivos del overview (`payments_attention_breakdown`) para no tener dos
+        definiciones de lo mismo que puedan desalinearse.
+        """
+        # `correlate(Model)` es obligatorio: la query del listado ya trae unida la operación,
+        # y sin esto SQLAlchemy correlaciona también esa tabla y deja la subconsulta sin FROM.
+        allocated = (
+            select(func.coalesce(func.sum(WhatsAppPaymentAllocation.amount), 0.0))
+            .where(WhatsAppPaymentAllocation.incoming_payment_id == Model.id)
+            .correlate(Model)
+            .scalar_subquery()
+        )
+        credited = (
+            select(func.coalesce(func.sum(WhatsAppBalanceEntry.amount), 0.0))
+            .where(
+                WhatsAppBalanceEntry.incoming_payment_id == Model.id,
+                WhatsAppBalanceEntry.entry_type == WhatsAppBalanceEntryType.CREDIT,
+            )
+            .correlate(Model)
+            .scalar_subquery()
+        )
+        has_allocation = (
+            select(WhatsAppPaymentAllocation.id)
+            .where(WhatsAppPaymentAllocation.incoming_payment_id == Model.id)
+            .correlate(Model)
+            .exists()
+        )
+        has_deposit = or_(
+            select(FundMovement.id)
+            .where(FundMovement.incoming_payment_id == Model.id)
+            .correlate(Model)
+            .exists(),
+            self._filed_as_fund_deposit(Model, "incoming"),
+        )
+
+        # Vínculo directo sin filas de reparto: el implícito de `_default_allocation_amount`.
+        # Solo puede sobrar dinero si la op liquida en la moneda del pago; si no son
+        # comparables se le asigna todo y no hay nada pendiente.
+        op_from_amount = (
+            select(WhatsAppOperation.from_amount)
+            .where(WhatsAppOperation.id == Model.whatsapp_operation_id)
+            .correlate(Model)
+            .scalar_subquery()
+        )
+        op_from_symbol = (
+            select(Currency.symbol)
+            .select_from(WhatsAppOperation)
+            .join(CurrencyPair, CurrencyPair.id == WhatsAppOperation.currency_pair_id)
+            .join(Currency, Currency.id == CurrencyPair.from_currency_id)
+            .where(WhatsAppOperation.id == Model.whatsapp_operation_id)
+            .correlate(Model)
+            .scalar_subquery()
+        )
+        return _IncomingCoverageSignals(
+            allocated=allocated,
+            credited=credited,
+            has_allocation=has_allocation,
+            has_deposit=has_deposit,
+            op_from_amount=op_from_amount,
+            op_from_symbol=op_from_symbol,
+        )
+
+    def _incoming_unlinked_clause(self, Model, sig: "_IncomingCoverageSignals"):
+        """Un entrante sin NINGÚN destino: ni operación, ni depósito, ni reparto, ni saldo."""
+        return and_(
+            Model.whatsapp_operation_id.is_(None),
+            ~sig.has_deposit,
+            ~sig.has_allocation,
+            sig.credited <= 0,
+        )
+
     def _attention_condition(self, Model, table: str):
         """
         Qué cuenta como «por atender»: comprobantes cuyo dinero todavía no respalda nada.
@@ -447,55 +540,7 @@ class WhatsAppPaymentService:
                 ),
             )
 
-        # `correlate(Model)` es obligatorio: la query del listado ya trae unida la operación,
-        # y sin esto SQLAlchemy correlaciona también esa tabla y deja la subconsulta sin FROM.
-        allocated = (
-            select(func.coalesce(func.sum(WhatsAppPaymentAllocation.amount), 0.0))
-            .where(WhatsAppPaymentAllocation.incoming_payment_id == Model.id)
-            .correlate(Model)
-            .scalar_subquery()
-        )
-        credited = (
-            select(func.coalesce(func.sum(WhatsAppBalanceEntry.amount), 0.0))
-            .where(
-                WhatsAppBalanceEntry.incoming_payment_id == Model.id,
-                WhatsAppBalanceEntry.entry_type == WhatsAppBalanceEntryType.CREDIT,
-            )
-            .correlate(Model)
-            .scalar_subquery()
-        )
-        has_allocation = (
-            select(WhatsAppPaymentAllocation.id)
-            .where(WhatsAppPaymentAllocation.incoming_payment_id == Model.id)
-            .correlate(Model)
-            .exists()
-        )
-        has_deposit = or_(
-            select(FundMovement.id)
-            .where(FundMovement.incoming_payment_id == Model.id)
-            .correlate(Model)
-            .exists(),
-            self._filed_as_fund_deposit(Model, table),
-        )
-
-        # Vínculo directo sin filas de reparto: el implícito de `_default_allocation_amount`.
-        # Solo puede sobrar dinero si la op liquida en la moneda del pago; si no son
-        # comparables se le asigna todo y no hay nada pendiente.
-        op_from_amount = (
-            select(WhatsAppOperation.from_amount)
-            .where(WhatsAppOperation.id == Model.whatsapp_operation_id)
-            .correlate(Model)
-            .scalar_subquery()
-        )
-        op_from_symbol = (
-            select(Currency.symbol)
-            .select_from(WhatsAppOperation)
-            .join(CurrencyPair, CurrencyPair.id == WhatsAppOperation.currency_pair_id)
-            .join(Currency, Currency.id == CurrencyPair.from_currency_id)
-            .where(WhatsAppOperation.id == Model.whatsapp_operation_id)
-            .correlate(Model)
-            .scalar_subquery()
-        )
+        sig = self._incoming_coverage_signals(Model)
 
         # Igual que el saliente (caso #4691): marcarlo irrelevante es terminal y va PRIMERO,
         # o un entrante sin monto (el OCR nunca lo va a leer de una foto ya descartada)
@@ -504,26 +549,21 @@ class WhatsAppPaymentService:
             ~Model.is_irrelevant.is_(True),
             or_(
                 Model.amount.is_(None),
-                and_(
-                    Model.whatsapp_operation_id.is_(None),
-                    ~has_deposit,
-                    ~has_allocation,
-                    credited <= 0,
-                ),
+                self._incoming_unlinked_clause(Model, sig),
                 and_(
                     Model.amount.isnot(None),
-                    has_allocation,
-                    allocated + credited < Model.amount - AMOUNT_EPSILON,
+                    sig.has_allocation,
+                    sig.allocated + sig.credited < Model.amount - AMOUNT_EPSILON,
                 ),
                 and_(
                     Model.amount.isnot(None),
                     Model.currency.isnot(None),
                     Model.whatsapp_operation_id.isnot(None),
-                    ~has_allocation,
-                    op_from_amount.isnot(None),
-                    op_from_symbol.isnot(None),
-                    _settlement_sql(op_from_symbol) == _settlement_sql(Model.currency),
-                    op_from_amount + credited < Model.amount - AMOUNT_EPSILON,
+                    ~sig.has_allocation,
+                    sig.op_from_amount.isnot(None),
+                    sig.op_from_symbol.isnot(None),
+                    _settlement_sql(sig.op_from_symbol) == _settlement_sql(Model.currency),
+                    sig.op_from_amount + sig.credited < Model.amount - AMOUNT_EPSILON,
                 ),
             ),
         )
@@ -678,6 +718,24 @@ class WhatsAppPaymentService:
 
         needs_attention = attention_q.count()
 
+        # Desglose de motivos, mutuamente excluyente por construcción (resta, no una cuarta
+        # rama SQL): el OCR no leyó el monto (to_review) prima sobre las demás porque
+        # `_attention_condition` la evalúa primero; "sin ningún destino" (unlinked) es la
+        # siguiente razón independiente del monto; lo que sobra son las que sí tienen algún
+        # destino pero no cubren el monto entero (partially_split). Lo consume el overview
+        # (`/admin/overview`) para no repetir esta cuenta con una query aparte.
+        to_review = attention_q.filter(Model.amount.is_(None)).count()
+        if table == "incoming":
+            sig = self._incoming_coverage_signals(Model)
+            unlinked = attention_q.filter(
+                Model.amount.isnot(None), self._incoming_unlinked_clause(Model, sig)
+            ).count()
+        else:
+            unlinked = attention_q.filter(
+                Model.amount.isnot(None), Model.whatsapp_operation_id.is_(None)
+            ).count()
+        partially_split = max(needs_attention - to_review - unlinked, 0)
+
         unassigned: list[dict] = []
         truncated = False
         if table == "incoming" and needs_attention:
@@ -685,6 +743,11 @@ class WhatsAppPaymentService:
                 attention_q.order_by(Model.created_at.desc()).limit(scan_limit).all()
             )
             truncated = needs_attention > len(rows)
+            # `payment.dict()` (llamado por `_row_to_dict` más abajo) resuelve
+            # `fund_group` leyendo `operation.fund_group` / `fund_group_by_jid` — sin
+            # precargarlos, cada fila del lote dispara sus propias consultas lazy. Se
+            # precargan aquí, en dos, para el lote entero.
+            self._preload_incoming_fund_context([r[0] for r in rows])
             items = [self._row_to_dict(*r) for r in rows]
             self._attach_allocations(items)
             by_currency: dict[str, dict] = {}
@@ -710,6 +773,9 @@ class WhatsAppPaymentService:
         return {
             "table": table,
             "needs_attention": needs_attention,
+            "to_review": to_review,
+            "unlinked": unlinked,
+            "partially_split": partially_split,
             "unassigned": unassigned,
             "unassigned_truncated": truncated,
             "received_today": received_today,
@@ -789,6 +855,25 @@ class WhatsAppPaymentService:
         for it in items:
             it["deposit"] = by_payment.get(it["id"])
 
+    def _preload_incoming_fund_context(self, payments: list) -> None:
+        """
+        Precarga `operation.fund_group` y `fund_group_by_jid` de un lote de entrantes.
+
+        Son las dos relaciones que `WhatsAppIncomingPayment.fund_group` (propiedad Python)
+        resuelve para cada fila; sin esto, `payment.dict()` dispara una consulta lazy de
+        `WhatsAppOperation` y otra de `FundGroup` POR FILA. Las mismas instancias ya están en
+        la sesión (identity map), así que esto solo rellena sus relaciones — no las duplica.
+        """
+        if not payments:
+            return
+        ids = [p.id for p in payments]
+        self.db.query(WhatsAppIncomingPayment).options(
+            selectinload(WhatsAppIncomingPayment.operation).selectinload(
+                WhatsAppOperation.fund_group
+            ),
+            selectinload(WhatsAppIncomingPayment.fund_group_by_jid),
+        ).filter(WhatsAppIncomingPayment.id.in_(ids)).all()
+
     def _attach_allocations(self, items: list[dict]) -> None:
         """
         Agrega a cada entrante cuánto de él está repartido entre operaciones y cuánto queda
@@ -819,9 +904,9 @@ class WhatsAppPaymentService:
             payments = (
                 self.db.query(WhatsAppIncomingPayment)
                 .options(
-                    selectinload(WhatsAppIncomingPayment.operation).selectinload(
-                        WhatsAppOperation.currency_pair
-                    )
+                    selectinload(WhatsAppIncomingPayment.operation)
+                    .selectinload(WhatsAppOperation.currency_pair)
+                    .selectinload(CurrencyPair.from_currency)
                 )
                 .filter(WhatsAppIncomingPayment.id.in_(implicit_ids))
                 .all()

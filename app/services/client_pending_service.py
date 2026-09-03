@@ -286,6 +286,64 @@ class ClientPendingService:
             entries.sort(key=lambda e: e["amount"], reverse=True)
         return result
 
+    def pending_overview(self, top_n: int = 3) -> dict:
+        """
+        Lo que le debemos a los clientes, para la home de admin: cuántos, cuánto por moneda, y
+        quiénes llevan más esperando.
+
+        Compone sobre `client_ids_with_pending` + `pending_by_client_ids` — las dos ya
+        agregan en SQL por cliente×par (nunca traen el pago crudo). El fold final por moneda
+        y el top de más viejos corren en Python, pero sobre ESE resultado ya reducido a un
+        puñado de filas (clientes × pares), no sobre las operaciones u origenes uno por uno.
+        """
+        client_ids = self.client_ids_with_pending()
+        if not client_ids:
+            return {"pending_count": 0, "totals": [], "oldest": []}
+
+        grouped = self.pending_by_client_ids(client_ids)
+
+        totals_by_currency: dict[str, float] = {}
+        # (client_id, entrada) aplanado: cada cliente puede aparecer una vez por par/moneda.
+        flat: list[tuple[int, dict]] = []
+        for client_id, items in grouped.items():
+            for item in items:
+                currency = item["currency"] or "?"
+                totals_by_currency[currency] = round(
+                    totals_by_currency.get(currency, 0.0) + item["amount"], 2
+                )
+                flat.append((client_id, item))
+
+        totals = [
+            {"currency": currency, "amount": amount}
+            for currency, amount in sorted(totals_by_currency.items(), key=lambda kv: -kv[1])
+        ]
+
+        flat.sort(key=lambda ce: ce[1]["oldest_at"] or datetime.max.replace(tzinfo=timezone.utc))
+        top = flat[:top_n]
+        names = {
+            c.id: c.display_name
+            for c in self.db.query(WhatsAppClient)
+            .filter(WhatsAppClient.id.in_({client_id for client_id, _ in top}))
+            .all()
+        }
+
+        now = datetime.now(timezone.utc)
+        oldest = []
+        for client_id, item in top:
+            oldest_at = item["oldest_at"]
+            waiting_days = None
+            if oldest_at is not None:
+                since = oldest_at if oldest_at.tzinfo else oldest_at.replace(tzinfo=timezone.utc)
+                waiting_days = max((now - since).days, 0)
+            oldest.append({
+                "name": names.get(client_id) or "Cliente sin nombre",
+                "waiting_days": waiting_days,
+                "amount": item["amount"],
+                "currency": item["currency"],
+            })
+
+        return {"pending_count": len(client_ids), "totals": totals, "oldest": oldest}
+
     # ── Escritura ────────────────────────────────────────────────────────────
 
     @staticmethod

@@ -6,7 +6,7 @@ from typing import List, Optional
 from datetime import datetime
 from contextlib import asynccontextmanager
 from app.services.scraper_service import BinanceP2PScraperService
-from app.routers import scraping, auth, currency, currency_pair, binance, rates, transaction, user, commission_config, fund, notifications, whatsapp, clients, client_accounts, operations, payments, analyses
+from app.routers import scraping, auth, currency, currency_pair, binance, rates, transaction, user, commission_config, fund, notifications, whatsapp, clients, client_accounts, operations, payments, analyses, admin
 from app.core.errors import ServerErrorsAsJSON
 from app.database.connection import get_db
 
@@ -100,6 +100,7 @@ app.include_router(client_accounts.router)
 app.include_router(operations.router)
 app.include_router(payments.router)
 app.include_router(analyses.router)
+app.include_router(admin.router)
 
 # Rutas de la API
 @app.get("/")

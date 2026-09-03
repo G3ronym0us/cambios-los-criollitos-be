@@ -280,6 +280,31 @@ class WhatsAppOperation(UUIDMixin, Base):
         ]
         return min(dates) if dates else None
 
+    @property
+    def last_incoming_payment_at(self):
+        """
+        Cuándo llegó el ÚLTIMO comprobante del cliente: el más reciente, no el primero.
+
+        Distinto a propósito de `first_incoming_payment_at`, que mide antigüedad (cuánto
+        lleva esperando la operación desde que llegó el PRIMER pago). Este campo es para
+        mostrar «cuándo fue el pago» en un listado — si el cliente pagó en dos partes, la
+        fecha que importa mostrar es la del último abono, no la del primero. No los
+        colapses en una sola función: una cuenta antigüedad desde el inicio, la otra
+        muestra el hecho más reciente, y una operación con dos o más comprobantes
+        necesita las dos al mismo tiempo.
+
+        `None` si no tiene ningún entrante (p.ej. `VIA_PARTNER` sin comprobante propio, o
+        un par que `settles_in_cash`); entonces la fecha de la operación es lo mejor que
+        hay y quien lo consuma se cae a ella.
+        """
+        dates = [p.created_at for p in (self.incoming_payments or []) if p.created_at]
+        dates += [
+            a.payment.created_at
+            for a in (self.incoming_allocations or [])
+            if a.payment is not None and a.payment.created_at
+        ]
+        return max(dates) if dates else None
+
     def real_rate(self, value: float | None, delivered: float) -> float | None:
         """
         La tasa que de verdad salió del trato: lo entregado entre el valor.
@@ -359,6 +384,7 @@ class WhatsAppOperation(UUIDMixin, Base):
             "transaction_uuid": self.transaction.uuid if self.transaction else None,
             "legacy_sqlite_id": self.legacy_sqlite_id,
             "first_incoming_payment_at": self.first_incoming_payment_at,
+            "last_incoming_payment_at": self.last_incoming_payment_at,
             "last_outgoing_payment_at": self.last_outgoing_payment_at,
             "quoted_at": self.quoted_at,
             "expires_at": self.expires_at,

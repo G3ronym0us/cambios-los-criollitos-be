@@ -46,6 +46,7 @@ from app.models.whatsapp_payment import (
     WhatsAppIncomingPayment,
     WhatsAppOutgoingPayment,
     WhatsAppOutgoingSettlement,
+    WhatsAppPaymentAllocation,
 )
 from app.schemas.whatsapp import WhatsAppOperationResponse
 from app.services.client_pending_service import ClientPendingService
@@ -429,6 +430,58 @@ class TestLastOutgoingPaymentAt:
         db.commit()
         db.refresh(op)
         assert op.last_outgoing_payment_at is None
+
+
+class TestLastIncomingPaymentAt:
+    """
+    La fecha que la pestaña «Cuenta» del cliente enseña en cada fila: cuándo pagó el
+    cliente. Es la contraparte de `TestLastOutgoingPaymentAt` pero del lado del comprobante
+    ENTRANTE, y a propósito distinta de `first_incoming_payment_at` (la antigüedad que mide
+    la cola de «por entregar»): un trato pagado en dos partes tiene una fecha de "desde
+    cuándo espera" y otra de "cuándo pasó lo último", y las dos hacen falta a la vez.
+    """
+
+    def test_toma_el_comprobante_entrante_mas_reciente_y_no_el_primero(self, db, world):
+        # `make_op` ya crea un primer entrante en NOW (vía `incoming_at`); se le añade un
+        # segundo, 2 días más tarde, para que primero y último de verdad difieran.
+        op = make_op(db, world["client"], world["usd_ves"], amount=100, incoming_at=NOW - timedelta(days=10))
+        db.add(WhatsAppIncomingPayment(
+            client_phone=world["client"].phone, amount=40, currency="USD",
+            whatsapp_operation_id=op.id, created_at=NOW - timedelta(days=2),
+        ))
+        db.commit()
+        db.refresh(op)
+
+        assert op.last_incoming_payment_at.replace(tzinfo=timezone.utc) == NOW - timedelta(days=2)
+        # Antigüedad y fecha mostrada divergen a propósito: la primera no se mueve porque
+        # haya llegado un segundo pago.
+        assert op.first_incoming_payment_at.replace(tzinfo=timezone.utc) == NOW - timedelta(days=10)
+
+    def test_cuenta_tambien_los_entrantes_repartidos_por_asignacion(self, db, world):
+        # Un Zelle que se reparte entre dos operaciones llega por `incoming_allocations`,
+        # no por el FK directo — la propiedad tiene que recorrer las dos fuentes.
+        op = make_op(db, world["client"], world["usd_ves"], amount=100, incoming_at=None)
+        pago = WhatsAppIncomingPayment(
+            client_phone=world["client"].phone, amount=220, currency="USD",
+            created_at=NOW - timedelta(days=1),
+        )
+        db.add(pago)
+        db.flush()
+        db.add(WhatsAppPaymentAllocation(
+            incoming_payment_id=pago.id, whatsapp_operation_id=op.id, amount=100,
+        ))
+        db.commit()
+        db.refresh(op)
+
+        assert op.last_incoming_payment_at.replace(tzinfo=timezone.utc) == NOW - timedelta(days=1)
+
+    def test_sin_comprobante_entrante_no_hay_fecha(self, db, world):
+        # `VIA_PARTNER` sin comprobante propio, o un par `settles_in_cash`: la fecha del
+        # pago no existe y quien la consuma se cae a la de la operación.
+        op = make_op(db, world["client"], world["usd_ves"], incoming_at=None)
+        db.commit()
+        db.refresh(op)
+        assert op.last_incoming_payment_at is None
 
 
 @pytest.fixture()

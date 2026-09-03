@@ -1882,8 +1882,20 @@ class WhatsAppPaymentService:
         marcarla como asumida. Lo usa la transferencia a otro cliente, donde la política ya
         está decidida: la operación vuelve a esperar fondos, y esa alarma tiene que seguir
         encendida para quien la mire.
+
+        El SELECT es `FOR UPDATE`: sin esto, dos vinculaciones concurrentes del MISMO
+        comprobante a DOS operaciones distintas (el operador y el bot, o dos operadores) leen
+        ambas `whatsapp_operation_id is None`, pasan el chequeo de "ya vinculado" y la segunda
+        pisa en silencio lo que dejó la primera -- la operación que perdió el pago puede
+        quedar igual COMPLETED (con su movimiento de fondo ya creado) mientras el comprobante
+        termina apuntando a la otra. Con el lock, la segunda transacción espera a que la
+        primera comitee y entonces SÍ ve el vínculo ya puesto, y responde 409
+        `payment_already_linked` en vez de una pérdida de actualización silenciosa.
         """
-        row = self._get_or_404(table, payment_id)
+        Model = self._model(table)
+        row = self.db.query(Model).filter(Model.id == payment_id).with_for_update().first()
+        if row is None:
+            raise QuoteServiceError("not_found", f"Pago {table}/{payment_id} no encontrado", 404)
         orphaned_op = (
             self._resolve_orphan(row, table, payment_id, orphan_action, orphan_note, completing_user)
             if operation_uuid is None and not allow_orphan
@@ -1893,10 +1905,17 @@ class WhatsAppPaymentService:
             self._assert_not_loan(payment_id)
         op = None
         if operation_uuid is not None:
+            # NOTA (ver H-8.4 en el informe de la campaña): se intentó un `.with_for_update()`
+            # acá para cerrar la carrera "cancelar vs. cubrir" y NO alcanza -- `_sync_status_
+            # from_delivery` más abajo llama a `WhatsAppQuoteService.update_status`, que hace
+            # su PROPIO `self.db.commit()` a mitad de este método. Ese commit interno libera
+            # el lock antes de que esta función termine, así que un `UPDATE` de cancelación
+            # bloqueado en otra sesión se destraba ahí y puede pisar el COMPLETED que se acaba
+            # de comitear. Un lock aislado en este SELECT no cierra la carrera; hace falta que
+            # el árbol de llamadas deje de comitear a mitad de camino (ver el hallazgo).
             op = self.db.query(WhatsAppOperation).filter(WhatsAppOperation.uuid == operation_uuid).first()
             if op is None:
                 raise QuoteServiceError("op_not_found", f"Operation {operation_uuid} no encontrada", 404)
-            Model = self._model(table)
             # Una operación puede tener varios comprobantes por lado: el trato de 220 se pagó
             # con un Pix y un pago móvil, y cada uno cubre su parte del valor (`settled_amount`).
             # Lo que antes se rechazaba como duplicado ahora se contabiliza.
@@ -2951,7 +2970,25 @@ class WhatsAppPaymentService:
         fund_group_provided: bool = False,
         notes: Optional[str] = None,
     ) -> dict:
-        row = self._get_or_404(table, payment_id)
+        """
+        El SELECT es `FOR UPDATE` y se rechaza si el comprobante ya tiene operación: sin esto,
+        un doble clic en "crear operación" (o un reintento del front tras un timeout) sobre el
+        MISMO comprobante suelto armaba DOS `WhatsAppOperation` -- cada una con su propia
+        transacción y fondo -- a partir de un solo pago real. A diferencia de `set_operation`
+        (que vincula a una operación YA EXISTENTE y sí rechazaba el duplicado), esta función
+        no comprobaba nada: el FK del pago se sobreescribía en silencio con la última que
+        terminara, dejando a la otra completada y contabilizada de más.
+        """
+        Model = self._model(table)
+        row = self.db.query(Model).filter(Model.id == payment_id).with_for_update().first()
+        if row is None:
+            raise QuoteServiceError("not_found", f"Pago {table}/{payment_id} no encontrado", 404)
+        if row.whatsapp_operation_id is not None:
+            raise QuoteServiceError(
+                "payment_already_linked",
+                "El pago ya tiene una operación creada; no se puede crear otra",
+                409,
+            )
         if table == "outgoing":
             self._assert_not_loan(payment_id)
         if from_amount <= 0 or to_amount <= 0:

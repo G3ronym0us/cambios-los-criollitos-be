@@ -127,6 +127,13 @@ class WhatsAppOperationResponse(BaseModel):
     uncovered_amount: Optional[float] = None
     uncovered_reason: Optional[str] = None
     pending_amount: Optional[float] = None
+    #: La OTRA pata, y sólo dice algo en un par que se cambia en efectivo: cuánto de los
+    #: billetes del cliente ya está recogido, y cuánto falta. `pending_amount` mide lo
+    #: nuestro —lo que no hemos cubierto— y en esos pares llega a cero en cuanto se vincula
+    #: el comprobante en bolívares, sin que nadie haya recogido un dólar. Sin estos dos
+    #: campos la pantalla no puede distinguir «ya está pagada» de «ya está cobrada».
+    collected_amount: Optional[float] = None
+    to_collect: Optional[float] = None
     # Cuántos comprobantes cubren la operación, y la tasa que resulta de ellos
     # (entregado ÷ valor). `rate_used` es la que se cotizó; esta es la que salió.
     payments_count: int = 0

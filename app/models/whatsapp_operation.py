@@ -134,6 +134,19 @@ class WhatsAppOperation(UUIDMixin, Base):
     uncovered_amount = Column(Float, nullable=True)
     uncovered_reason = Column(String(24), nullable=True)
 
+    #: Cuánto del efectivo del CLIENTE ya está en la mano, en los pares que se cambian en
+    #: efectivo (`CurrencyPair.settles_in_cash`).
+    #:
+    #: Es la otra pata del trato y no tenía dónde vivir. `uncovered_amount` y
+    #: `delivered_amount` miden lo NUESTRO —cuánto del valor hemos cubierto—, y en un par de
+    #: efectivo eso ya está resuelto en cuanto se vincula el comprobante en bolívares: la
+    #: operación queda cubierta y sigue sin cobrarse. Lo único que decía «ya me pagó» era
+    #: `delivery_status`, que es un sí/no y no admite que el cliente traiga la mitad.
+    #:
+    #: Va en la moneda del VALOR del trato (los USD de un USD-VES), igual que
+    #: `pending_amount`. En un par normal no se usa.
+    collected_amount = Column(Float, nullable=True)
+
     # Vínculo con la Transaction derivada. Puede existir desde QUOTED/PENDING si hay fondo.
     transaction_id = Column(Integer, ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True, index=True)
 
@@ -214,6 +227,18 @@ class WhatsAppOperation(UUIDMixin, Base):
         return len(self.outgoing_settlements or [])
 
     @property
+    def to_collect(self) -> float:
+        """
+        Cuánto efectivo falta por recoger del cliente. Sólo dice algo en un par de efectivo.
+
+        No se resta lo cubierto: lo que cubre el comprobante en bolívares es NUESTRA pata, y
+        descontarlo aquí daría cero justo en las operaciones que sí hay que ir a cobrar —las
+        que nacen de su propio comprobante de salida, cubiertas desde el primer segundo.
+        """
+        value = self.amount if self.amount is not None else self.from_amount
+        return round(float(value or 0) - float(self.collected_amount or 0), 2)
+
+    @property
     def last_outgoing_payment_at(self):
         """
         Cuándo se pagó el trato: la fecha del comprobante de SALIDA más reciente.
@@ -291,6 +316,12 @@ class WhatsAppOperation(UUIDMixin, Base):
             "uncovered_amount": self.uncovered_amount,
             "uncovered_reason": self.uncovered_reason,
             "pending_amount": round((value or 0) - delivered - (self.uncovered_amount or 0), 2),
+            # Las dos patas viajan por separado a propósito: `pending_amount` es lo que
+            # falta por CUBRIR (lo nuestro) y `to_collect` lo que falta por COBRAR (lo del
+            # cliente, sólo en pares de efectivo). Meterlas en el mismo número fue lo que
+            # dejó la cola de cobros mirando la columna equivocada.
+            "collected_amount": self.collected_amount,
+            "to_collect": self.to_collect,
             "amount_usdt": self.amount_usdt,
             "usdt_rate": self.usdt_rate,
             "bcv_amount": self.bcv_amount,

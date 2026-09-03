@@ -17,16 +17,24 @@ hasta que su plata llega — una operación registrada sin comprobante entrante 
 cotización o un trato a medio armar, no una deuda. Contarlas mezclaba las dos patas del
 cambio y hacía que la lista pidiera pagar cosas que nadie había pagado todavía.
 
-**Salvo en los pares que se cambian en efectivo** (`CurrencyPair.settles_in_cash`). Ahí no
-hay comprobante entrante ni lo habrá —nadie fotografía un billete—, así que exigirlo borra
-el par entero: USD-VES tenía 134 operaciones sin cuadrar y CERO con entrante, y la pantalla
-salía vacía. En esos pares el filtro lo hace el ESTADO: cuenta lo que está en PENDING —un
-trato registrado— y no lo que sigue en QUOTED, que es una cotización que nadie confirmó.
+**En los pares que se cambian en efectivo** (`CurrencyPair.settles_in_cash`) todo esto se
+da la vuelta, y no es un matiz: es la otra pata del trato. Ahí los bolívares ya salieron y
+lo que falta es el efectivo del CLIENTE, así que lo pendiente no se mide con `missing` sino
+con `to_collect` — el valor menos lo que ya se le recogió (`collected_amount`).
 
-En un par de efectivo el saldo pendiente NO significa lo mismo, y quien lo pinte tiene que
-decirlo: ahí los bolívares ya salieron y lo que falta es el efectivo del cliente. Por eso
-el par viaja en cada entrada (`settles_in_cash`), para que la pantalla sepa si eso que
-enseña es lo que debemos o lo que nos deben.
+Medirlo con `missing` era el bug que vació la cola justo de lo que había que cobrar: una
+USD-VES creada desde su propio comprobante en bolívares nace cubierta (`missing = 0`) sin
+que nadie haya recogido un dólar, así que salía de la lista el mismo día en que empezaba a
+deberse. Las que sí aparecían eran las contrarias —aquellas a las que aún no les habíamos
+atado el comprobante—, que es la pata nuestra, no la suya.
+
+El comprobante entrante tampoco sirve de filtro ahí: no hay ni habrá —nadie fotografía un
+billete—, y exigirlo borraba el par entero (USD-VES: 134 operaciones sin cuadrar y CERO con
+entrante). Lo separa el ESTADO: cuenta lo que está en PENDING —un trato registrado— y no lo
+que sigue en QUOTED, que es una cotización que nadie confirmó.
+
+Por eso el par viaja en cada entrada (`settles_in_cash`), para que la pantalla sepa si eso
+que enseña es lo que debemos o lo que nos deben.
 
 **La moneda**: `missing` va en la moneda del VALOR del trato (lo que entrega el cliente:
 los USD de un USD/VES), no en la moneda con la que se le paga. Es la cifra exacta, la que
@@ -38,23 +46,30 @@ from datetime import datetime, timezone
 from typing import Iterable, Optional
 from uuid import UUID
 
-from sqlalchemy import Float, and_, func, or_
+from sqlalchemy import Float, and_, case, func, or_
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.currency_pair import CurrencyPair
 from app.models.user import User
 from app.models.whatsapp_client import WhatsAppClient
-from app.models.whatsapp_operation import WhatsAppOperation, WhatsAppOperationStatus
+from app.models.whatsapp_operation import (
+    WhatsAppDeliveryStatus,
+    WhatsAppOperation,
+    WhatsAppOperationStatus,
+)
 from app.models.whatsapp_payment import (
     WhatsAppIncomingPayment,
     WhatsAppOutgoingSettlement,
     WhatsAppPaymentAllocation,
 )
 from app.models.whatsapp_pending_delivery import (
+    COLLECTION_KIND,
+    DELIVERY_KIND,
     WhatsAppPendingDelivery,
     WhatsAppPendingDeliveryItem,
 )
-from app.services.whatsapp_quote_service import QuoteServiceError
+from app.schemas.whatsapp import WhatsAppOperationComplete
+from app.services.whatsapp_quote_service import QuoteServiceError, WhatsAppQuoteService
 
 #: Debajo de esto es ruido de redondeo, no deuda. Igual que en el front.
 EPSILON = 0.01
@@ -131,10 +146,24 @@ class ClientPendingService:
         paid = self._first_incoming_subquery()
 
         value = func.coalesce(WhatsAppOperation.amount, WhatsAppOperation.from_amount)
-        missing = (
-            value
-            - func.coalesce(settled.c.delivered, 0)
-            - func.coalesce(WhatsAppOperation.uncovered_amount, 0)
+        # Dos patas, dos cuentas — y el par decide cuál se debe.
+        #
+        # En un par normal lo que falta es lo NUESTRO: el valor menos lo que cubren los
+        # comprobantes de salida y menos el hueco declarado. En uno de efectivo lo que falta
+        # es lo del CLIENTE: el valor menos el efectivo ya recogido. Restar allí lo cubierto
+        # daba cero justo en las operaciones que sí hay que ir a cobrar —las que nacen de su
+        # propio comprobante en bolívares, cubiertas desde el primer segundo—, y por eso el
+        # par entero desaparecía de la cola en cuanto se pagaba.
+        missing = case(
+            (
+                CurrencyPair.settles_in_cash.is_(True),
+                value - func.coalesce(WhatsAppOperation.collected_amount, 0),
+            ),
+            else_=(
+                value
+                - func.coalesce(settled.c.delivered, 0)
+                - func.coalesce(WhatsAppOperation.uncovered_amount, 0)
+            ),
         )
         # La antigüedad se mide desde que entró el dinero. En los pares de efectivo no hay
         # comprobante del que sacarla, y ahí el `coalesce` sí trabaja: manda la fecha de la
@@ -279,11 +308,67 @@ class ClientPendingService:
             raise QuoteServiceError("client_not_found", "Cliente no encontrado", 404)
         return client
 
+    @staticmethod
+    def _settles_in_cash(op: WhatsAppOperation) -> bool:
+        cp = op.currency_pair
+        return bool(cp.settles_in_cash) if cp else False
+
     def _pending_amount(self, op: WhatsAppOperation) -> float:
+        """Lo que falta de esta operación: el efectivo del cliente, o lo que no cubrimos."""
+        if self._settles_in_cash(op):
+            return op.to_collect
         value = op.amount if op.amount is not None else op.from_amount
         return round(
             float(value or 0) - op.delivered_amount - float(op.uncovered_amount or 0), 2
         )
+
+    def _close_collected(self, op: WhatsAppOperation, actor: Optional[User]) -> None:
+        """
+        Cierra la operación cuyo efectivo ya está recogido entero.
+
+        Es lo que faltaba para que el gesto significara algo: marcar «ya me pagó» escribía
+        el hueco y dejaba la operación en PENDING, así que Pagos la seguía enseñando
+        pendiente para siempre y la cuenta del cliente no cuadraba con ella. Recoger el
+        último dólar es exactamente lo que hace `mark_delivered` desde el detalle, y hace
+        falta lo mismo: estado, fecha de entrega y su transacción.
+        """
+        if actor is None:
+            raise QuoteServiceError(
+                "collect_user_required",
+                "Falta el usuario que registra el cobro",
+                400,
+            )
+
+        now = datetime.now(timezone.utc)
+        if op.delivery_status == WhatsAppDeliveryStatus.PENDING:
+            op.delivery_status = WhatsAppDeliveryStatus.RECEIVED
+            op.delivered_at = now
+        if op.status != WhatsAppOperationStatus.COMPLETED:
+            op.status = WhatsAppOperationStatus.COMPLETED
+            op.completed_at = now
+
+        tx = WhatsAppQuoteService(self.db)._create_transaction_for_op(
+            op, WhatsAppOperationComplete(), actor
+        )
+        op.transaction_id = tx.id
+        tx.completed_at = op.completed_at
+
+    def _reopen_collected(self, op: WhatsAppOperation, item) -> None:
+        """
+        Devuelve al estado previo la operación que un cobro había cerrado.
+
+        La transacción NO se borra: se quedó atada a la operación y volverá a sincronizarse
+        cuando se cobre de nuevo (`_create_transaction_for_op` actualiza la que ya existe).
+        Borrarla desde aquí sería tocar los libros para deshacer una marca de pantalla.
+        """
+        if item.previous_status:
+            op.status = WhatsAppOperationStatus(item.previous_status)
+            if op.status != WhatsAppOperationStatus.COMPLETED:
+                op.completed_at = None
+        if item.previous_delivery_status:
+            op.delivery_status = WhatsAppDeliveryStatus(item.previous_delivery_status)
+            if op.delivery_status != WhatsAppDeliveryStatus.RECEIVED:
+                op.delivered_at = None
 
     def deliver(
         self,
@@ -293,15 +378,22 @@ class ClientPendingService:
         actor: Optional[User],
     ) -> dict:
         """
-        Marca como entregado, en efectivo y sin comprobante, un lote de operaciones.
+        Salda a mano un lote de operaciones: lo que le entregamos, o lo que nos pagó.
+
+        **El gesto lo decide el par de cada operación, no quien llama.** En un par que se
+        cambia en efectivo lo que se marca es que el CLIENTE trajo sus billetes
+        (`collected_amount`), y recoger el último cierra la operación. En cualquier otro se
+        declara cubierto un trozo del valor sin comprobante que lo respalde
+        (`uncovered_amount`). Un mismo lote puede llevar de los dos —un cliente tiene las
+        dos cosas a la vez— y por eso el tipo va en cada fila.
 
         **O todas o ninguna.** Una entrega a medias es peor que un error: deja dinero
         marcado sin que nadie sepa cuánto, así que cualquier problema levanta y no se
         guarda nada.
 
-        Lo que escribe es `uncovered_amount`, que es el hueco ENTERO de la operación y no un
-        incremento: lo entregado se SUMA a lo que ya hubiera. Antes de tocarlo se guarda el
-        valor previo en el lote, que es lo único que permite deshacer de verdad.
+        Las dos columnas guardan el TOTAL de la operación y no un incremento: lo marcado se
+        SUMA a lo que ya hubiera. Antes de tocarlo se guarda el valor previo en la fila del
+        lote, que es lo único que permite deshacer de verdad.
         """
         client = self._client_or_404(client_uuid)
         if not items:
@@ -381,16 +473,30 @@ class ClientPendingService:
                     400,
                 )
 
-            delivery.items.append(
-                WhatsAppPendingDeliveryItem(
-                    whatsapp_operation_id=op.id,
-                    amount=amount,
-                    previous_uncovered=op.uncovered_amount,
-                    previous_uncovered_reason=op.uncovered_reason,
-                )
+            item = WhatsAppPendingDeliveryItem(
+                whatsapp_operation_id=op.id,
+                amount=amount,
+                previous_uncovered=op.uncovered_amount,
+                previous_uncovered_reason=op.uncovered_reason,
+                previous_collected=op.collected_amount,
+                previous_status=op.status.value if op.status else None,
+                previous_delivery_status=(
+                    op.delivery_status.value if op.delivery_status else None
+                ),
             )
-            op.uncovered_amount = round(float(op.uncovered_amount or 0) + amount, 2)
-            op.uncovered_reason = DELIVERY_REASON
+            delivery.items.append(item)
+
+            if en_efectivo:
+                item.kind = COLLECTION_KIND
+                op.collected_amount = round(float(op.collected_amount or 0) + amount, 2)
+                # Recogido el último dólar, el trato se cierra. Sin esto la operación se
+                # quedaba en PENDING para siempre por mucho que el cliente hubiera pagado.
+                if op.to_collect <= EPSILON:
+                    self._close_collected(op, actor)
+            else:
+                item.kind = DELIVERY_KIND
+                op.uncovered_amount = round(float(op.uncovered_amount or 0) + amount, 2)
+                op.uncovered_reason = DELIVERY_REASON
 
         self.db.commit()
         self.db.refresh(delivery)
@@ -400,8 +506,10 @@ class ClientPendingService:
         """
         Devuelve las operaciones del lote a como estaban, sin borrar el rastro.
 
-        Repone el hueco previo en vez de restar lo entregado: si entre medias alguien tocó
-        la cobertura a mano, restar dejaría un número inventado. Y deshacer no borra el
+        Repone el valor previo en vez de restar lo marcado: si entre medias alguien tocó la
+        cobertura a mano, restar dejaría un número inventado. Un cobro que había cerrado la
+        operación la reabre al estado que tenía; su transacción se queda, porque deshacer
+        una marca de pantalla no es motivo para tocar los libros. Y deshacer no borra el
         lote — queda quién marcó, quién deshizo y cuándo, que es lo que hace auditable un
         error. Sin límite de tiempo: si se descubre mañana, se deshace mañana.
         """
@@ -420,8 +528,12 @@ class ClientPendingService:
             op = item.operation
             if op is None:
                 continue
-            op.uncovered_amount = item.previous_uncovered
-            op.uncovered_reason = item.previous_uncovered_reason
+            if item.kind == COLLECTION_KIND:
+                op.collected_amount = item.previous_collected
+                self._reopen_collected(op, item)
+            else:
+                op.uncovered_amount = item.previous_uncovered
+                op.uncovered_reason = item.previous_uncovered_reason
 
         delivery.undone_at = datetime.now(timezone.utc)
         delivery.undone_by_user_id = actor.id if actor else None

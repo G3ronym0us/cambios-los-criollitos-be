@@ -420,6 +420,31 @@ def test_forwarded_disambiguates_by_identification():
     got = pick_forwarded_incoming(candidates, set(), fwd(200.0, identification="V87654321"), NOW)
     assert got == 8
 
+def test_forwarded_non_zelle_ocr_fingerprint_breaks_on_a_single_misread_character():
+    """
+    HALLAZGO (agente 5, 2026-09-03): la huella del OCR (`receipt_fingerprint`) solo
+    normaliza espacios y mayúsculas — es igualdad de texto EXACTA. Dos lecturas de Tesseract
+    sobre la MISMA imagen (una del chat del cliente, otra de la que reenvía el operador al
+    grupo, a veces recomprimida por WhatsApp al reenviar) casi nunca producen el carácter por
+    carácter idéntico: basta que UNA cifra se lea distinto (el clásico O/0, o un separador de
+    miles) para que la huella no calce. Sin referencia bancaria en el comprobante (Pix,
+    Pago Móvil, muchos bancos VE no la imprimen fuera de "Referencia:"), la huella es la
+    ÚNICA prueba fuera de Zelle — así que este typo de un carácter hace que
+    `pick_forwarded_incoming` trate el reenvío como un pago NUEVO en vez de la reposición del
+    mismo comprobante, con el mismo resultado que ya costó el caso BRL→VES de 2026-08-06:
+    un saliente fantasma sumado al pago real.
+    """
+    candidates = [inc(7, 500.0, currency="BRL", raw_text="Comprovante PIX R$ 500,00 13/07 14:32")]
+    # Un solo carácter distinto (O en vez de 0 en el segundo cero del monto) — el mismo
+    # comprobante, la misma imagen, una segunda pasada de Tesseract.
+    criteria = fwd(500.0, currency="BRL", raw_text="Comprovante PIX R$ 5O0,00 13/07 14:32")
+    assert pick_forwarded_incoming(candidates, set(), criteria, NOW) is None, (
+        "Documentando el estado ACTUAL: la huella exacta no perdona un solo carácter de OCR "
+        "ruidoso. Si esto empieza a fallar, alguien ya lo arregló con matching difuso — "
+        "genial, pero hay que revisar que no una comprobantes que NO son el mismo."
+    )
+
+
 
 # ---------------------------------------------------------------------------
 # Capa con BD (OperationMatchService) — necesita Postgres local; si no, se salta

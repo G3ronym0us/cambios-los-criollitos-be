@@ -1487,6 +1487,21 @@ class WhatsAppPaymentService:
         cp = op.currency_pair
         return cp.to_currency.symbol if cp and cp.to_currency else None
 
+    def _settled_in_payment_currency(self, payment: WhatsAppOutgoingPayment) -> Optional[float]:
+        """
+        Lo que YA cubre este comprobante en `whatsapp_outgoing_settlements`, pasado a SU
+        moneda sumando todas sus liquidaciones. `None` cuando alguna liquidación no tiene
+        `settled_reference_rate`: sin tasa no hay cómo convertirla, y el fallo real de los
+        candidatos de cobertura era justo tratar ese caso como CERO en vez de "no lo sé" — un
+        comprobante que ya cubría la operación B volvía a ofrecerse entero libre para la A.
+        """
+        total = 0.0
+        for s in payment.settlements:
+            if not s.settled_reference_rate:
+                return None
+            total += (s.settled_amount or 0) * s.settled_reference_rate
+        return round(total, 2)
+
     def _free_amount(self, payment: WhatsAppOutgoingPayment) -> float:
         """
         Cuánto del comprobante no está repartido todavía, en su propia moneda.
@@ -1494,12 +1509,26 @@ class WhatsAppPaymentService:
         Cada parte del reparto va en la moneda del VALOR de su operación, así que para saber
         cuánto consume del comprobante hay que pasarla por su tasa — igual que hace el panel
         que reparte un comprobante entre varias operaciones.
+
+        Sin tasa en alguna liquidación (`_settled_in_payment_currency` devuelve `None`) no se
+        puede afirmar que sobra saldo: se trata como agotado en vez de libre. Es a propósito
+        conservador — mejor esconder un candidato legítimo que ofrecer uno ya comprometido.
+
+        También cubre el rastro de ANTES de esta tabla: un comprobante con el FK directo
+        (`whatsapp_operation_id`) puesto y `settled_amount`/`settled_reference_rate` a mano,
+        sin fila en `whatsapp_outgoing_settlements` — lo que `backfill_outgoing_settlements`
+        no alcanzó a migrar. Ese vínculo cuenta igual que uno con fila propia.
         """
-        usado = sum(
-            (s.settled_amount or 0) * (s.settled_reference_rate or 0)
-            for s in payment.settlements
-            if s.settled_reference_rate
-        )
+        usado = self._settled_in_payment_currency(payment)
+        if usado is None:
+            return 0.0
+
+        settled_op_ids = {s.whatsapp_operation_id for s in payment.settlements}
+        if payment.whatsapp_operation_id is not None and payment.whatsapp_operation_id not in settled_op_ids:
+            if not payment.settled_reference_rate:
+                return 0.0
+            usado += (payment.settled_amount or 0) * payment.settled_reference_rate
+
         return round(float(payment.amount or 0) - usado, 2)
 
     def operation_coverage(self, op_uuid) -> dict:
@@ -1733,13 +1762,13 @@ class WhatsAppPaymentService:
         settled = round(sum(r.settled_amount for r in rows), 2)
         # Lo que el comprobante entrega en SU moneda contra lo que ya está repartido: la
         # diferencia es lo que el operador todavía no ha dicho a qué trato pertenece.
-        covered_in_payment_currency = round(
-            sum(
-                r.settled_amount * (r.settled_reference_rate or 0)
-                for r in rows
-                if r.settled_reference_rate
-            ),
-            2,
+        # Mismo criterio que `_free_amount`: sin tasa en alguna fila no se puede convertir, y
+        # no se afirma que sobra saldo — se cuenta como comprometido, no como libre.
+        covered_in_payment_currency = self._settled_in_payment_currency(payment)
+        unassigned_in_payment_currency = (
+            round((payment.amount or 0) - covered_in_payment_currency, 2)
+            if covered_in_payment_currency is not None
+            else 0.0
         )
         return {
             "payment_id": payment.id,
@@ -1747,9 +1776,7 @@ class WhatsAppPaymentService:
             "currency": payment.currency,
             "settled_total": settled,
             "covered_in_payment_currency": covered_in_payment_currency,
-            "unassigned_in_payment_currency": round(
-                (payment.amount or 0) - covered_in_payment_currency, 2
-            ),
+            "unassigned_in_payment_currency": unassigned_in_payment_currency,
             "settlements": items,
         }
 

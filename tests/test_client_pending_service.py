@@ -38,7 +38,6 @@ from app.models.user import User
 from app.models.whatsapp_client import WhatsAppClient
 from app.models.whatsapp_operation import (
     WhatsAppAmountSide,
-    WhatsAppDeliveryStatus,
     WhatsAppOperation,
     WhatsAppOperationStatus,
 )
@@ -106,9 +105,7 @@ def make_op(
     status=WhatsAppOperationStatus.PENDING,
     beneficiary="Yelitza",
     uncovered=None,
-    collected=None,
     incoming_at=NOW,
-    delivery_status=None,
 ):
     """
     Una operación del cliente. `incoming_at=None` la deja SIN comprobante entrante, que es
@@ -128,8 +125,6 @@ def make_op(
         created_at=created_at,
         beneficiary_alias=beneficiary,
         uncovered_amount=uncovered,
-        collected_amount=collected,
-        delivery_status=delivery_status,
     )
     db.add(op)
     db.flush()
@@ -541,8 +536,8 @@ class TestParesDeEfectivo:
         ][0]
         assert entry["oldest_at"].replace(tzinfo=timezone.utc) == nacio
 
-    def test_lo_ya_cobrado_se_descuenta(self, db, world, cash_pair):
-        make_op(db, world["client"], cash_pair, amount=100, collected=40, incoming_at=None)
+    def test_lo_ya_entregado_se_descuenta_igual(self, db, world, cash_pair):
+        make_op(db, world["client"], cash_pair, amount=100, uncovered=40, incoming_at=None)
         db.commit()
 
         entry = ClientPendingService(db).pending_by_client_ids([world["client"].id])[
@@ -550,38 +545,10 @@ class TestParesDeEfectivo:
         ][0]
         assert entry["amount"] == 60
 
-    def test_lo_cobrado_del_todo_desaparece(self, db, world, cash_pair):
-        make_op(db, world["client"], cash_pair, amount=100, collected=100, incoming_at=None)
+    def test_lo_entregado_del_todo_desaparece(self, db, world, cash_pair):
+        make_op(db, world["client"], cash_pair, amount=100, uncovered=100, incoming_at=None)
         db.commit()
         assert ClientPendingService(db).pending_by_client_ids([world["client"].id]) == {}
-
-    def test_lo_que_cubrimos_nosotros_no_salda_lo_que_el_debe(self, db, world, cash_pair):
-        """
-        El corazón del asunto. Vincular el comprobante en bolívares cubre NUESTRA pata: la
-        operación queda sin nada por cuadrar y el cliente sigue sin traer un solo dólar.
-
-        Medirlo con lo cubierto sacaba de la lista justo a las que hay que ir a cobrar — y
-        eran todas, porque una operación creada desde su propio comprobante de salida nace
-        cubierta. El par entero desaparecía el día que se pagaba.
-        """
-        op = make_op(db, world["client"], cash_pair, amount=100, incoming_at=None)
-        pago = WhatsAppOutgoingPayment(
-            client_phone=world["client"].phone, amount=28000, currency="VES"
-        )
-        db.add(pago)
-        db.flush()
-        db.add(
-            WhatsAppOutgoingSettlement(
-                outgoing_payment_id=pago.id, whatsapp_operation_id=op.id, settled_amount=100
-            )
-        )
-        db.commit()
-
-        assert op.dict()["pending_amount"] == 0  # nuestra pata, cubierta
-        entry = ClientPendingService(db).pending_by_client_ids([world["client"].id])[
-            world["client"].id
-        ][0]
-        assert entry["amount"] == 100  # la suya, entera
 
     def test_entregar_y_deshacer_funcionan_sin_comprobante(self, db, world, cash_pair):
         """La entrega en lote es lo que se usa justamente aquí: cobrar efectivo a mano."""
@@ -621,7 +588,7 @@ class TestParesDeEfectivo:
         )
 
         db.refresh(op)
-        assert op.collected_amount == 100
+        assert op.uncovered_amount == 100
         assert batch["operations"] == 1
 
     def test_en_un_par_normal_el_beneficiario_se_sigue_exigiendo(self, db, world, cash_pair):
@@ -634,146 +601,6 @@ class TestParesDeEfectivo:
                 world["client"].uuid, [{"operation_uuid": str(op.uuid)}], None, world["actor"]
             )
         assert exc.value.code == "operation_without_beneficiary"
-
-
-class TestCobroDelEfectivo:
-    """
-    Marcar que el CLIENTE pagó, que es el gesto de un par de efectivo.
-
-    Es la otra pata del trato y hasta ahora no tenía dónde anotarse: marcar escribía
-    `uncovered_amount` —o sea declaraba cubierta la pata NUESTRA— y la operación se quedaba
-    en PENDING por mucho que el cliente hubiera traído los billetes.
-    """
-
-    def test_cobrar_entero_cierra_la_operacion(self, db, world, cash_pair):
-        op = make_op(
-            db, world["client"], cash_pair, amount=100, incoming_at=None,
-            delivery_status=WhatsAppDeliveryStatus.PENDING,
-        )
-        db.commit()
-
-        ClientPendingService(db).deliver(
-            world["client"].uuid, [{"operation_uuid": str(op.uuid)}], None, world["actor"]
-        )
-
-        db.refresh(op)
-        assert op.collected_amount == 100
-        # Lo que faltaba: sin esto Pagos la seguía enseñando «Pendiente» para siempre.
-        assert op.status == WhatsAppOperationStatus.COMPLETED
-        assert op.delivery_status == WhatsAppDeliveryStatus.RECEIVED
-        assert op.completed_at is not None
-
-    def test_un_cobro_parcial_deja_la_operacion_abierta(self, db, world, cash_pair):
-        """Trae 60 de los 100: se anotan los 60 y sigue debiendo 40, no se cierra nada."""
-        op = make_op(db, world["client"], cash_pair, amount=100, incoming_at=None)
-        db.commit()
-        service = ClientPendingService(db)
-
-        service.deliver(
-            world["client"].uuid,
-            [{"operation_uuid": str(op.uuid), "amount": 60}],
-            None,
-            world["actor"],
-        )
-
-        db.refresh(op)
-        assert op.collected_amount == 60
-        assert op.status == WhatsAppOperationStatus.PENDING
-        assert service.pending_by_client_ids([world["client"].id])[world["client"].id][0][
-            "amount"
-        ] == 40
-
-    def test_dos_cobros_parciales_se_suman_hasta_cerrarla(self, db, world, cash_pair):
-        """`collected_amount` es el total, no un incremento: el segundo pago se le suma."""
-        op = make_op(db, world["client"], cash_pair, amount=100, incoming_at=None)
-        db.commit()
-        service = ClientPendingService(db)
-
-        service.deliver(
-            world["client"].uuid,
-            [{"operation_uuid": str(op.uuid), "amount": 60}],
-            None,
-            world["actor"],
-        )
-        service.deliver(
-            world["client"].uuid,
-            [{"operation_uuid": str(op.uuid), "amount": 40}],
-            None,
-            world["actor"],
-        )
-
-        db.refresh(op)
-        assert op.collected_amount == 100
-        assert op.status == WhatsAppOperationStatus.COMPLETED
-
-    def test_no_se_puede_cobrar_mas_de_lo_que_debe(self, db, world, cash_pair):
-        op = make_op(db, world["client"], cash_pair, amount=100, collected=80, incoming_at=None)
-        db.commit()
-
-        with pytest.raises(QuoteServiceError) as exc:
-            ClientPendingService(db).deliver(
-                world["client"].uuid,
-                [{"operation_uuid": str(op.uuid), "amount": 30}],
-                None,
-                world["actor"],
-            )
-        assert exc.value.code == "amount_exceeds_pending"
-
-    def test_deshacer_un_cobro_reabre_la_operacion(self, db, world, cash_pair):
-        op = make_op(
-            db, world["client"], cash_pair, amount=100, incoming_at=None,
-            delivery_status=WhatsAppDeliveryStatus.PENDING,
-        )
-        db.commit()
-        service = ClientPendingService(db)
-        batch = service.deliver(
-            world["client"].uuid, [{"operation_uuid": str(op.uuid)}], None, world["actor"]
-        )
-
-        service.undo(world["client"].uuid, batch["uuid"], world["actor"])
-
-        db.refresh(op)
-        assert op.collected_amount is None
-        assert op.status == WhatsAppOperationStatus.PENDING
-        assert op.delivery_status == WhatsAppDeliveryStatus.PENDING
-        assert op.completed_at is None
-
-    def test_el_cobro_no_toca_lo_que_cubrimos_nosotros(self, db, world, cash_pair):
-        """Las dos patas son columnas distintas: cobrar no declara cubierto nada nuestro."""
-        op = make_op(db, world["client"], cash_pair, amount=100, incoming_at=None)
-        db.commit()
-
-        ClientPendingService(db).deliver(
-            world["client"].uuid, [{"operation_uuid": str(op.uuid)}], None, world["actor"]
-        )
-
-        db.refresh(op)
-        assert op.uncovered_amount is None
-
-    def test_un_lote_puede_llevar_un_cobro_y_una_entrega(self, db, world, cash_pair):
-        """
-        Un cliente tiene las dos cosas a la vez y salda de una vez. El gesto lo decide el par
-        de cada operación, así que cada fila escribe en su columna.
-        """
-        efectivo = make_op(db, world["client"], cash_pair, amount=100, incoming_at=None)
-        normal = make_op(db, world["client"], world["usd_ves"], amount=70)
-        db.commit()
-
-        batch = ClientPendingService(db).deliver(
-            world["client"].uuid,
-            [
-                {"operation_uuid": str(efectivo.uuid)},
-                {"operation_uuid": str(normal.uuid)},
-            ],
-            None,
-            world["actor"],
-        )
-
-        db.refresh(efectivo)
-        db.refresh(normal)
-        assert (efectivo.collected_amount, efectivo.uncovered_amount) == (100, None)
-        assert (normal.uncovered_amount, normal.collected_amount) == (70, None)
-        assert {item["kind"] for item in batch["items"]} == {"COLLECTION", "DELIVERY"}
 
 
 class TestLoQueLlegaAlFront:

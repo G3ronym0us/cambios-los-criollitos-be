@@ -1,21 +1,15 @@
 """
-Lo que se salda desde el perfil del cliente, marcado a mano y deshacible.
+Entregas de lo que le debemos al cliente, marcadas desde su perfil.
 
-Son DOS gestos opuestos y cada fila dice el suyo en `kind`:
+El caso: una operación se cubre normalmente con un comprobante de salida, pero a veces se
+le entrega al cliente en efectivo o por un canal que el bot no lee. Eso ya se podía
+declarar operación por operación (`uncovered_amount`), y lo que faltaba era hacerlo de
+varias a la vez —o repartiendo un monto entre ellas— dejando rastro y pudiendo deshacerlo.
 
-- `DELIVERY` — **le entregamos** a él sin comprobante que lo respalde: efectivo en mano, un
-  canal que el bot no lee. Vive en `uncovered_amount` de cada operación, igual que cuando se
-  declara desde el panel de cobertura.
-- `COLLECTION` — **nos pagó** él: el efectivo de un par que se cambia en efectivo
-  (`settles_in_cash`), que hasta ahora no tenía dónde anotarse. Vive en `collected_amount`.
-
-Mezclarlos en un solo gesto era el fondo del problema: en un par de efectivo marcar «pagado»
-escribía `uncovered_amount` —o sea, declaraba cubierta NUESTRA pata— y la del cliente no
-quedaba registrada en ninguna parte, así que la operación seguía en PENDING para siempre.
-
-Estas dos tablas son el rastro. No son contables: el dinero vive en las columnas de la
-operación. Aquí se guarda quién marcó qué, cuándo, y **qué había antes** — que es lo único
-que permite deshacer de verdad en vez de poner ceros.
+Estas dos tablas son ese rastro. No son contables: el dinero sigue viviendo en
+`uncovered_amount` de cada operación, como cuando se declara desde el panel de cobertura.
+Aquí sólo se guarda quién marcó qué, cuándo, y **qué había antes** — que es lo único que
+permite deshacer de verdad en vez de poner ceros.
 """
 
 from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Text
@@ -24,12 +18,6 @@ from sqlalchemy.sql import func
 
 from app.database.connection import Base
 from app.models.mixins import UUIDMixin
-
-#: Le entregamos al cliente sin comprobante. Es el valor histórico: todo lote anterior a la
-#: separación de los dos gestos es una entrega.
-DELIVERY_KIND = "DELIVERY"
-#: El cliente nos pagó su efectivo, en un par que se cambia en efectivo.
-COLLECTION_KIND = "COLLECTION"
 
 
 class WhatsAppPendingDelivery(UUIDMixin, Base):
@@ -90,10 +78,10 @@ class WhatsAppPendingDeliveryItem(UUIDMixin, Base):
     """
     Una operación dentro del lote, con el estado al que hay que volver si se deshace.
 
-    Los `previous_*` no son un detalle de auditoría: son el mecanismo. Tanto
-    `uncovered_amount` como `collected_amount` guardan el TOTAL de la operación, no un
-    incremento, así que deshacer no puede ser «restar lo marcado» ni «poner a cero» — hay
-    que reponer exactamente lo que había, que puede no ser nada o puede ser un lote anterior.
+    `previous_uncovered` / `previous_uncovered_reason` no son un detalle de auditoría: son
+    el mecanismo. `uncovered_amount` es el hueco ENTERO de la operación, no un incremento,
+    así que deshacer no puede ser «restar lo entregado» ni «poner a cero» — hay que reponer
+    exactamente lo que había, que puede no ser nada o puede ser una entrega anterior.
     """
 
     __tablename__ = "whatsapp_pending_delivery_items"
@@ -108,22 +96,10 @@ class WhatsAppPendingDeliveryItem(UUIDMixin, Base):
     whatsapp_operation_id = Column(
         Integer, ForeignKey("whatsapp_operations.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    #: `DELIVERY` (le entregamos) o `COLLECTION` (nos pagó). Va en la fila y no en el lote
-    #: porque el gesto lo decide el PAR de cada operación: un cliente con una USD-VES en
-    #: efectivo y un cambio normal a medio cubrir salda las dos de una vez, y son gestos
-    #: opuestos. Ponerlo arriba obligaba a partir el lote o a mentir en una de las dos.
-    kind = Column(String(12), nullable=False, server_default=DELIVERY_KIND)
-    #: Lo entregado —o cobrado, según el `kind`— en esta operación.
+    #: Lo entregado en esta operación dentro de este lote.
     amount = Column(Float, nullable=False)
     previous_uncovered = Column(Float, nullable=True)
     previous_uncovered_reason = Column(String(24), nullable=True)
-    #: Lo mismo para un lote de cobro: cuánto efectivo había recogido antes de éste.
-    previous_collected = Column(Float, nullable=True)
-    #: Un cobro que termina de recoger el efectivo CIERRA la operación, así que deshacerlo
-    #: tiene que poder reabrirla. Se guardan los dos estados por nombre —no el enum— para
-    #: que la fila siga siendo legible aunque el enum cambie.
-    previous_status = Column(String(12), nullable=True)
-    previous_delivery_status = Column(String(12), nullable=True)
 
     delivery = relationship("WhatsAppPendingDelivery", back_populates="items")
     operation = relationship("WhatsAppOperation", foreign_keys=[whatsapp_operation_id])
@@ -135,12 +111,10 @@ class WhatsAppPendingDeliveryItem(UUIDMixin, Base):
             "uuid": self.uuid,
             "operation_uuid": op.uuid if op else None,
             "pair_symbol": cp.pair_symbol if cp else None,
-            "kind": self.kind,
             "amount": self.amount,
             "currency": (op.currency if op and op.currency else (
                 cp.from_currency.symbol if cp and cp.from_currency else None
             )),
             "previous_uncovered": self.previous_uncovered,
             "previous_uncovered_reason": self.previous_uncovered_reason,
-            "previous_collected": self.previous_collected,
         }

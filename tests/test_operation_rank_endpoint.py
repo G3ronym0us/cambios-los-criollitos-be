@@ -211,7 +211,7 @@ def test_match_endpoint_returns_operations_with_scores_paginated(db, fund, pairs
     operación completa (lo que antes salía de `GET /operations`) junto a `score` (lo que
     antes salía de `candidates`), más `total`/`page`/`limit` para el pie del cajón.
     """
-    from app.core.dependencies import get_current_user
+    from app.core.dependencies import get_current_user, get_moderator_user
     from app.database.connection import get_db
     from app.main import app
     from starlette.testclient import TestClient
@@ -224,6 +224,10 @@ def test_match_endpoint_returns_operations_with_scores_paginated(db, fund, pairs
 
     app.dependency_overrides[get_db] = lambda: db
     app.dependency_overrides[get_current_user] = lambda: operator
+    # H-4.1: POST /operations/match now requires get_moderator_user; this test is
+    # about the ranking contract, not auth (covered separately in
+    # tests/test_auth_floor_h41.py), so it overrides the role gate directly too.
+    app.dependency_overrides[get_moderator_user] = lambda: operator
     try:
         with TestClient(app, raise_server_exceptions=False) as api:
             r = api.post(
@@ -263,7 +267,7 @@ def test_el_contrato_viejo_sigue_respondido(db, fund, pairs, operator):
 
     Se borran el campo y este test cuando el front nuevo esté desplegado en todas partes.
     """
-    from app.core.dependencies import get_current_user
+    from app.core.dependencies import get_current_user, get_moderator_user
     from app.database.connection import get_db
     from app.main import app
     from starlette.testclient import TestClient
@@ -277,6 +281,10 @@ def test_el_contrato_viejo_sigue_respondido(db, fund, pairs, operator):
 
     app.dependency_overrides[get_db] = lambda: db
     app.dependency_overrides[get_current_user] = lambda: operator
+    # H-4.1: POST /operations/match now requires get_moderator_user; this test is
+    # about the ranking contract, not auth (covered separately in
+    # tests/test_auth_floor_h41.py), so it overrides the role gate directly too.
+    app.dependency_overrides[get_moderator_user] = lambda: operator
     try:
         with TestClient(app, raise_server_exceptions=False) as api:
             r = api.post(

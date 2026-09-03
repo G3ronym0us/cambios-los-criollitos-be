@@ -21,8 +21,20 @@ from app.enums.user_roles import UserRole
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 @router.post("/register", response_model=UserResponse)
-async def register(user_data: UserRegister, db: Session = Depends(get_db)):
-    """Registrar nuevo usuario"""
+async def register(
+    user_data: UserRegister,
+    db: Session = Depends(get_db),
+    # H-4.1: this endpoint used to be wide open (no auth at all), which is how a
+    # self-registered, never-verified USER account could reach the rest of the API
+    # through routers gated only by get_current_user (JWT-valid, not role-checked).
+    # This is an internal admin panel, not a self-service product — there is no
+    # legitimate anonymous caller. The real user-creation path staff already use is
+    # POST /auth/admin/create-user (get_moderator_user, below). Gating this one
+    # behind ROOT turns it from a public backdoor into "ROOT can also do it this
+    # way", without removing the route (in case something still references it).
+    current_user: User = Depends(get_root_user),
+):
+    """Registrar nuevo usuario (sólo ROOT — ver H-4.1)"""
     user_repo = UserRepository(db)
     
     # Verificar si username o email ya existen

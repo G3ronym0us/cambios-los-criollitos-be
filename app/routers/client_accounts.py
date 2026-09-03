@@ -10,7 +10,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import get_current_user, get_moderator_user
+from app.core.dependencies import get_moderator_user
 from app.database.connection import get_db
 from app.models.user import User
 from app.repositories.whatsapp_client_account_repository import WhatsAppClientAccountRepository
@@ -37,7 +37,7 @@ def _get_account_or_404(db: Session, account_uuid: UUID):
 def list_client_accounts(
     client_uuid: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     client = WhatsAppClientRepository(db).get_by_uuid(client_uuid)
     if client is None:

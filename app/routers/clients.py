@@ -13,7 +13,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import get_current_user, get_moderator_user
+from app.core.dependencies import get_moderator_user
 from app.database.connection import get_db
 from app.models.user import User
 from app.repositories.currency_pair_repository import CurrencyPairRepository
@@ -40,7 +40,7 @@ router = APIRouter(prefix="/clients", tags=["Clients"])
 async def get_client_loans(
     client_uuid: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     try:
         return ClientLoanService(db).list_for_client(client_uuid)
@@ -55,7 +55,7 @@ async def preview_manual_loan_valuation(
     currency: str = Query(..., min_length=2, max_length=10),
     at: datetime = Query(..., description="Fecha del préstamo (ISO 8601)"),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Equivalencias de un préstamo sin comprobante, con las tasas de la fecha indicada."""
     try:
@@ -69,7 +69,7 @@ async def create_manual_loan(
     client_uuid: UUID,
     payload: ClientLoanManualCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Registra un préstamo a mano, sin comprobante."""
     try:
@@ -94,7 +94,7 @@ async def add_client_loan_repayment(
     loan_uuid: UUID,
     payload: ClientLoanRepaymentCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     service = ClientLoanService(db)
     try:
@@ -139,7 +139,7 @@ async def list_clients(
         None, description="Acota `has_pending` y `pending_by_pair` a un par ('USD/VES')"
     ),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Lista clientes del bot. Cualquier operador autenticado puede leer.
@@ -180,7 +180,7 @@ async def list_clients(
 async def get_client(
     client_uuid: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     client = WhatsAppClientRepository(db).get_by_uuid(client_uuid)
     if client is None:
@@ -196,7 +196,7 @@ async def get_client(
 async def get_client_balance(
     client_uuid: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Saldo a favor + movimientos del cliente. {balance, currency, entries}."""
     try:
@@ -268,7 +268,7 @@ async def list_pending_deliveries(
     client_uuid: UUID,
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Las entregas marcadas del cliente, con lo que había antes de cada una."""
     try:

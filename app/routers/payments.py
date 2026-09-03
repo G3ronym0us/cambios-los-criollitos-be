@@ -19,7 +19,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import get_current_user, get_root_user
+from app.core.dependencies import get_root_user, get_moderator_user
 from app.database.connection import get_db
 from app.models.user import User
 from app.schemas.whatsapp import (
@@ -54,7 +54,7 @@ async def preview_client_loan_valuation(
     fiat_currency: str | None = Query(None, min_length=2, max_length=10),
     payment_currency: str | None = Query(None, min_length=2, max_length=10),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Equivalencias del pago usando las tasas registradas en la fecha del comprobante."""
     try:
@@ -68,7 +68,7 @@ async def create_client_loan(
     payment_id: int,
     payload: ClientLoanCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Registra un pago saliente como préstamo al cliente."""
     try:
@@ -93,7 +93,7 @@ async def suggest_fund_deposit(
     table: Literal["incoming", "outgoing"],
     payment_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Qué fondo y qué gestor proponer para registrar este comprobante como depósito.
@@ -111,7 +111,7 @@ async def create_fund_deposit_from_receipt(
     payment_id: int,
     payload: FundDepositFromReceipt,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     El comprobante ES el depósito: entra al fondo CONFIRMADO, con él enganchado como
@@ -135,7 +135,7 @@ async def get_payments_stats(
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Agregados de la bandeja: cuántos comprobantes esperan una decisión, cuánto dinero de
@@ -163,7 +163,7 @@ async def suggest_operations_for_payments(
     table: Literal["incoming", "outgoing"],
     payload: PaymentSuggestionsRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Operación sugerida para una tanda de comprobantes, para que el listado la muestre en
@@ -187,7 +187,7 @@ async def list_payments(
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Página de pagos (paginada + búsqueda/clasificación server-side). Devuelve {items, total}."""
     service = WhatsAppPaymentService(db)
@@ -214,7 +214,7 @@ async def update_payment(
     payment_id: int,
     payload: WhatsAppPaymentUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Corrige a mano los campos que el OCR leyó mal (monto, moneda, referencia, bancos...).
@@ -236,7 +236,7 @@ async def link_payment_operation(
     payment_id: int,
     payload: WhatsAppPaymentLink,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Vincula un pago; si es saliente, completa la operación cuando lo entregado cubre su valor.
@@ -266,7 +266,7 @@ async def preview_outgoing_coverage(
     payment_id: int,
     operation_uuid: UUID = Query(..., description="Operación a la que se vincularía"),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Cuánto del valor de la operación cubriría este comprobante: lo que da la tasa, lo que le
@@ -284,7 +284,7 @@ async def preview_outgoing_coverage(
 async def get_payment_allocations(
     payment_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Reparto de un pago entrante: qué operaciones cubre, con cuánto y cómo se pagó cada una.
@@ -302,7 +302,7 @@ async def set_payment_allocations(
     payment_id: int,
     payload: PaymentAllocationsUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Reparte un pago entrante entre varias operaciones (un Zelle de 220 puede cubrir 200 de un
@@ -319,7 +319,7 @@ async def set_payment_allocations(
 async def get_outgoing_settlements(
     payment_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Reparto de un comprobante de salida: qué operaciones cubre y con cuánto del valor de cada
@@ -338,7 +338,7 @@ async def set_outgoing_settlements(
     payment_id: int,
     payload: OutgoingSettlementsUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Reparte un comprobante de salida entre varias operaciones. Reemplaza el reparto anterior
@@ -389,7 +389,7 @@ async def get_payment_timeline(
     table: Literal["incoming", "outgoing"],
     payment_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Bitácora del comprobante, de lo más reciente a lo más viejo. Cada línea viene con su
@@ -407,7 +407,7 @@ async def preview_payment_unlink(
     table: Literal["incoming", "outgoing"],
     payment_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Qué dejaría atrás desvincular este pago: si su operación se quedaría sin comprobantes y,
@@ -425,7 +425,7 @@ async def mark_personal_expense(
     payment_id: int,
     payload: WhatsAppPersonalExpense,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Marca/desmarca un pago saliente como gasto personal (auto-desvincula la op). Operador JWT."""
     service = WhatsAppPaymentService(db)
@@ -448,7 +448,7 @@ async def mark_irrelevant(
     payment_id: int,
     payload: WhatsAppIrrelevant,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Marca/desmarca un pago como irrelevante (auto-desvincula la op). Operador JWT.
@@ -476,7 +476,7 @@ async def convert_outgoing_to_group_incoming(
     payment_id: int,
     payload: WhatsAppForwardToGroup,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Convierte un saliente (Zelle reenviado al grupo) en un entrante contabilizado en el grupo. Operador JWT."""
     service = WhatsAppPaymentService(db)
@@ -490,7 +490,7 @@ async def convert_outgoing_to_group_incoming(
 async def convert_outgoing_to_incoming(
     payment_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Mueve un pago saliente a la bandeja de entrantes sin exigir un grupo."""
     try:
@@ -503,7 +503,7 @@ async def convert_outgoing_to_incoming(
 async def convert_incoming_to_outgoing(
     payment_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Devuelve un pago entrante no contabilizado a la bandeja de salientes."""
     try:
@@ -518,7 +518,7 @@ async def create_operation_from_payment(
     payment_id: int,
     payload: WhatsAppCreateOpManual,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Crea una operación a mano desde un pago y lo vincula. Soporta fondo (+EXCHANGE). Operador JWT."""
     service = WhatsAppPaymentService(db)
@@ -546,7 +546,7 @@ async def credit_balance_from_incoming(
     payment_id: int,
     payload: WhatsAppBalanceCredit,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Acredita un pago entrante (Zelle/PayPal/USD) como saldo a favor del cliente. Operador JWT."""
     try:

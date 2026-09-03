@@ -215,10 +215,21 @@ def require_role(min_role: UserRole):
             logger.warning(f"Access denied: User {current_user.id} has no role assigned")
             raise AuthorizationError("No role assigned to user")
         
-        # Verificar nivel de rol (asumiendo que UserRole tiene un atributo 'value' o similar)
-        user_role_level = getattr(current_user.role, 'value', 0)
-        required_role_level = getattr(min_role, 'value', 999)
-        
+        # CRITICAL FIX (found while implementing H-4.1, pre-dates this branch — commit
+        # ace2a098, 2025-07-02): this used to compare `.value` (the *string* "USER" /
+        # "MODERATOR" / "ROOT"), not `.level` (the intended integer hierarchy). Ordered
+        # alphabetically, "USER" is not less than "MODERATOR" or "ROOT", so the `<` check
+        # below never fired for a USER caller — get_moderator_user and get_root_user (both
+        # built on require_role) let ANY authenticated, verified USER through, regardless
+        # of min_role. This silently defeated every dependency upgrade in this branch (and
+        # every pre-existing get_moderator_user/get_root_user gate elsewhere in the app —
+        # e.g. currency.py's "ROOT-only" router was never actually ROOT-only for a USER).
+        # `.level` is the numeric hierarchy UserRole already defines for exactly this
+        # comparison; get_admin_user (require_any_role, plain `in` membership) was never
+        # affected because it doesn't compare `.value` at all.
+        user_role_level = getattr(current_user.role, 'level', 0)
+        required_role_level = getattr(min_role, 'level', 999)
+
         if user_role_level < required_role_level:
             logger.warning(
                 f"Access denied: User {current_user.id} has role {current_user.role.name} "

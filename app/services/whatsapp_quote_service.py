@@ -1164,6 +1164,24 @@ class WhatsAppQuoteService:
             op.transaction_id = tx.id
         else:
             self._sync_linked_transaction(op)
+
+        # `_apply_scenario` puede haber cambiado `fund_group_id`/`fund_group_out_id`: sin
+        # este resync, una op COMPLETED que cambia de fondo desde este endpoint dejaba el
+        # FundMovement viejo apuntando al fondo ANTERIOR mientras la operación ya decía
+        # otro -la plata "se movió" por un fondo que la operación ya no dice tocar-. Es el
+        # mismo resync que ya hace `set_scenario` para el mismo campo; acá faltaba. Sólo
+        # corre si el payload de verdad tocó alguno de esos campos: evita trabajo (y
+        # consultas) de más en la corrección de cliente/par/margen, que es la mayoría de
+        # las llamadas a este endpoint.
+        fund_fields = {
+            "clear_fund_group", "fund_group_uuid", "clear_fund_group_out",
+            "fund_group_out_uuid", "group_jid", "fund_manager_phone",
+        }
+        if fund_fields & fields_set:
+            from app.services.whatsapp_payment_service import WhatsAppPaymentService
+
+            WhatsAppPaymentService(self.db)._sync_fund_legs(op, operator)
+
         self.db.commit()
         self.db.refresh(op)
         return op
@@ -1184,6 +1202,21 @@ class WhatsAppQuoteService:
             raise QuoteServiceError(
                 "completed_status_is_terminal",
                 "Una operación completada no puede volver a otro estado porque ya tiene una transacción contable",
+                409,
+            )
+        if (
+            op.status == WhatsAppOperationStatus.CANCELLED
+            and target != WhatsAppOperationStatus.QUOTED
+        ):
+            # Reactivar una cancelada tiene un solo camino sancionado: `restore_quote`
+            # (CANCELLED -> QUOTED, con su propio refresh de `expires_at`). Dejar que este
+            # cambio administrativo la mande directo a PENDING o COMPLETED se salta esa
+            # revisión y resucita movimientos de fondo/transacción para un trato que el
+            # operador había cancelado a propósito.
+            raise QuoteServiceError(
+                "cancelled_must_be_restored_first",
+                "Una operación cancelada sólo puede reactivarse con /restore (vuelve a "
+                "QUOTED); desde ahí sigue su curso normal",
                 409,
             )
 

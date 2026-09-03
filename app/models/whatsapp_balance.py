@@ -13,8 +13,8 @@ en Bs a la tasa del día) debita 30.
 
 import enum
 
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Text, Enum as SQLEnum
-from sqlalchemy.sql import func
+from sqlalchemy import Column, Index, Integer, String, Float, DateTime, ForeignKey, Text, Enum as SQLEnum
+from sqlalchemy.sql import func, text
 from sqlalchemy.orm import relationship
 
 from app.database.connection import Base
@@ -28,6 +28,31 @@ class WhatsAppBalanceEntryType(enum.Enum):
 
 class WhatsAppBalanceEntry(UUIDMixin, Base):
     __tablename__ = "whatsapp_balance_entries"
+    __table_args__ = (
+        # `credit_from_incoming`/`debit_for_operation` ya comprueban "no existe todavía"
+        # antes de insertar, pero eso es lectura-luego-escritura sin lock: dos requests que
+        # lleguen a la vez (un reintento del bot, un doble click) pueden pasar la comprobación
+        # los dos y dejar el mismo pago acreditado —o la misma operación debitada— dos veces.
+        # Estos índices hacen que la segunda escritura choque en la base, no solo en la app.
+        #
+        # No filtran también por entry_type: Postgres no deja usar el cast del enum a texto
+        # en un índice parcial (su función de salida no es IMMUTABLE — el valor podría
+        # renombrarse con ALTER TYPE). No hace falta: por construcción del servicio,
+        # `incoming_payment_id` sólo se llena en un CREDIT y `whatsapp_operation_id` sólo en
+        # un DEBIT (`adjust()`, el único otro camino, no llena ninguno de los dos).
+        Index(
+            "uq_balance_credit_per_incoming_payment",
+            "incoming_payment_id",
+            unique=True,
+            postgresql_where=text("incoming_payment_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_balance_debit_per_operation",
+            "whatsapp_operation_id",
+            unique=True,
+            postgresql_where=text("whatsapp_operation_id IS NOT NULL"),
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     client_id = Column(Integer, ForeignKey("whatsapp_clients.id"), nullable=False, index=True)

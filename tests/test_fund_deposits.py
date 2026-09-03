@@ -183,3 +183,27 @@ def test_a_movement_outside_the_filter_has_no_page(db, fund, operator):
     corte = datetime.now(timezone.utc) - timedelta(days=5)
     assert repo.locate_movement(viejo, date_to=corte) == 1
     assert repo.locate_movement(reversa, date_to=corte) is None
+
+
+def test_confirmed_deposit_fills_usdt_equivalent(deposits, db, fund, operator):
+    """
+    Sin equivalente en USDT, `get_group_balance` cuenta este depósito como 0 en su
+    consolidado (`total_position_usdt` suma `amount_usdt`, no `amount`): el dinero entró
+    al fondo pero el balance no lo refleja. USD/USDT es 1:1 así que no hace falta ninguna
+    tasa cargada para probarlo.
+    """
+    from app.repositories.fund_repository import FundRepository
+
+    pending = deposits.create_manual(
+        group_uuid=fund.uuid, user_uuid=operator.uuid, amount=650, currency="USD",
+        created_by_user_id=operator.id,
+    )
+    result = deposits.confirm(pending["uuid"], deposit_method="TRANSFER", recorded_by_user_id=operator.id)
+
+    movement = db.query(FundMovement).filter(
+        FundMovement.uuid == result["confirmed_movement_uuid"]
+    ).first()
+    assert movement.amount_usdt == 650
+
+    balance = FundRepository(db).get_group_balance(fund.id)
+    assert balance["total_position_usdt"] == 650

@@ -27,6 +27,7 @@ from app.models.fund import (
 from app.models.user import User
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from app.repositories.fund_repository import FundRepository
+from app.services import valuation
 from app.services.fund_channel import resolve_fund_channel
 from app.services.whatsapp_quote_service import QuoteServiceError
 
@@ -213,13 +214,22 @@ class FundPendingDepositService:
                 "missing_depositor", "No se pudo determinar el depositante (envía user_uuid)", 400
             )
 
+        # Equivalente en USDT al momento del depósito: sin esto, `get_group_balance` suma
+        # `amount_usdt` de este movimiento como 0 y un fondo que no lleva USD (COP, BRL)
+        # reporta balance consolidado cero aunque el dinero sí entró — no es que falte,
+        # es que nunca se calculó. Igual que `_sync_fund_legs` para las patas de operación.
+        now = datetime.now(timezone.utc)
+        equivalents = valuation.equivalents(self.db, final_amount, final_currency, now)
+
         movement = self.fund_repo.create_movement(
             group_id=row.group_id,
             user_id=depositor_id,
             movement_type=FundMovementType.DEPOSIT,
             amount=final_amount,
             currency=final_currency,
-            movement_date=datetime.now(timezone.utc),
+            movement_date=now,
+            amount_usdt=equivalents["usdt_amount"],
+            usdt_rate=equivalents["usdt_rate"],
             reference=reference or row.reference,
             notes=notes,
             recorded_by_user_id=recorded_by_user_id,

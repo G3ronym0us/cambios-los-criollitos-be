@@ -259,6 +259,33 @@ class WhatsAppOperation(UUIDMixin, Base):
         return max(dates) if dates else None
 
     @property
+    def first_outgoing_payment_at(self):
+        """
+        Cuándo salió NUESTRA plata: la fecha del primer comprobante de salida.
+
+        Es el espejo de `first_incoming_payment_at` y existe por la misma razón: mide
+        antigüedad, no el hecho más reciente. En un par que se cambia en efectivo el
+        comprobante entrante no existe —de un billete no hay foto—, así que lo único que
+        sitúa la operación en el tiempo es la salida: los bolívares que ya mandamos. Sin
+        esta fecha, la antigüedad de esas operaciones cae a `created_at`, que es cuándo el
+        operador las tecleó, y una tanda registrada a mano el mismo minuto sale toda con la
+        misma espera aunque los pagos fueran de días distintos.
+
+        El MÍNIMO y no el máximo: un segundo comprobante sobre la misma operación no puede
+        rejuvenecer una deuda vieja. Para «cuándo se pagó», que es el hecho más reciente,
+        está `last_outgoing_payment_at`.
+
+        `None` si todavía no hay ninguno; entonces la fecha de la operación es lo mejor que
+        hay y quien lo consuma se cae a ella.
+        """
+        dates = [
+            s.payment.created_at
+            for s in (self.outgoing_settlements or [])
+            if s.payment is not None and s.payment.created_at
+        ]
+        return min(dates) if dates else None
+
+    @property
     def first_incoming_payment_at(self):
         """
         Cuándo llegó el dinero del cliente: la fecha de su primer comprobante entrante.
@@ -385,6 +412,7 @@ class WhatsAppOperation(UUIDMixin, Base):
             "legacy_sqlite_id": self.legacy_sqlite_id,
             "first_incoming_payment_at": self.first_incoming_payment_at,
             "last_incoming_payment_at": self.last_incoming_payment_at,
+            "first_outgoing_payment_at": self.first_outgoing_payment_at,
             "last_outgoing_payment_at": self.last_outgoing_payment_at,
             "quoted_at": self.quoted_at,
             "expires_at": self.expires_at,

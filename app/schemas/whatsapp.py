@@ -178,6 +178,10 @@ class WhatsAppOperationResponse(BaseModel):
     # el pago más reciente — lo que un listado debe mostrar como "fecha del pago" cuando
     # el cliente pagó en varias partes. Ver el docstring de la property en el modelo.
     last_incoming_payment_at: Optional[datetime] = None
+    # El espejo de `first_incoming_payment_at` del lado de la salida: mide antigüedad, no el
+    # hecho más reciente. Es la única fecha real que tiene una operación de par en efectivo,
+    # donde el comprobante entrante no existe.
+    first_outgoing_payment_at: Optional[datetime] = None
     last_outgoing_payment_at: Optional[datetime] = None
     quoted_at: datetime
     expires_at: datetime

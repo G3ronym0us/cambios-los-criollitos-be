@@ -1166,6 +1166,7 @@ class WhatsAppPaymentService:
         """Fija cuánto cubre este comprobante. Sin monto explícito, lo que da la tasa."""
         reference_rate = self._reference_rate(op, payment)
         value = settled_amount
+        was_explicit = settled_amount is not None
         if value is None:
             if reference_rate and payment.amount:
                 value = round(float(payment.amount) / reference_rate, 2)
@@ -1174,6 +1175,20 @@ class WhatsAppPaymentService:
                 value = self.operation_value(op)[0] - self.delivered_amount(op, payment.id)
         if value is not None and value <= 0:
             raise QuoteServiceError("invalid_settled_amount", "Lo cubierto debe ser > 0", 400)
+        # Mismo tope que `set_settlements`: ningún camino para fijar cuánto cubre un
+        # comprobante puede dejar una operación cubierta por encima de su valor. Solo se
+        # exige cuando el monto vino explícito — el derivado arriba ya se calcula acotado
+        # al pendiente real de la operación.
+        if was_explicit:
+            op_value, op_currency = self.operation_value(op)
+            other = self.delivered_amount(op, exclude_payment_id=payment.id)
+            if op_value > 0 and round(other + float(value), 2) > round(op_value, 2) + 0.01:
+                raise QuoteServiceError(
+                    "settlement_exceeds_operation",
+                    f"La operación {op.uuid} vale {op_value:.2f} {op_currency} y ya tiene "
+                    f"{other:.2f} cubiertos: no puede recibir {float(value):.2f} más",
+                    400,
+                )
         self._upsert_settlement(payment, op, round(float(value), 2), reference_rate)
         self._sync_settlement_totals(payment)
 

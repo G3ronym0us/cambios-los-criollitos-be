@@ -451,12 +451,18 @@ def test_la_transaccion_manual_registra_una_entrada(db, fund, pairs, operator):
     """Lo que el cliente entrega ENTRA al fondo: el endpoint manual también lo registra así."""
     from starlette.testclient import TestClient
 
-    from app.core.dependencies import get_current_user
+    from app.core.dependencies import get_current_user, get_moderator_user
     from app.database.connection import get_db
     from app.main import app
 
     app.dependency_overrides[get_db] = lambda: db
     app.dependency_overrides[get_current_user] = lambda: operator
+    # H-4.1: POST /transactions now requires get_moderator_user. This test is about the
+    # fund-leg bookkeeping the endpoint produces, not about auth, so it overrides the role
+    # gate directly too (same pattern as test_client_accounts_endpoint.py) instead of
+    # asserting `operator` is a moderator — role-gating itself is covered separately by
+    # tests/test_auth_floor_h41.py.
+    app.dependency_overrides[get_moderator_user] = lambda: operator
     try:
         with TestClient(app, raise_server_exceptions=False) as api:
             resp = api.post("/transactions", json={

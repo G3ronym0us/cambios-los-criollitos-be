@@ -17,7 +17,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import get_current_user, get_moderator_user
+from app.core.dependencies import get_moderator_user
 from app.database.connection import get_db
 from app.models.user import User
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
@@ -70,7 +70,7 @@ async def list_operations(
     page: int = Query(1, ge=1),
     limit: int = Query(200, ge=1, le=500),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Lista operaciones del bot, paginada. Cualquier operador autenticado puede leer.
@@ -131,7 +131,7 @@ def _payment_link_flags(db: Session, op_ids: list[int]) -> tuple[set[int], set[i
 async def rank_operations_for_payment(
     payload: OperationRankRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Filtra, puntúa contra el comprobante y ordena en un solo viaje: el cajón de "vincular
@@ -189,7 +189,7 @@ async def rank_operations_for_payment(
 @router.get("/stats", response_model=WhatsAppStatsResponse)
 async def get_operations_stats(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     service = WhatsAppQuoteService(db)
     return WhatsAppStatsResponse(**service.get_stats())
@@ -199,7 +199,7 @@ async def get_operations_stats(
 async def get_operation(
     op_uuid: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     service = WhatsAppQuoteService(db)
     op = service.get_by_uuid(op_uuid)
@@ -212,7 +212,7 @@ async def get_operation(
 async def get_operation_payments(
     op_uuid: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Pagos entrantes y salientes vinculados a la operación (para el detalle)."""
     service = WhatsAppPaymentService(db)
@@ -227,7 +227,7 @@ async def debit_balance_for_operation(
     op_uuid: UUID,
     payload: WhatsAppBalanceDebit,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Debita saldo a favor del cliente por esta operación de abono (default: from_amount USD)."""
     try:
@@ -242,7 +242,7 @@ async def debit_balance_for_operation(
 async def mark_operation_delivered(
     op_uuid: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Recibe los USD, completa la operación y asegura su transacción."""
     service = WhatsAppQuoteService(db)
@@ -258,7 +258,7 @@ async def update_operation(
     op_uuid: UUID,
     payload: WhatsAppOperationUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Edita cliente, escenario, grupo y receptor como una sola operación atómica."""
     service = WhatsAppQuoteService(db)
@@ -274,7 +274,7 @@ async def update_operation_status(
     op_uuid: UUID,
     payload: WhatsAppOperationStatusUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Cambia manualmente el estado; COMPLETED crea la transacción contable."""
     service = WhatsAppQuoteService(db)
@@ -290,7 +290,7 @@ async def update_operation_value(
     op_uuid: UUID,
     payload: WhatsAppOperationValue,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Corrige cuánto vale el trato, hacia arriba o hacia abajo. Reescala la cotización, recorta
@@ -307,7 +307,7 @@ async def update_operation_value(
 async def get_operation_coverage(
     op_uuid: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Qué cubre ya la operación y con qué comprobantes del cliente podría terminar de cubrirse.
@@ -328,7 +328,7 @@ async def set_operation_coverage(
     op_uuid: UUID,
     payload: OperationCoverageUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Fija con qué comprobantes se cubre la operación. Al cuadrarla la tasa se deriva de la suma;
@@ -375,7 +375,7 @@ async def update_operation_scenario(
     op_uuid: UUID,
     payload: WhatsAppOperationScenarioUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Edición manual del escenario/grupo/receptor del entrante desde el dashboard."""
     service = WhatsAppQuoteService(db)
@@ -390,7 +390,7 @@ async def update_operation_scenario(
 async def get_profit_allocations(
     op_uuid: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Quién se queda con el margen de esta operación, y cuánto quedó sin asignar."""
     service = WhatsAppQuoteService(db)

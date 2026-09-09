@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_moderator_user
 from app.database.connection import get_db
 from app.models.user import User
 from app.models.whatsapp_message_analysis import WhatsAppMessageAnalysis
@@ -47,7 +47,7 @@ def list_analyses(
     limit: int = Query(100, ge=1, le=500),
     skip: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     El listado que se revisa desde el panel, del más reciente al más viejo.
@@ -88,7 +88,7 @@ def list_analyses(
 def analyses_stats(
     days: int = Query(7, ge=1, le=365),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Recuento por veredicto y cuántos quedan por revisar."""
     service = AnalysisCorpusService(db)
@@ -113,7 +113,7 @@ def analyses_stats(
 def analyses_digest(
     hours: int = Query(24, ge=1, le=720),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """El mismo resumen que sale por WhatsApp una vez al día, para verlo bajo demanda."""
     return {"hours": hours, "text": AnalysisDigestService(db).build_message(hours)}
@@ -124,7 +124,7 @@ def label_analysis(
     analysis_uuid: UUID,
     payload: AnalysisLabel,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Corrige a mano lo que el join con la operación no resuelve.

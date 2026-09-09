@@ -19,7 +19,7 @@ from app.models.whatsapp_operation import WhatsAppOperation
 from app.models.whatsapp_payment import WhatsAppOutgoingPayment
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
 from app.services.whatsapp_quote_service import QuoteServiceError
-from tests.conftest import _pair
+from tests.conftest import _drop_pair, _pair
 
 
 @pytest.fixture
@@ -41,6 +41,7 @@ def seed(engine):
         session.flush()
 
         pair = _pair(session, "ZELLE", "VES", 800.0)
+        pair_id = pair.id
 
         session.add(WhatsAppClient(phone="1900000cop", display_name="CreateOp", is_tracked=True))
         session.flush()
@@ -105,6 +106,7 @@ def seed(engine):
         # Fondos y grupos que pudieran haberse tocado quedan; este flujo no crea fondo (no se
         # pasa fund_group_uuid), así que no hay nada más que limpiar salvo el operador.
         cleanup.query(User).filter(User.id == data["operator_id"]).delete()
+        _drop_pair(cleanup, pair_id)
         cleanup.commit()
     finally:
         cleanup.close()

@@ -32,7 +32,7 @@ from app.models.whatsapp_operation import (
 from app.models.whatsapp_payment import WhatsAppOutgoingPayment
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
 from app.services.whatsapp_quote_service import QuoteServiceError
-from tests.conftest import _currency, _pair
+from tests.conftest import _currency, _drop_pair, _pair
 
 
 @pytest.fixture
@@ -52,6 +52,7 @@ def seed(engine):
         session.flush()
 
         pair = _pair(session, "ZELLE", "VES", 800.0)
+        pair_id = pair.id
 
         fund = FundGroup(name=f"Fondo race {id(session)}", currency="USD", is_active=True)
         session.add(fund)
@@ -146,6 +147,7 @@ def seed(engine):
         cleanup.query(FundGroupMember).filter(FundGroupMember.group_id == data["fund_id"]).delete()
         cleanup.query(FundGroup).filter(FundGroup.id == data["fund_id"]).delete()
         cleanup.query(User).filter(User.id == data["operator_id"]).delete()
+        _drop_pair(cleanup, pair_id)
         cleanup.commit()
     finally:
         cleanup.close()

@@ -21,7 +21,7 @@ from app.models.whatsapp_operation import (
 )
 from app.services.whatsapp_balance_service import WhatsAppBalanceService
 from app.services.whatsapp_quote_service import QuoteServiceError
-from tests.conftest import _pair
+from tests.conftest import _drop_pair, _pair
 
 
 @pytest.fixture
@@ -38,6 +38,7 @@ def seed(engine):
         session.flush()
 
         pair = _pair(session, "ZELLE", "VES", 800.0)
+        pair_id = pair.id
 
         client = WhatsAppClient(phone="1900000ab", display_name="Abono", is_tracked=True)
         session.add(client)
@@ -87,6 +88,7 @@ def seed(engine):
         ).delete(synchronize_session=False)
         cleanup.query(WhatsAppClient).filter(WhatsAppClient.id == data["client_id"]).delete()
         cleanup.query(User).filter(User.id == data["operator_id"]).delete()
+        _drop_pair(cleanup, pair_id)
         cleanup.commit()
     finally:
         cleanup.close()

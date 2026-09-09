@@ -432,6 +432,42 @@ class TestLastOutgoingPaymentAt:
         assert op.last_outgoing_payment_at is None
 
 
+class TestFirstOutgoingPaymentAt:
+    """
+    La antigüedad por el lado de la SALIDA: el espejo de `first_incoming_payment_at`.
+
+    Es la única fecha real que tiene una operación de par en efectivo, donde el comprobante
+    entrante no existe. Sin ella la antigüedad cae a `created_at` —cuándo la tecleó el
+    operador— y una tanda registrada a mano el mismo minuto sale entera con la misma espera.
+    """
+
+    def test_toma_el_primero_y_no_el_mas_reciente(self, db, world):
+        op = make_op(db, world["client"], world["usd_ves"], amount=100)
+        for dia, monto in ((10, 20), (2, 30)):
+            pago = WhatsAppOutgoingPayment(
+                client_phone=world["client"].phone, amount=monto * 280, currency="VES",
+                created_at=NOW - timedelta(days=dia),
+            )
+            db.add(pago)
+            db.flush()
+            db.add(WhatsAppOutgoingSettlement(
+                outgoing_payment_id=pago.id, whatsapp_operation_id=op.id, settled_amount=monto,
+            ))
+        db.commit()
+        db.refresh(op)
+
+        # Un segundo comprobante no puede rejuvenecer una deuda vieja: la antigüedad se
+        # queda en el primero, mientras «cuándo se pagó» se va al último.
+        assert op.first_outgoing_payment_at.replace(tzinfo=timezone.utc) == NOW - timedelta(days=10)
+        assert op.last_outgoing_payment_at.replace(tzinfo=timezone.utc) == NOW - timedelta(days=2)
+
+    def test_sin_comprobante_de_salida_no_hay_fecha(self, db, world):
+        op = make_op(db, world["client"], world["usd_ves"])
+        db.commit()
+        db.refresh(op)
+        assert op.first_outgoing_payment_at is None
+
+
 class TestLastIncomingPaymentAt:
     """
     La fecha que la pestaña «Cuenta» del cliente enseña en cada fila: cuándo pagó el
@@ -528,6 +564,43 @@ class TestParesDeEfectivo:
         assert [(e["pair_symbol"], e["amount"], e["operations"]) for e in entries] == [
             ("USD-COP efectivo", 100, 1)
         ]
+
+    def test_la_antiguedad_sale_de_la_salida_y_no_del_tecleo(self, db, world, cash_pair):
+        """
+        El caso que se veía en «Por cobrar»: cinco operaciones tecleadas a mano el mismo
+        minuto salían todas con la misma espera, la del registro, aunque los bolívares se
+        hubieran mandado en días distintos.
+
+        Sin entrante del que sacar la antigüedad, la fecha tiene que salir del comprobante
+        de SALIDA —lo que ya mandamos— antes de caer a `created_at`.
+        """
+        registradas = NOW  # las dos se teclean ahora, en la misma tanda
+        for dias_atras, monto in ((8, 100), (5, 60)):
+            op = make_op(
+                db, world["client"], cash_pair,
+                amount=monto, from_amount=monto, to_amount=monto * 4000,
+                created_at=registradas, incoming_at=None,
+            )
+            pago = WhatsAppOutgoingPayment(
+                client_phone=world["client"].phone, amount=monto * 4000, currency="COP",
+                created_at=NOW - timedelta(days=dias_atras),
+            )
+            db.add(pago)
+            db.flush()
+            # Sin `settled_amount` la operación quedaría cubierta y saldría de la deuda: lo
+            # que se ata aquí es la FECHA, no el pago.
+            db.add(WhatsAppOutgoingSettlement(
+                outgoing_payment_id=pago.id, whatsapp_operation_id=op.id, settled_amount=0,
+            ))
+        db.commit()
+
+        entries = ClientPendingService(db).pending_by_client_ids([world["client"].id])[
+            world["client"].id
+        ]
+        entry = next(e for e in entries if e["pair_symbol"] == "USD-COP efectivo")
+        assert entry["operations"] == 2
+        # La más vieja de las dos salidas, no el minuto en que se registraron las dos.
+        assert entry["oldest_at"].replace(tzinfo=timezone.utc) == NOW - timedelta(days=8)
 
     def test_una_cotizacion_sin_comprobante_no_cuenta(self, db, world, cash_pair):
         """

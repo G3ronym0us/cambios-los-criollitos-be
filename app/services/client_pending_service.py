@@ -59,6 +59,7 @@ from app.models.whatsapp_operation import (
 )
 from app.models.whatsapp_payment import (
     WhatsAppIncomingPayment,
+    WhatsAppOutgoingPayment,
     WhatsAppOutgoingSettlement,
     WhatsAppPaymentAllocation,
 )
@@ -92,6 +93,27 @@ class ClientPendingService:
                 func.coalesce(func.sum(WhatsAppOutgoingSettlement.settled_amount), 0).label(
                     "delivered"
                 ),
+            )
+            .group_by(WhatsAppOutgoingSettlement.whatsapp_operation_id)
+            .subquery()
+        )
+
+    def _first_outgoing_subquery(self):
+        """
+        Cuándo salió NUESTRA plata en cada operación: su primer comprobante de salida.
+
+        Va por `whatsapp_outgoing_settlements` y no por el FK del comprobante, que es la
+        misma razón por la que lo hace `_settled_subquery`: un saliente repartido entre dos
+        operaciones sólo apunta con el FK a una de ellas.
+        """
+        return (
+            self.db.query(
+                WhatsAppOutgoingSettlement.whatsapp_operation_id.label("op_id"),
+                func.min(WhatsAppOutgoingPayment.created_at).label("paid_at"),
+            )
+            .join(
+                WhatsAppOutgoingPayment,
+                WhatsAppOutgoingPayment.id == WhatsAppOutgoingSettlement.outgoing_payment_id,
             )
             .group_by(WhatsAppOutgoingSettlement.whatsapp_operation_id)
             .subquery()
@@ -144,6 +166,7 @@ class ClientPendingService:
         """
         settled = self._settled_subquery()
         paid = self._first_incoming_subquery()
+        sent = self._first_outgoing_subquery()
 
         value = func.coalesce(WhatsAppOperation.amount, WhatsAppOperation.from_amount)
         # Dos patas, dos cuentas — y el par decide cuál se debe.
@@ -165,16 +188,23 @@ class ClientPendingService:
                 - func.coalesce(WhatsAppOperation.uncovered_amount, 0)
             ),
         )
-        # La antigüedad se mide desde que entró el dinero. En los pares de efectivo no hay
-        # comprobante del que sacarla, y ahí el `coalesce` sí trabaja: manda la fecha de la
-        # operación, que es lo mejor que existe.
-        since = func.coalesce(paid.c.paid_at, WhatsAppOperation.created_at)
+        # La antigüedad se mide desde que se movió el dinero, nunca desde que se registró la
+        # operación: una que el bot no reconoció se teclea a mano días después, y ordenar por
+        # `created_at` manda al final de la cola justo las más viejas.
+        #
+        # Primero el entrante, que es el que abre la deuda en un par normal. Si no lo hay
+        # —los pares de efectivo, donde de un billete no existe comprobante— manda la SALIDA:
+        # los bolívares que ya mandamos son el único hecho fechado de esa operación. Sin ese
+        # segundo escalón una tanda registrada a mano en el mismo minuto salía entera con la
+        # misma espera, la del tecleo. `created_at` queda de último recurso.
+        since = func.coalesce(paid.c.paid_at, sent.c.paid_at, WhatsAppOperation.created_at)
 
         q = (
             self.db.query(WhatsAppOperation)
             .join(CurrencyPair, CurrencyPair.id == WhatsAppOperation.currency_pair_id)
             .outerjoin(settled, settled.c.op_id == WhatsAppOperation.id)
             .outerjoin(paid, paid.c.op_id == WhatsAppOperation.id)
+            .outerjoin(sent, sent.c.op_id == WhatsAppOperation.id)
             .filter(
                 WhatsAppOperation.status.in_(
                     [WhatsAppOperationStatus.PENDING, WhatsAppOperationStatus.QUOTED]

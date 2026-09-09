@@ -135,8 +135,10 @@ FULL_PAYOUT_MIN_RATIO = 0.9
 
 def _covers_whole_payout(payment, to_amount: Optional[float]) -> bool:
     """¿Este comprobante es la pata que sale de la operación, o sólo un trozo de ella?"""
-    if not to_amount or to_amount <= 0 or not payment.amount:
+    if not to_amount or to_amount <= 0 or payment.amount is None:
         # Sin con qué comparar se conserva lo de siempre: el comprobante la cubre.
+        # OJO: se compara con `is None`, no con falsy — un comprobante con monto 0 (OCR que
+        # no leyó nada) SÍ tiene "con qué comparar", y 0 nunca cubre nada.
         return True
     return float(payment.amount) >= to_amount * FULL_PAYOUT_MIN_RATIO
 
@@ -1166,14 +1168,33 @@ class WhatsAppPaymentService:
         """Fija cuánto cubre este comprobante. Sin monto explícito, lo que da la tasa."""
         reference_rate = self._reference_rate(op, payment)
         value = settled_amount
+        was_explicit = settled_amount is not None
         if value is None:
-            if reference_rate and payment.amount:
+            # `is not None`, no falsy: un comprobante con monto REAL 0 (OCR que no leyó
+            # nada) sí tiene con qué comparar -da 0- y no debe caer al "asume que cubre
+            # todo lo pendiente" de abajo, que es para cuando de verdad no hay nada con qué
+            # calcular (comprobante sin monto reconocido en absoluto).
+            if reference_rate and payment.amount is not None:
                 value = round(float(payment.amount) / reference_rate, 2)
             else:
                 _, _ = self.operation_value(op)
                 value = self.operation_value(op)[0] - self.delivered_amount(op, payment.id)
         if value is not None and value <= 0:
             raise QuoteServiceError("invalid_settled_amount", "Lo cubierto debe ser > 0", 400)
+        # Mismo tope que `set_settlements`: ningún camino para fijar cuánto cubre un
+        # comprobante puede dejar una operación cubierta por encima de su valor. Solo se
+        # exige cuando el monto vino explícito — el derivado arriba ya se calcula acotado
+        # al pendiente real de la operación.
+        if was_explicit:
+            op_value, op_currency = self.operation_value(op)
+            other = self.delivered_amount(op, exclude_payment_id=payment.id)
+            if op_value > 0 and round(other + float(value), 2) > round(op_value, 2) + 0.01:
+                raise QuoteServiceError(
+                    "settlement_exceeds_operation",
+                    f"La operación {op.uuid} vale {op_value:.2f} {op_currency} y ya tiene "
+                    f"{other:.2f} cubiertos: no puede recibir {float(value):.2f} más",
+                    400,
+                )
         self._upsert_settlement(payment, op, round(float(value), 2), reference_rate)
         self._sync_settlement_totals(payment)
 
@@ -1487,6 +1508,21 @@ class WhatsAppPaymentService:
         cp = op.currency_pair
         return cp.to_currency.symbol if cp and cp.to_currency else None
 
+    def _settled_in_payment_currency(self, payment: WhatsAppOutgoingPayment) -> Optional[float]:
+        """
+        Lo que YA cubre este comprobante en `whatsapp_outgoing_settlements`, pasado a SU
+        moneda sumando todas sus liquidaciones. `None` cuando alguna liquidación no tiene
+        `settled_reference_rate`: sin tasa no hay cómo convertirla, y el fallo real de los
+        candidatos de cobertura era justo tratar ese caso como CERO en vez de "no lo sé" — un
+        comprobante que ya cubría la operación B volvía a ofrecerse entero libre para la A.
+        """
+        total = 0.0
+        for s in payment.settlements:
+            if not s.settled_reference_rate:
+                return None
+            total += (s.settled_amount or 0) * s.settled_reference_rate
+        return round(total, 2)
+
     def _free_amount(self, payment: WhatsAppOutgoingPayment) -> float:
         """
         Cuánto del comprobante no está repartido todavía, en su propia moneda.
@@ -1494,12 +1530,26 @@ class WhatsAppPaymentService:
         Cada parte del reparto va en la moneda del VALOR de su operación, así que para saber
         cuánto consume del comprobante hay que pasarla por su tasa — igual que hace el panel
         que reparte un comprobante entre varias operaciones.
+
+        Sin tasa en alguna liquidación (`_settled_in_payment_currency` devuelve `None`) no se
+        puede afirmar que sobra saldo: se trata como agotado en vez de libre. Es a propósito
+        conservador — mejor esconder un candidato legítimo que ofrecer uno ya comprometido.
+
+        También cubre el rastro de ANTES de esta tabla: un comprobante con el FK directo
+        (`whatsapp_operation_id`) puesto y `settled_amount`/`settled_reference_rate` a mano,
+        sin fila en `whatsapp_outgoing_settlements` — lo que `backfill_outgoing_settlements`
+        no alcanzó a migrar. Ese vínculo cuenta igual que uno con fila propia.
         """
-        usado = sum(
-            (s.settled_amount or 0) * (s.settled_reference_rate or 0)
-            for s in payment.settlements
-            if s.settled_reference_rate
-        )
+        usado = self._settled_in_payment_currency(payment)
+        if usado is None:
+            return 0.0
+
+        settled_op_ids = {s.whatsapp_operation_id for s in payment.settlements}
+        if payment.whatsapp_operation_id is not None and payment.whatsapp_operation_id not in settled_op_ids:
+            if not payment.settled_reference_rate:
+                return 0.0
+            usado += (payment.settled_amount or 0) * payment.settled_reference_rate
+
         return round(float(payment.amount or 0) - usado, 2)
 
     def operation_coverage(self, op_uuid) -> dict:
@@ -1636,9 +1686,61 @@ class WhatsAppPaymentService:
             )
             rows.append((row, explicit))
 
+        # "Es el conjunto COMPLETO, no deltas" (ver `OperationCoverageUpdate`): un
+        # comprobante que YA cubría esta operación y no viene en `payments` deja de
+        # cubrirla. Sin este drop, una llamada posterior que sólo manda los recibos nuevos
+        # derivaba la tasa/`to_amount` de la suma de ESOS solos -descartando lo que ya
+        # habían cubierto los que faltan en la lista- mientras esos settlements viejos
+        # seguían sumando en `delivered_amount`: la cotización de la operación quedaba por
+        # debajo de lo que en realidad se le había entregado.
+        kept_ids = {row.id for row, _ in rows}
+        stale = (
+            self.db.query(WhatsAppOutgoingSettlement)
+            .filter(
+                WhatsAppOutgoingSettlement.whatsapp_operation_id == op.id,
+                WhatsAppOutgoingSettlement.outgoing_payment_id.notin_(kept_ids or [-1]),
+            )
+            .all()
+        )
+        stale_payments = {s.payment for s in stale if s.payment is not None}
+        for s in stale:
+            self.db.delete(s)
+        if stale:
+            self.db.flush()
+        for payment in stale_payments:
+            self._sync_settlement_totals(payment)
+            # Soltar la liquidación no basta: hay que soltar también el FK directo si apuntaba
+            # a ESTA operación y al comprobante no le queda ninguna otra parte. `_sync_settlement_
+            # totals` deja ese campo intacto en su rama vacía (sólo limpia `settled_amount` y
+            # `settled_reference_rate`), y desde que `_free_amount` cuenta un FK sin fila de
+            # liquidación como "ya consumido", un comprobante soltado así no volvía a estar
+            # libre: se quedaba invisible, sin cubrir nada y sin poder ofrecerse a otra
+            # operación.
+            #
+            # Se acota a este bucle a propósito, en vez de arreglarlo dentro de
+            # `_sync_settlement_totals`. Ahí sería peligroso: los comprobantes anteriores a
+            # `whatsapp_outgoing_settlements` tienen FK directo y CERO filas, así que limpiar
+            # el campo en la rama vacía les borraría el único vínculo que tienen con su
+            # operación. Acá no pueden aparecer — sin fila que soltar, nunca entran en `stale`.
+            if payment.whatsapp_operation_id == op.id and not payment.settlements:
+                payment.whatsapp_operation_id = None
+        if stale_payments:
+            self.db.flush()
+
         cubierto_por_valor = round(value - resto, 2)
         if rows and not partial and cubierto_por_valor > 0:
             suma = round(sum(float(r.amount or 0) for r, _ in rows), 2)
+            if suma <= 0:
+                # Los comprobantes marcados no suman nada (monto real en 0, típico de un OCR
+                # que falló): derivar la tasa de esa suma dejaría rate_used/to_amount en 0
+                # aunque el operador haya puesto un `settled_amount` explícito distinto de
+                # cero más abajo. Una operación "cerrada" a tasa 0 es un estado imposible.
+                raise QuoteServiceError(
+                    "coverage_sums_to_zero",
+                    "Los comprobantes marcados suman 0: no se puede derivar una tasa de eso. "
+                    "Corrige el monto del comprobante o ciérralo con `partial` mientras tanto.",
+                    400,
+                )
             nueva_tasa = suma / cubierto_por_valor
             op.to_amount = suma
             op.rate_used = nueva_tasa
@@ -1670,6 +1772,15 @@ class WhatsAppPaymentService:
                 )
             self._upsert_settlement(row, op, cubre, tasa, actor)
             self._sync_settlement_totals(row)
+
+        # Si la op ya estaba COMPLETED (el caso normal: se completa sola al vincular el
+        # primer saliente) su Transaction y los movimientos de fondo ya existen con la tasa
+        # VIEJA. Cerrar o reabrir la cobertura después -otro comprobante que llega, un
+        # reparto que se corrige- puede cambiar rate_used/to_amount/applied_percentage, y
+        # sin este resync la contabilidad real quedaba mintiendo: la operación mostraba un
+        # margen y la transacción/el libro de fondos contabilizaba otro.
+        WhatsAppQuoteService(self.db)._sync_linked_transaction(op)
+        self._sync_fund_legs(op, actor)
 
         self.db.commit()
         self.db.refresh(op)
@@ -1733,13 +1844,13 @@ class WhatsAppPaymentService:
         settled = round(sum(r.settled_amount for r in rows), 2)
         # Lo que el comprobante entrega en SU moneda contra lo que ya está repartido: la
         # diferencia es lo que el operador todavía no ha dicho a qué trato pertenece.
-        covered_in_payment_currency = round(
-            sum(
-                r.settled_amount * (r.settled_reference_rate or 0)
-                for r in rows
-                if r.settled_reference_rate
-            ),
-            2,
+        # Mismo criterio que `_free_amount`: sin tasa en alguna fila no se puede convertir, y
+        # no se afirma que sobra saldo — se cuenta como comprometido, no como libre.
+        covered_in_payment_currency = self._settled_in_payment_currency(payment)
+        unassigned_in_payment_currency = (
+            round((payment.amount or 0) - covered_in_payment_currency, 2)
+            if covered_in_payment_currency is not None
+            else 0.0
         )
         return {
             "payment_id": payment.id,
@@ -1747,9 +1858,7 @@ class WhatsAppPaymentService:
             "currency": payment.currency,
             "settled_total": settled,
             "covered_in_payment_currency": covered_in_payment_currency,
-            "unassigned_in_payment_currency": round(
-                (payment.amount or 0) - covered_in_payment_currency, 2
-            ),
+            "unassigned_in_payment_currency": unassigned_in_payment_currency,
             "settlements": items,
         }
 

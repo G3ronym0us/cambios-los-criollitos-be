@@ -42,7 +42,9 @@ def enrich_transaction_response(transaction, db: Session) -> dict:
 async def create_transaction(
     transaction_data: TransactionCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    # H-4.1: this mutates fund balances and assigns profit splits (see H-4.3 for the
+    # separate, still-open mass-assignment concern on usdt_rate/status/profit_splits).
+    current_user: User = Depends(get_moderator_user)
 ):
     """
     Crear nueva transacción con distribución de ganancias
@@ -243,7 +245,7 @@ async def get_transactions(
     start_date: Optional[datetime] = Query(None, description="Fecha inicio (ISO format)"),
     end_date: Optional[datetime] = Query(None, description="Fecha fin (ISO format)"),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_moderator_user)  # H-4.1: staff-only transaction ledger
 ):
     """Obtener lista de transacciones con filtros y paginación"""
     transaction_repo = TransactionRepository(db)
@@ -294,7 +296,7 @@ async def get_transactions(
 async def get_recent_transactions(
     limit: int = Query(10, ge=1, le=50, description="Número de transacciones recientes"),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_moderator_user)  # H-4.1
 ):
     """Obtener las transacciones más recientes"""
     transaction_repo = TransactionRepository(db)
@@ -306,7 +308,7 @@ async def get_recent_transactions(
 @router.get("/stats")
 async def get_transaction_stats(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_moderator_user)  # H-4.1
 ):
     """Obtener estadísticas generales de transacciones"""
     transaction_repo = TransactionRepository(db)
@@ -317,7 +319,7 @@ async def get_transaction_stats(
 async def get_transaction(
     transaction_uuid: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_moderator_user)  # H-4.1
 ):
     """Obtener transacción por UUID"""
     transaction_repo = TransactionRepository(db)

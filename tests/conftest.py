@@ -33,6 +33,11 @@ ADMIN_URL = os.environ.get(
 TEST_URL = os.environ.get(
     "TEST_DATABASE_URL", "postgresql://tasas_user:tasas_password@localhost:5433/tasas_test"
 )
+# El nombre sale de la URL, no de una constante: si dos corridas a la vez creaban y borraban
+# `tasas_test` a mano, la segunda le arrancaba la base a la primera y ficheros enteros fallaban
+# en el fixture (no en un assert). Con TEST_DATABASE_URL apuntando a otra base, cada corrida
+# tiene la suya y pueden convivir.
+TEST_DB_NAME = TEST_URL.rsplit("/", 1)[-1].split("?")[0]
 
 
 def _postgres_available() -> bool:
@@ -56,8 +61,8 @@ def engine():
 
     admin = create_engine(ADMIN_URL, isolation_level="AUTOCOMMIT")
     with admin.connect() as conn:
-        conn.execute(text("DROP DATABASE IF EXISTS tasas_test"))
-        conn.execute(text("CREATE DATABASE tasas_test"))
+        conn.execute(text(f'DROP DATABASE IF EXISTS "{TEST_DB_NAME}"'))
+        conn.execute(text(f'CREATE DATABASE "{TEST_DB_NAME}"'))
     admin.dispose()
 
     eng = create_engine(TEST_URL)
@@ -68,9 +73,10 @@ def engine():
     admin = create_engine(ADMIN_URL, isolation_level="AUTOCOMMIT")
     with admin.connect() as conn:
         conn.execute(text(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='tasas_test'"
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            f"WHERE datname='{TEST_DB_NAME}'"
         ))
-        conn.execute(text("DROP DATABASE IF EXISTS tasas_test"))
+        conn.execute(text(f'DROP DATABASE IF EXISTS "{TEST_DB_NAME}"'))
     admin.dispose()
 
 

@@ -56,7 +56,7 @@ async def create_fund_group(
 async def list_fund_groups(
     active_only: bool = Query(True, description="Solo grupos activos"),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),  # H-4.1: fund groups are staff data
 ):
     """Listar grupos de fondo"""
     fund_repo = FundRepository(db)
@@ -183,7 +183,7 @@ async def remove_group_member(
 async def get_group_balance(
     group_uuid: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),  # H-4.1: fund balances are staff data
 ):
     """Balance consolidado del grupo (Total / Acumulada / Fondos)"""
     fund_repo = FundRepository(db)
@@ -345,7 +345,7 @@ async def create_movement(
 async def get_movement(
     movement_uuid: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),  # H-4.1: fund movement detail is staff data
 ):
     """Detalle de un movimiento"""
     fund_repo = FundRepository(db)

@@ -1709,6 +1709,23 @@ class WhatsAppPaymentService:
             self.db.flush()
         for payment in stale_payments:
             self._sync_settlement_totals(payment)
+            # Soltar la liquidación no basta: hay que soltar también el FK directo si apuntaba
+            # a ESTA operación y al comprobante no le queda ninguna otra parte. `_sync_settlement_
+            # totals` deja ese campo intacto en su rama vacía (sólo limpia `settled_amount` y
+            # `settled_reference_rate`), y desde que `_free_amount` cuenta un FK sin fila de
+            # liquidación como "ya consumido", un comprobante soltado así no volvía a estar
+            # libre: se quedaba invisible, sin cubrir nada y sin poder ofrecerse a otra
+            # operación.
+            #
+            # Se acota a este bucle a propósito, en vez de arreglarlo dentro de
+            # `_sync_settlement_totals`. Ahí sería peligroso: los comprobantes anteriores a
+            # `whatsapp_outgoing_settlements` tienen FK directo y CERO filas, así que limpiar
+            # el campo en la rama vacía les borraría el único vínculo que tienen con su
+            # operación. Acá no pueden aparecer — sin fila que soltar, nunca entran en `stale`.
+            if payment.whatsapp_operation_id == op.id and not payment.settlements:
+                payment.whatsapp_operation_id = None
+        if stale_payments:
+            self.db.flush()
 
         cubierto_por_valor = round(value - resto, 2)
         if rows and not partial and cubierto_por_valor > 0:

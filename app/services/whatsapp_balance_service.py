@@ -113,10 +113,18 @@ class WhatsAppBalanceService:
         """
         Acredita un pago ENTRANTE (ej. Zelle 200) como saldo a favor del cliente.
         Idempotente por pago: un entrante solo puede acreditarse una vez.
+
+        `FOR UPDATE`: mismo patrón que `debit_for_operation` -- un doble clic en "acreditar
+        a saldo" sobre el MISMO pago sin esto podía crear dos CREDIT (saldo duplicado, plata
+        de más a favor del cliente) porque el chequeo de "ya se acreditó" y el INSERT no eran
+        atómicos. No se reprodujo con una prueba de concurrencia dedicada (ver el hallazgo en
+        el informe) -- se corrige por el mismo patrón ya demostrado en `debit_for_operation`
+        y `set_operation`, no por haberlo visto fallar acá.
         """
         payment = (
             self.db.query(WhatsAppIncomingPayment)
             .filter(WhatsAppIncomingPayment.id == payment_id)
+            .with_for_update()
             .first()
         )
         if payment is None:
@@ -179,10 +187,18 @@ class WhatsAppBalanceService:
         Debita del saldo del cliente el lado USD de una operación de abono
         (default: `from_amount`). Idempotente por operación: una op solo puede
         consumir saldo una vez. Valida saldo suficiente (±0.01).
+
+        El saldo es un `SUM` sobre `whatsapp_balance_entries`, no una fila que se pueda
+        bloquear directamente -- así que el mutex es el cliente: se bloquea su fila
+        (`FOR UPDATE`) antes de sumar. Sin esto, dos abonos concurrentes del MISMO cliente
+        (dos operaciones distintas, cada una dentro del saldo por separado) leen el mismo
+        saldo, los dos pasan "saldo suficiente" y los dos débitos juntos lo dejan negativo
+        -- plata que el negocio regaló sin que el saldo lo respaldara.
         """
         op = self._op_by_uuid(op_uuid)
         if op.client is None:
             raise QuoteServiceError("client_not_found", "La operación no tiene cliente", 404)
+        self.db.query(WhatsAppClient).filter(WhatsAppClient.id == op.client_id).with_for_update().first()
 
         existing = (
             self.db.query(WhatsAppBalanceEntry)

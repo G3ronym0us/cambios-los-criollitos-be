@@ -16,7 +16,7 @@ from typing import Optional
 from uuid import UUID
 
 from sqlalchemy import and_, func as safunc, or_
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, lazyload, selectinload
 
 from app.models.currency_pair import CurrencyPair
 from app.models.fund import FundGroup, FundGroupMember, FundMovement, FundMovementType
@@ -862,8 +862,27 @@ class WhatsAppQuoteService:
         Las operaciones USD→VES creadas desde el pago saliente permanecen PENDING
         hasta que el cliente entrega el efectivo. Recibirlo debe completar la op y
         crear (o sincronizar) su transacción dentro de la misma acción.
+
+        El SELECT es `FOR UPDATE`: un doble clic en "marcar entregada" (o un reintento del
+        front tras un timeout) manda dos peticiones casi a la vez. Sin el lock, las dos leen
+        `delivery_status == PENDING` y `op.transaction_id is None`, y las dos crean su propia
+        `Transaction` -- una queda enganchada a la operación y la otra huérfana en el libro
+        contable, duplicando la ganancia registrada de un solo trato. Con el lock, la segunda
+        espera a que la primera comitee y entonces ve `delivery_status` ya en `RECEIVED`, así
+        que el chequeo de abajo la rechaza con 409 en vez de crear una segunda transacción.
         """
-        op = self._get_op_or_404(op_uuid)
+        op = (
+            self.db.query(WhatsAppOperation)
+            # `currency_pair` es `lazy="joined"` en el modelo (LEFT OUTER JOIN); Postgres no
+            # permite `FOR UPDATE` sobre el lado nulable de un outer join, así que se apaga
+            # el eager load para esta lectura puntual (no hace falta el par acá).
+            .options(lazyload(WhatsAppOperation.currency_pair))
+            .filter(WhatsAppOperation.uuid == op_uuid)
+            .with_for_update()
+            .first()
+        )
+        if op is None:
+            raise QuoteServiceError("not_found", f"Operation {op_uuid} no encontrada", 404)
         if op.delivery_status != WhatsAppDeliveryStatus.PENDING:
             raise QuoteServiceError(
                 "invalid_status",

@@ -9,12 +9,17 @@ que existe en el backend es `RateAlertRepository.top_unacknowledged_by_deviation
 tienen una `RateAlert` sin reconocer (divergencia manual vs. automática) -- un par sin
 alerta pendiente, con el scraper caído hace una semana, no tiene ninguna señal.
 
-Este test no es un "falla antes, pasa después": documenta que el comportamiento actual
-(cotizar sin más, cualquiera sea la antigüedad de la fila activa) es efectivamente el
-código tal cual está, para dejar la reproducción trazable. No se toca product code.
+Va como `xfail(strict=True)` afirmando lo que DEBERÍA pasar, no lo que pasa. Es el mismo
+patrón de `test_probe_inverse_pair_labeling`, y por el mismo motivo: escrito al revés
+—afirmando que los campos de antigüedad NO existen— la prueba congelaba la ausencia del
+arreglo, y el día que alguien añadiera la señal se pondría roja por hacerlo bien. Con
+`strict`, ese día pasa a XPASS y falla pidiendo que se quite la marca, que es el aviso que
+sí queremos. No se toca product code.
 """
 
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from app.models.currency import Currency
 from app.models.currency_pair import CurrencyPair
@@ -31,6 +36,14 @@ def _currency(db, symbol: str) -> Currency:
     return row
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Hueco real, sin arreglar: no hay ninguna puerta de antigüedad en el camino de "
+        "cotización y `RateEntry` no expone la edad de la fila. Cuando alguien la añada, "
+        "esto pasa a XPASS y hay que quitar la marca."
+    ),
+)
 def test_get_rate_entry_uses_month_old_active_rate_without_any_signal(db):
     pair = CurrencyPair(
         from_currency_id=_currency(db, "USDT").id,
@@ -60,8 +73,18 @@ def test_get_rate_entry_uses_month_old_active_rate_without_any_signal(db):
     assert entry is not None
     assert entry.rate == 100.0  # se sirve tal cual, sin objeción
 
-    # RateEntry no tiene NINGÚN campo que exprese antigüedad: quien cotiza con esto no
-    # tiene forma de saber, desde acá, que la fila lleva 30 días sin refrescar.
-    assert not hasattr(entry, "created_at")
-    assert not hasattr(entry, "stale_hours")
-    assert not hasattr(entry, "age_hours")
+    # Lo que DEBERÍA pasar: quien cotiza tiene que poder saber, desde el propio `RateEntry`,
+    # que la fila lleva 30 días sin refrescar. Hoy no hay ningún campo que lo exprese, así
+    # que esto falla — y por eso el test va marcado `xfail`.
+    edad = next(
+        (
+            getattr(entry, campo)
+            for campo in ("age_hours", "stale_hours", "created_at")
+            if hasattr(entry, campo)
+        ),
+        None,
+    )
+    assert edad is not None, (
+        "RateEntry no expone ninguna noción de antigüedad: se cotiza una tasa de hace 30 "
+        "días sin que el consumidor pueda distinguirla de una de hace 30 segundos."
+    )

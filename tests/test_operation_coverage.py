@@ -78,6 +78,122 @@ def test_coverage_lists_the_clients_free_receipts(svc, db, client, pairs, operat
 
 
 # ---------------------------------------------------------------------------
+# Un comprobante ya vinculado a OTRA operación no puede volver a ofrecerse entero
+# ---------------------------------------------------------------------------
+#
+# El fallo real: en vivo, un comprobante ya vinculado a la operación B aparecía como
+# candidato de la A. Causa: `_free_amount` sumaba `settled_amount * settled_reference_rate`
+# de cada liquidación pero SALTABA las que no tenían tasa (`if s.settled_reference_rate`),
+# contándolas como CERO consumido en vez de "no lo sé". Eso pasa por dos caminos: una
+# liquidación de `whatsapp_outgoing_settlements` sin tasa resoluble (`_reference_rate` puede
+# devolver None y aun así `set_operation_coverage`/`set_settlements` la guardan si el monto
+# vino explícito), y el rastro de ANTES de esa tabla — el FK directo con
+# `settled_amount`/`settled_reference_rate` puestos a mano, que `backfill_outgoing_settlements`
+# no siempre migra.
+
+
+def test_a_fully_consumed_receipt_is_not_a_candidate_for_another_operation(
+    svc, db, client, pairs, operator
+):
+    """Lo que otra operación ya agotó no puede volver a ofrecerse entero libre."""
+    pago = f.outgoing(db, 65_723, "VES", phone=TELEFONO)
+    op_a = _op(svc, db, pago, operator=operator)  # rate_used = 900 exactos (315.000 / 350)
+    # Múltiplo exacto de 900 para que "cubre 300 de valor" consuma el comprobante entero sin
+    # dejar centavos de redondeo — lo que interesa aquí es el criterio, no la aritmética.
+    extra = f.outgoing(db, 270_000, "VES", phone=TELEFONO)
+    db.flush()
+
+    svc.set_operation_coverage(
+        op_a["uuid"],
+        payments=[{"payment_id": pago.id}, {"payment_id": extra.id, "settled_amount": 300}],
+        partial=True,
+    )
+
+    otro_pago = f.outgoing(db, 6_277, "VES", phone=TELEFONO)
+    op_b = _op(svc, db, otro_pago, valor=10, salida=6_277, operator=operator)
+    db.flush()
+
+    cov = svc.operation_coverage(op_b["uuid"])
+    assert extra.id not in {c["payment_id"] for c in cov["candidates"]}
+
+
+def test_a_partially_consumed_receipt_is_offered_by_its_remainder(svc, db, client, pairs, operator):
+    """El reparto es parcial por diseño: lo que sobra de un comprobante sigue siendo candidato."""
+    pago = f.outgoing(db, 65_723, "VES", phone=TELEFONO)
+    op_a = _op(svc, db, pago, operator=operator)  # rate_used queda en 900 (315.000 / 350)
+    extra = f.outgoing(db, 250_000, "VES", phone=TELEFONO)
+    db.flush()
+
+    # A medias, con `extra` aportando sólo 100 de valor (90.000 de sus 250.000 Bs).
+    svc.set_operation_coverage(
+        op_a["uuid"],
+        payments=[{"payment_id": pago.id}, {"payment_id": extra.id, "settled_amount": 100}],
+        partial=True,
+    )
+
+    otro_pago = f.outgoing(db, 6_277, "VES", phone=TELEFONO)
+    op_b = _op(svc, db, otro_pago, valor=10, salida=6_277, operator=operator)
+    db.flush()
+
+    cov = svc.operation_coverage(op_b["uuid"])
+    candidato = next(c for c in cov["candidates"] if c["payment_id"] == extra.id)
+    assert candidato["free_amount"] == pytest.approx(250_000 - 100 * 900, abs=0.01)
+
+
+def test_a_legacy_direct_link_without_a_settlement_row_is_not_a_candidate(
+    svc, db, client, pairs, operator
+):
+    """
+    Antes de `whatsapp_outgoing_settlements` un saliente se vinculaba con el FK directo y
+    `settled_amount`/`settled_reference_rate` puestos a mano, sin fila en la tabla de
+    reparto. `backfill_outgoing_settlements` no migra todos los casos (hay uno real en la
+    base local, comprobante 56), así que ese rastro sigue vivo y `_free_amount` tiene que
+    contarlo igual que si tuviera su propia fila.
+    """
+    pago = f.outgoing(db, 65_723, "VES", phone=TELEFONO)
+    op_a = _op(svc, db, pago, operator=operator)
+    row_a = _row(db, op_a)
+
+    legado = f.outgoing(db, 250_000, "VES", phone=TELEFONO)
+    legado.whatsapp_operation_id = row_a.id
+    legado.settled_amount = round(250_000 / 900, 2)  # cubre el comprobante entero a la vieja tasa
+    legado.settled_reference_rate = 900.0
+    db.flush()
+
+    otro_pago = f.outgoing(db, 6_277, "VES", phone=TELEFONO)
+    op_b = _op(svc, db, otro_pago, valor=10, salida=6_277, operator=operator)
+    db.flush()
+
+    cov = svc.operation_coverage(op_b["uuid"])
+    assert legado.id not in {c["payment_id"] for c in cov["candidates"]}
+
+
+def test_a_receipt_split_on_purpose_across_two_operations_still_sums_right(
+    svc, db, client, pairs, operator
+):
+    """
+    No es "excluir todo lo que tenga cualquier vínculo": un comprobante puede cubrir a
+    propósito varias operaciones (el caso de Nelson, `test_outgoing_settlements.py`), y el
+    fix de arriba no puede convertir eso en "agotado" sólo por tener más de una liquidación.
+    """
+    a_pago = f.outgoing(db, 6_277, "VES", phone=TELEFONO)
+    op_a = _row(db, _op(svc, db, a_pago, valor=10, salida=6_277, operator=operator))
+    b_pago = f.outgoing(db, 6_277, "VES", phone=TELEFONO)
+    op_b = _row(db, _op(svc, db, b_pago, valor=10, salida=6_277, operator=operator))
+
+    # Un solo comprobante que paga los dos tratos enteros de una vez (el caso de Nelson):
+    # cada op se lleva su valor (10) completo, y la suma agota justo los 12.554 Bs.
+    compartido = f.outgoing(db, 12_554, "VES", phone=TELEFONO)  # exactamente 2 x 6.277
+    db.flush()
+    svc._upsert_settlement(compartido, op_a, 10.0, 627.7, operator)
+    svc._upsert_settlement(compartido, op_b, 10.0, 627.7, operator)
+    svc._sync_settlement_totals(compartido)
+    db.flush()
+
+    assert svc._free_amount(compartido) == pytest.approx(0.0, abs=0.01)
+
+
+# ---------------------------------------------------------------------------
 # Escribir la cobertura — el caso de aceptación
 # ---------------------------------------------------------------------------
 

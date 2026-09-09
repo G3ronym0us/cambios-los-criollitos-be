@@ -11,7 +11,7 @@ from app.schemas.commission_config import (
 from app.repositories.commission_config_repository import CommissionConfigRepository
 from app.repositories.user_repository import UserRepository
 from app.models.user import User
-from app.core.dependencies import get_current_user, get_moderator_user
+from app.core.dependencies import get_moderator_user
 
 router = APIRouter(prefix="/commission-configs", tags=["Commission Configurations"])
 
@@ -80,7 +80,7 @@ async def get_configs_by_pair(
     currency_pair_uuid: UUID,
     only_active: bool = Query(True, description="Solo configuraciones activas"),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_moderator_user)
 ):
     """
     Obtener todas las configuraciones disponibles para un par de divisas
@@ -129,7 +129,7 @@ async def get_configs_by_pair(
 @router.get("/pairs", response_model=List[int])
 async def get_available_pairs(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_moderator_user)
 ):
     """
     Obtener lista de IDs de pares de divisas con configuraciones activas
@@ -195,7 +195,7 @@ async def get_all_commission_configs(
 async def get_commission_config(
     config_uuid: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_moderator_user)
 ):
     """Obtener configuración por UUID con detalles completos"""
     config_repo = CommissionConfigRepository(db)

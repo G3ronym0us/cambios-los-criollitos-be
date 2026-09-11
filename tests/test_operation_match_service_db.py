@@ -67,9 +67,10 @@ def test_suggestions_never_reach_another_clients_operation(db, fund, pairs, oper
 
     items = OperationMatchService(db).suggest_for_payments([pago.id], "incoming")
 
-    # Antes de la Task 4 (proponer CREATE) el servicio simplemente no sugiere nada: lo que
-    # importa aquí es que la op de Arianna NUNCA aparece.
-    assert items == []
+    # Bogao no tiene ninguna operación propia: la única op que existe es de Arianna, y esa
+    # nunca puede aparecer. Lo que sí corresponde (Task 4) es proponer CREAR una para él.
+    assert len(items) == 1
+    assert items[0]["kind"] == "CREATE"
 
 
 def test_a_cash_pair_operation_is_never_suggested_for_an_incoming_receipt(db, fund, pairs, operator):
@@ -93,7 +94,9 @@ def test_a_cash_pair_operation_is_never_suggested_for_an_incoming_receipt(db, fu
     db.flush()
 
     items = OperationMatchService(db).suggest_for_payments([pago.id], "incoming")
-    assert items == []
+    # Nunca un LINK a la op en efectivo. El servicio puede seguir proponiendo CREAR una
+    # operación nueva (Task 4): eso es una pregunta distinta, no la que prueba este caso.
+    assert items == [] or items[0]["kind"] == "CREATE"
 
 
 def test_a_via_partner_operation_is_never_suggested_for_an_incoming_receipt(db, fund, pairs, operator):
@@ -106,4 +109,53 @@ def test_a_via_partner_operation_is_never_suggested_for_an_incoming_receipt(db, 
     db.flush()
 
     items = OperationMatchService(db).suggest_for_payments([pago.id], "incoming")
-    assert items == []
+    # Igual que en el caso del par en efectivo: nunca un LINK a la op VIA_PARTNER, pero un
+    # CREATE nuevo sigue siendo una propuesta legítima.
+    assert items == [] or items[0]["kind"] == "CREATE"
+
+
+# ---------------------------------------------------------------------------
+# Task 4: sugerir crear cuando el cliente no tiene ninguna
+# ---------------------------------------------------------------------------
+
+
+def test_create_hint_uses_the_clients_preferred_pair(db, fund, pairs, operator):
+    par = pairs["ZELLE-VES"]
+    cliente = _client(db, "584267169499", "Jose Bogao", preferred_pair_id=par.id)
+    pago = f.incoming(db, 200.0, "ZELLE", phone=cliente.phone)
+    db.flush()
+
+    items = OperationMatchService(db).suggest_for_payments([pago.id], "incoming")
+
+    assert items[0]["kind"] == "CREATE"
+    hint = items[0]["create_hint"]
+    assert hint["reason"] == "preferred"
+    assert hint["pair_symbol"] == "ZELLE/VES"
+    assert hint["from_amount"] == 200.0
+    assert hint["to_amount"] == pytest.approx(200.0 * 782.92, rel=1e-6)
+
+
+def test_create_hint_falls_back_to_the_pair_the_client_uses_most(db, fund, pairs, operator):
+    par = pairs["ZELLE-VES"]
+    cliente = _client(db, "584267169499", "Jose Bogao")  # sin preferido
+    _op(
+        db, client_id=cliente.id, pair=par, from_amount=50.0, to_amount=39146.0,
+        status="COMPLETED",
+    )
+    pago = f.incoming(db, 200.0, "ZELLE", phone=cliente.phone)
+    db.flush()
+
+    hint = OperationMatchService(db).suggest_for_payments([pago.id], "incoming")[0]["create_hint"]
+    assert hint["reason"] == "most_used"
+
+
+def test_link_item_now_carries_its_kind(db, fund, pairs, operator):
+    """El item que sí sugiere vincular gana `kind: LINK` (antes no llevaba ninguno)."""
+    cliente = _client(db, "584124640125", "Nelson")
+    op_ = _op(db, client_id=cliente.id, pair=pairs["ZELLE-VES"], from_amount=100.0, to_amount=78292.0)
+    pago = f.incoming(db, 100.0, "ZELLE", phone=cliente.phone)
+    db.flush()
+
+    item = OperationMatchService(db).suggest_for_payments([pago.id], "incoming")[0]
+    assert item["kind"] == "LINK"
+    assert item["operation_uuid"] == str(op_.uuid)

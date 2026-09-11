@@ -1002,6 +1002,81 @@ class OperationMatchService:
                 ordered.insert(0, ordered.pop(idx))
         return ordered
 
+    def _create_hint(self, payment, alias_phones: Sequence[str]) -> Optional[dict]:
+        """
+        Con qué par nacería la operación de este comprobante, y cuánto daría.
+
+        Orden de preferencia: el par preferido del cliente → el que más usa en su historial →
+        el que se deduce de la moneda del comprobante. Si ninguno resuelve se devuelve `None`
+        y la tarjeta abre el formulario vacío; adivinar un par es peor que no proponerlo.
+
+        La tasa se pide A LA FECHA DEL COMPROBANTE, no la de hoy: la bandeja se procesa días
+        después y cotizar con la tasa de hoy un cambio del lunes reescribe el margen.
+        """
+        from app.models.currency_pair import CurrencyPair
+        from app.models.whatsapp_client import WhatsAppClient
+        from app.repositories.exchange_rate_repository import ExchangeRateRepository
+        from app.services.whatsapp_rate_resolver import WhatsAppRateResolver
+
+        cliente = (
+            self.db.query(WhatsAppClient)
+            .filter(WhatsAppClient.phone.in_(list(alias_phones)))
+            .first()
+        )
+        par, motivo = None, None
+        if cliente is not None and cliente.preferred_pair_id:
+            par = (
+                self.db.query(CurrencyPair)
+                .filter(CurrencyPair.id == cliente.preferred_pair_id)
+                .first()
+            )
+            motivo = "preferred"
+        if par is None and cliente is not None:
+            fila = (
+                self.db.query(
+                    WhatsAppOperation.currency_pair_id,
+                    func.count(WhatsAppOperation.id).label("n"),
+                )
+                .filter(WhatsAppOperation.client_id == cliente.id)
+                .group_by(WhatsAppOperation.currency_pair_id)
+                .order_by(func.count(WhatsAppOperation.id).desc())
+                .first()
+            )
+            if fila is not None:
+                par = self.db.query(CurrencyPair).filter(CurrencyPair.id == fila[0]).first()
+                motivo = "most_used"
+        if par is None and payment.currency:
+            par = (
+                self.db.query(CurrencyPair)
+                .join(CurrencyPair.from_currency)
+                .filter(CurrencyPair.is_active.is_(True))
+                .filter(CurrencyPair.from_currency.has(symbol=payment.currency))
+                .first()
+            )
+            motivo = "currency" if par is not None else None
+        if par is None:
+            return None
+
+        repo = ExchangeRateRepository(self.db)
+        at = _aware(payment.created_at)
+        tasa = repo.get_rate_by_pair_at(par.uuid, at) if at else None
+        if tasa is None:
+            tasa = repo.get_active_rate_by_pair(par.uuid)
+        if tasa is None:
+            return None
+        destino = WhatsAppRateResolver.apply_rate(payment.amount, tasa.rate, tasa.inverse_percentage)
+        return {
+            "pair_uuid": str(par.uuid),
+            "pair_symbol": f"{par.from_currency.symbol}/{par.to_currency.symbol}",
+            "reason": motivo,
+            "rate": tasa.rate,
+            "rate_at": tasa.created_at.date().isoformat() if tasa.created_at else None,
+            "from_amount": payment.amount,
+            "to_amount": round(destino, 2),
+            "from_currency": par.from_currency.symbol,
+            "to_currency": par.to_currency.symbol,
+        }
+
     def suggest_for_payments(
         self, payment_ids: Sequence[int], table: str, *, limit: int = 500
     ) -> list[dict]:
@@ -1077,6 +1152,10 @@ class OperationMatchService:
                 scored = rank_candidates(candidates, criteria, table, now)
             suggestion = pick_suggestion(scored)
             if suggestion is None:
+                if table == "incoming":
+                    hint = self._create_hint(payment, alias.get(payment.client_phone, []))
+                    if hint is not None:
+                        out.append({"payment_id": payment.id, "kind": "CREATE", "create_hint": hint})
                 continue
             cand = by_uuid.get(suggestion.uuid)
             best = next((s for s in scored if s.uuid == suggestion.uuid), None)
@@ -1085,6 +1164,7 @@ class OperationMatchService:
             out.append(
                 {
                     "payment_id": payment.id,
+                    "kind": "LINK",
                     "operation_uuid": cand.uuid,
                     "confident": suggestion.confident,
                     "score": round(best.score, 4),

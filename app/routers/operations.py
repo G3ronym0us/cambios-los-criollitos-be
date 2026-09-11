@@ -154,6 +154,7 @@ async def rank_operations_for_payment(
         order_by=payload.order_by,
         page=payload.page,
         limit=payload.limit,
+        scope=payload.scope,
     )
 
     inc_taken, out_taken = _payment_link_flags(db, [op.id for op, _ in result.items])

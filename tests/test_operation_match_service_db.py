@@ -182,3 +182,22 @@ def test_link_item_carries_the_criteria_the_operator_needs(db, fund, pairs, oper
     assert item["missing_after"] == 0.0
     assert item["status"] == op_.status.value
     assert item["hours_apart"] == pytest.approx(0.0, abs=0.5)
+
+
+# ---------------------------------------------------------------------------
+# Task 6: el cajón se abre acotado al cliente
+# ---------------------------------------------------------------------------
+
+
+def test_drawer_defaults_to_the_payments_own_client(db, fund, pairs, operator):
+    bogao = _client(db, "584267169499", "Jose Bogao")
+    arianna = _client(db, "584128580852", "Arianna")
+    _op(db, client_id=arianna.id, pair=pairs["ZELLE-VES"], from_amount=200.0, to_amount=177192.0)
+    pago = f.incoming(db, 200.0, "ZELLE", phone=bogao.phone)
+    db.flush()
+
+    page = OperationMatchService(db).rank_for_payment(pago.id, "incoming")
+    assert page.total == 0
+
+    todas = OperationMatchService(db).rank_for_payment(pago.id, "incoming", scope="all")
+    assert todas.total == 1

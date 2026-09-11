@@ -905,6 +905,7 @@ class OperationMatchService:
         order_by: str = "suggested",
         page: int = 1,
         limit: int = 200,
+        scope: str = "client",
     ) -> MatchPage:
         """
         Una página de operaciones YA filtradas, puntuadas contra el comprobante y ordenadas
@@ -932,7 +933,17 @@ class OperationMatchService:
             bank_to=payment.bank_to,
             created_at=_aware(payment.created_at),
         )
+        # Por defecto el cajón enseña las operaciones DEL CLIENTE del comprobante (con sus
+        # alias de socio) y solo las abiertas: ese es el universo real de lo que ese pago
+        # puede cerrar. `scope="all"` es el botón «buscar en todos los clientes», que el
+        # operador pulsa a sabiendas — y ahí `same_client` deja de ser siempre cierto.
         filters = dict(phone=phone, search=search, statuses=[status] if status else None)
+        if scope == "client" and table == "incoming" and phone is None:
+            filters["phones"] = self._client_phones_for_many([payment.client_phone]).get(
+                payment.client_phone, []
+            )
+            filters["statuses"] = filters["statuses"] or list(OPEN_STATUSES)
+            filters["payable_by_receipt"] = True
 
         # El total cuenta sobre TODO lo que cumple el filtro, sin el tope de seguridad de
         # `MATCH_POOL_LIMIT`: el pie del cajón no debe decir "26 de 200" solo porque el

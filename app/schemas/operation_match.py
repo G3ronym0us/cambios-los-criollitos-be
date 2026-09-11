@@ -82,6 +82,11 @@ class OperationRankRequest(BaseModel):
     order_by: str = Field("suggested", pattern="^(suggested|amount|time)$")
     page: int = Field(1, ge=1)
     limit: int = Field(200, ge=1, le=500)
+    #: client (default) = solo las operaciones del cliente del comprobante (y sus alias de
+    #: socio), abiertas. all = el botón «buscar en todos los clientes» del cajón, a sabiendas.
+    #: Deviation del plan: el endpoint recibe TODO por body (`OperationRankRequest`), no hay
+    #: otros query params — así que `scope` va aquí como un campo más, no como `Query(...)`.
+    scope: Literal["client", "all"] = "client"
 
 
 class OperationScoreResponse(BaseModel):
@@ -94,6 +99,8 @@ class OperationScoreResponse(BaseModel):
     time_score: float
     score: float
     within_tolerance: bool
+    #: Solo del lado entrante: "CLOSES" | "PARTIAL". `None` en salientes.
+    coverage: Optional[str] = None
 
 
 class SuggestionResponse(BaseModel):

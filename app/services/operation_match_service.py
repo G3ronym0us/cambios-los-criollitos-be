@@ -43,8 +43,9 @@ from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoin
 AMOUNT_TOLERANCE = 0.01
 #: Más allá de esto el monto ya no compite por la sugerencia.
 AMOUNT_CUTOFF = 0.02
-#: Horas a las que la cercanía temporal vale la mitad.
-TIME_HALF_LIFE_HOURS = 6.0
+#: Horas a las que la cercanía temporal vale la mitad. Era 6 h, que con el p90 real en 32 min
+#: dejaba a una candidata de hace 5 horas puntuando 0,55 y empatándole a la correcta.
+TIME_HALF_LIFE_HOURS = 1.0
 #: El monto manda; la hora solo desempata.
 AMOUNT_WEIGHT = 0.75
 #: Ventaja mínima sobre la segunda candidata para dar la sugerencia por inequívoca.
@@ -55,6 +56,14 @@ DEFAULT_WINDOW_HOURS = 24
 MIN_TOKEN_LENGTH = 4
 #: Estados en los que una operación sigue admitiendo el comprobante del cliente.
 OPEN_STATUSES = ("QUOTED", "PENDING")
+
+#: Ventana dura del ranking del PANEL del lado entrante. El ranking no tenía ninguna: el
+#: tiempo puntuaba pero nunca descartaba, así que una op de hace tres meses con el monto
+#: exacto podía ganar. Medido en producción (98 vínculos): el p90 del desfase op→comprobante
+#: es 32 min y el p99 es 23,8 h, así que 72 h es holgado a propósito — cubre al cliente que
+#: paga el lunes lo que se cotizó el viernes. No lo lee el bot, que tiene su propia
+#: `DEFAULT_WINDOW_HOURS`.
+INCOMING_WINDOW_HOURS = 72
 
 #: El comprobante reenviado es el MISMO, no uno parecido: tolerancia mucho más dura.
 FORWARDED_TOLERANCE = 0.001
@@ -236,6 +245,8 @@ class MatchScore:
     time_score: float
     score: float
     within_tolerance: bool
+    #: Solo del lado entrante: "CLOSES" | "PARTIAL". `None` en salientes, que no tienen clases.
+    coverage: Optional[str] = None
 
 
 @dataclass
@@ -281,13 +292,33 @@ def expected_amount(
     Si la op ya está parcialmente cubierta se prorratea el pendiente sobre ese lado.
     """
     if table == "incoming":
-        return cand.from_amount, cand.from_currency
+        # Lo que le toca comparar no es el lado `from` entero sino lo que queda por cobrar:
+        # un trato de 500 al que ya le entraron 400 lo cierra un comprobante de 100.
+        return cand.missing_incoming, cand.from_currency
     delivered = cand.delivered_amount or 0
     pending = cand.pending_amount or 0
     value = cand.value_amount or cand.from_amount or 0
     if delivered > 0.01 and pending > 0.01 and value > 0 and cand.to_amount > 0:
         return cand.to_amount * (pending / value), cand.to_currency
     return cand.to_amount, cand.to_currency
+
+
+def incoming_coverage(missing: Optional[float], paid: Optional[float]) -> Optional[str]:
+    """
+    Qué le hace este comprobante a lo que la operación todavía tiene por cobrar.
+
+    `CLOSES` la deja sin faltante; `PARTIAL` cubre una parte y deja resto. `None` significa
+    que no es candidata: o no falta nada, o el comprobante se pasa de lo que falta — y eso
+    último es saldo a favor del cliente, una decisión aparte que nadie debe tomar por inercia
+    desde una sugerencia.
+    """
+    if not paid or paid <= 0 or missing is None or missing <= 0:
+        return None
+    if abs(missing - paid) <= paid * AMOUNT_TOLERANCE:
+        return "CLOSES"
+    if missing > paid:
+        return "PARTIAL"
+    return None
 
 
 def _time_score(cand: OperationCandidate, reference: datetime) -> float:
@@ -322,6 +353,36 @@ def score_candidate(
     if not currency_matches:
         return MatchScore(cand.uuid, delta, relative, False, 0.0, time_score, 0.0, False)
 
+    if table == "incoming":
+        coverage = incoming_coverage(exp_amount, paid)
+        if coverage is None:
+            return MatchScore(cand.uuid, None, None, currency_matches, 0.0, time_score, 0.0, False)
+        if cand.created_at is None:
+            return MatchScore(cand.uuid, None, None, currency_matches, 0.0, 0.0, 0.0, False)
+        # Fuera de la ventana no compite, aunque el monto cuadre al céntimo.
+        if abs((reference - cand.created_at).total_seconds()) > INCOMING_WINDOW_HOURS * 3600:
+            return MatchScore(cand.uuid, None, None, currency_matches, 0.0, time_score, 0.0, False)
+        if coverage == "CLOSES":
+            amount_score = max(0.0, 1.0 - relative / AMOUNT_CUTOFF)
+            score = AMOUNT_WEIGHT * amount_score + (1 - AMOUNT_WEIGHT) * time_score
+        else:
+            # En un abono el monto no dice nada (cualquier cifra que quepa es igual de
+            # válida), así que lo único que ordena es el tiempo. Las dos escalas nunca se
+            # comparan entre sí: `rank_candidates` ordena por clase ANTES que por puntaje.
+            amount_score = 0.0
+            score = time_score
+        return MatchScore(
+            uuid=cand.uuid,
+            delta=delta,
+            relative=relative,
+            currency_matches=True,
+            amount_score=amount_score,
+            time_score=time_score,
+            score=score,
+            within_tolerance=coverage == "CLOSES",
+            coverage=coverage,
+        )
+
     amount_score = max(0.0, 1.0 - relative / AMOUNT_CUTOFF)
     score = (
         AMOUNT_WEIGHT * amount_score + (1 - AMOUNT_WEIGHT) * time_score
@@ -340,18 +401,30 @@ def score_candidate(
     )
 
 
+#: Orden de las clases de cobertura del lado entrante: un cierre siempre gana a un abono.
+_COVERAGE_RANK = {"CLOSES": 0, "PARTIAL": 1}
+
+
 def rank_candidates(
     candidates: Iterable[OperationCandidate],
     criteria: OutgoingCriteria,
     table: str,
     now: datetime,
 ) -> list[MatchScore]:
-    """Puntúa todas y devuelve de mejor a peor (desempate: la más reciente primero)."""
+    """
+    Puntúa todas y devuelve de mejor a peor.
+
+    Del lado ENTRANTE la clase manda sobre el puntaje: primero todo lo que CIERRA, después
+    todo lo que ABONA. Un cierre exacto es una afirmación mucho más fuerte que una
+    coincidencia horaria. Del lado saliente `coverage` es siempre None y el orden queda
+    exactamente como estaba. Desempate, en ambos: la más reciente primero.
+    """
     scores: list[tuple[MatchScore, Optional[datetime]]] = [
         (score_candidate(cand, criteria, table, now), cand.created_at) for cand in candidates
     ]
     scores.sort(
         key=lambda pair: (
+            _COVERAGE_RANK.get(pair[0].coverage, 0),
             -pair[0].score,
             -(pair[1].timestamp() if pair[1] else 0),
         )
@@ -361,12 +434,15 @@ def rank_candidates(
 
 def pick_suggestion(scored: Sequence[MatchScore]) -> Optional[Suggestion]:
     """
-    Política del FRONT: la mejor candidata, marcada como inequívoca solo si ninguna otra
-    queda igual de cerca. En la duda el operador elige a mano.
+    Política del FRONT: la mejor candidata, marcada como inequívoca solo si ninguna otra de
+    SU MISMA CLASE queda igual de cerca. En la duda el operador elige a mano.
     """
-    eligible = sorted(
-        [s for s in scored if s.within_tolerance], key=lambda s: s.score, reverse=True
-    )
+    closing = [s for s in scored if s.coverage == "CLOSES"]
+    partial = [s for s in scored if s.coverage == "PARTIAL"]
+    # Salientes: no hay clases, se mantiene el criterio de siempre.
+    plain = [s for s in scored if s.coverage is None and s.within_tolerance]
+
+    eligible = sorted(closing or plain or partial, key=lambda s: s.score, reverse=True)
     if not eligible:
         return None
     best = eligible[0]

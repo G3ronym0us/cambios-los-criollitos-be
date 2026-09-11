@@ -437,16 +437,27 @@ async def get_rate_at_datetime(
 @router.get("/by-pair/{currency_pair_uuid}", response_model=ExchangeRateResponse)
 async def get_active_rate_by_pair(
     currency_pair_uuid: UUID,
+    at: Optional[datetime] = Query(
+        None,
+        description="Instante ISO-8601: devuelve la tasa que regía entonces, no la de hoy",
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """
     Obtener la tasa activa para un par de divisas específico.
 
+    Con `at` devuelve la que REGÍA en ese instante, que es lo que hace falta para leer un
+    comprobante de ayer: cotizarlo con la tasa de hoy le cambia el trato al cliente.
+
     **Acceso**: USER o superior
     """
     repo = ExchangeRateRepository(db)
-    rate = repo.get_active_rate_by_pair(currency_pair_uuid)
+    rate = (
+        repo.get_rate_by_pair_at(currency_pair_uuid, at)
+        if at is not None
+        else repo.get_active_rate_by_pair(currency_pair_uuid)
+    )
 
     if not rate:
         raise HTTPException(

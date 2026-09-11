@@ -15,8 +15,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import or_
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import and_, func as safunc, or_
+from sqlalchemy.orm import Session, lazyload, selectinload
 
 from app.models.currency_pair import CurrencyPair
 from app.models.fund import FundGroup, FundGroupMember, FundMovement, FundMovementType
@@ -24,7 +24,12 @@ from app.models.transaction import Transaction, TransactionProfitSplit, Transact
 from app.models.user import User
 from app.models.whatsapp_balance import WhatsAppBalanceEntry
 from app.models.whatsapp_client import WhatsAppClient
-from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
+from app.models.whatsapp_payment import (
+    WhatsAppIncomingPayment,
+    WhatsAppOutgoingPayment,
+    WhatsAppOutgoingSettlement,
+    WhatsAppPaymentAllocation,
+)
 from app.models.whatsapp_operation_message import WhatsAppOperationMessage
 from app.models.whatsapp_operation import (
     WhatsAppAmountSide,
@@ -737,20 +742,69 @@ class WhatsAppQuoteService:
         since: Optional[datetime] = None,
         limit: int = 100,
         delivery_status: Optional[str] = None,
-    ) -> list[WhatsAppOperation]:
-        # `delivered_amount` recorre los comprobantes de salida de cada operación: sin
-        # precargarlos, listar 500 operaciones dispararía 500 consultas sueltas.
+        offset: int = 0,
+        search: Optional[str] = None,
+        scenario: Optional[str] = None,
+        needs: Optional[str] = None,
+        order_by: str = "created",
+    ) -> tuple[list[WhatsAppOperation], int]:
+        """
+        Una página de operaciones y el total que hay tras los filtros.
+
+        El total viaja aparte porque el listado del admin necesita paginar de verdad: antes
+        se pedían 500 de golpe y se filtraba en el navegador, lo que era una espera larga al
+        entrar y un techo silencioso — la 501 no existía.
+
+        `order_by` elige por qué fecha se ordena:
+
+        - `created` — cuándo se registró la operación. Es el histórico y sigue siendo el
+          predeterminado, porque el bot depende de él.
+        - `paid` — cuándo salió la plata: la fecha del comprobante de salida más reciente,
+          cayendo a la de la operación mientras no haya ninguno. Es lo que pide el listado
+          del admin, donde la pregunta es «qué se pagó últimamente» y una operación armada
+          a mano hoy por un pago de la semana pasada no debe colarse arriba.
+
+        El orden tiene que resolverse ACÁ y no en el navegador: la lista viene paginada, y
+        reordenar una página ya recortada sólo reordena esas 25 filas, no la lista.
+        """
+        # `delivered_amount` recorre los comprobantes de salida de cada operación, y
+        # `first_incoming_payment_at` los de entrada: sin precargarlos, listar una página
+        # entera dispararía varias consultas por fila.
         q = self.db.query(WhatsAppOperation).options(
-            selectinload(WhatsAppOperation.outgoing_payments)
+            selectinload(WhatsAppOperation.outgoing_payments),
+            selectinload(WhatsAppOperation.outgoing_settlements).selectinload(
+                WhatsAppOutgoingSettlement.payment
+            ),
+            selectinload(WhatsAppOperation.incoming_payments),
+            selectinload(WhatsAppOperation.incoming_allocations).selectinload(
+                WhatsAppPaymentAllocation.payment
+            ),
         )
+        # El buscador cruza cliente, así que el join tiene que existir aunque no haya phone.
+        if phone or search:
+            q = q.join(WhatsAppClient, WhatsAppClient.id == WhatsAppOperation.client_id)
         if phone:
-            q = q.join(WhatsAppClient, WhatsAppClient.id == WhatsAppOperation.client_id)\
-                 .filter(WhatsAppClient.phone == phone)
+            q = q.filter(WhatsAppClient.phone == phone)
+        if search:
+            like = f"%{search.strip()}%"
+            q = q.filter(
+                or_(
+                    WhatsAppClient.display_name.ilike(like),
+                    WhatsAppClient.phone.ilike(like),
+                )
+            )
         if status:
             try:
                 q = q.filter(WhatsAppOperation.status == WhatsAppOperationStatus(status.upper()))
             except ValueError:
                 raise QuoteServiceError("invalid_status", f"Status inválido: {status}", 400)
+        if scenario:
+            try:
+                q = q.filter(
+                    WhatsAppOperation.scenario == WhatsAppOperationScenario(scenario.upper())
+                )
+            except ValueError:
+                raise QuoteServiceError("invalid_scenario", f"scenario inválido: {scenario}", 400)
         if delivery_status:
             try:
                 q = q.filter(WhatsAppOperation.delivery_status == WhatsAppDeliveryStatus(delivery_status.upper()))
@@ -758,7 +812,49 @@ class WhatsAppQuoteService:
                 raise QuoteServiceError("invalid_delivery_status", f"delivery_status inválido: {delivery_status}", 400)
         if since:
             q = q.filter(WhatsAppOperation.created_at >= since)
-        return q.order_by(WhatsAppOperation.created_at.desc()).limit(limit).all()
+        if needs:
+            q = self._filter_needs_action(q, needs)
+
+        if order_by == "paid":
+            paid = self._last_outgoing_subquery()
+            q = q.outerjoin(paid, paid.c.op_id == WhatsAppOperation.id)
+            # Coalesce y no `paid_at` a secas: si no, las que aún no se han pagado —que son
+            # justo las que hay que atender— se irían todas al fondo con fecha nula.
+            ordering = safunc.coalesce(paid.c.paid_at, WhatsAppOperation.created_at).desc()
+        elif order_by != "created":
+            raise QuoteServiceError(
+                "invalid_order_by", f"order_by inválido: {order_by}. Use created | paid", 400
+            )
+        else:
+            ordering = WhatsAppOperation.created_at.desc()
+
+        # El conteo va sobre los mismos filtros pero sin cargar relaciones ni ordenar. El
+        # outerjoin de arriba agrega por operación, así que no multiplica filas.
+        total = q.order_by(None).count()
+        items = (
+            q.order_by(ordering)
+            .offset(max(0, offset))
+            .limit(limit)
+            .all()
+        )
+        return items, total
+
+    def _last_outgoing_subquery(self):
+        """La fecha del comprobante de salida más reciente de cada operación."""
+        from app.models.whatsapp_payment import WhatsAppOutgoingSettlement
+
+        return (
+            self.db.query(
+                WhatsAppOutgoingSettlement.whatsapp_operation_id.label("op_id"),
+                safunc.max(WhatsAppOutgoingPayment.created_at).label("paid_at"),
+            )
+            .join(
+                WhatsAppOutgoingPayment,
+                WhatsAppOutgoingPayment.id == WhatsAppOutgoingSettlement.outgoing_payment_id,
+            )
+            .group_by(WhatsAppOutgoingSettlement.whatsapp_operation_id)
+            .subquery()
+        )
 
     def mark_delivered(self, op_uuid: UUID, completed_by_user: User) -> WhatsAppOperation:
         """Recibe los USD físicos y cierra contablemente la operación.
@@ -766,8 +862,27 @@ class WhatsAppQuoteService:
         Las operaciones USD→VES creadas desde el pago saliente permanecen PENDING
         hasta que el cliente entrega el efectivo. Recibirlo debe completar la op y
         crear (o sincronizar) su transacción dentro de la misma acción.
+
+        El SELECT es `FOR UPDATE`: un doble clic en "marcar entregada" (o un reintento del
+        front tras un timeout) manda dos peticiones casi a la vez. Sin el lock, las dos leen
+        `delivery_status == PENDING` y `op.transaction_id is None`, y las dos crean su propia
+        `Transaction` -- una queda enganchada a la operación y la otra huérfana en el libro
+        contable, duplicando la ganancia registrada de un solo trato. Con el lock, la segunda
+        espera a que la primera comitee y entonces ve `delivery_status` ya en `RECEIVED`, así
+        que el chequeo de abajo la rechaza con 409 en vez de crear una segunda transacción.
         """
-        op = self._get_op_or_404(op_uuid)
+        op = (
+            self.db.query(WhatsAppOperation)
+            # `currency_pair` es `lazy="joined"` en el modelo (LEFT OUTER JOIN); Postgres no
+            # permite `FOR UPDATE` sobre el lado nulable de un outer join, así que se apaga
+            # el eager load para esta lectura puntual (no hace falta el par acá).
+            .options(lazyload(WhatsAppOperation.currency_pair))
+            .filter(WhatsAppOperation.uuid == op_uuid)
+            .with_for_update()
+            .first()
+        )
+        if op is None:
+            raise QuoteServiceError("not_found", f"Operation {op_uuid} no encontrada", 404)
         if op.delivery_status != WhatsAppDeliveryStatus.PENDING:
             raise QuoteServiceError(
                 "invalid_status",
@@ -858,14 +973,18 @@ class WhatsAppQuoteService:
             if group is None:
                 raise QuoteServiceError("fund_group_not_found", "FundGroup no encontrado", 404)
             op.fund_group_id = group.id
-        elif payload.group_jid:
-            group = self.db.query(FundGroup).filter(FundGroup.whatsapp_group_jid == payload.group_jid).first()
-            if group is None:
-                raise QuoteServiceError(
-                    "fund_group_not_found",
-                    f"No hay FundGroup asociado al grupo {payload.group_jid}",
-                    404,
-                )
+        elif payload.group_jid or payload.fund_manager_phone:
+            # El canal del fondo: su grupo, o el chat directo con su gestor. La regla es una
+            # sola (`fund_channel`) — ver el caso del pago 4951.
+            #
+            # El import va acá dentro y no arriba porque `fund_channel` levanta
+            # `QuoteServiceError`, que se define en ESTE módulo: a nivel de módulo el ciclo
+            # rompe la carga.
+            from app.services.fund_channel import resolve_fund_channel
+
+            group = resolve_fund_channel(
+                self.db, payload.group_jid, None, payload.fund_manager_phone
+            )
             op.fund_group_id = group.id
 
         # Fondo de la pata que SALE. clear_fund_group_out lo limpia.
@@ -1064,6 +1183,24 @@ class WhatsAppQuoteService:
             op.transaction_id = tx.id
         else:
             self._sync_linked_transaction(op)
+
+        # `_apply_scenario` puede haber cambiado `fund_group_id`/`fund_group_out_id`: sin
+        # este resync, una op COMPLETED que cambia de fondo desde este endpoint dejaba el
+        # FundMovement viejo apuntando al fondo ANTERIOR mientras la operación ya decía
+        # otro -la plata "se movió" por un fondo que la operación ya no dice tocar-. Es el
+        # mismo resync que ya hace `set_scenario` para el mismo campo; acá faltaba. Sólo
+        # corre si el payload de verdad tocó alguno de esos campos: evita trabajo (y
+        # consultas) de más en la corrección de cliente/par/margen, que es la mayoría de
+        # las llamadas a este endpoint.
+        fund_fields = {
+            "clear_fund_group", "fund_group_uuid", "clear_fund_group_out",
+            "fund_group_out_uuid", "group_jid", "fund_manager_phone",
+        }
+        if fund_fields & fields_set:
+            from app.services.whatsapp_payment_service import WhatsAppPaymentService
+
+            WhatsAppPaymentService(self.db)._sync_fund_legs(op, operator)
+
         self.db.commit()
         self.db.refresh(op)
         return op
@@ -1084,6 +1221,21 @@ class WhatsAppQuoteService:
             raise QuoteServiceError(
                 "completed_status_is_terminal",
                 "Una operación completada no puede volver a otro estado porque ya tiene una transacción contable",
+                409,
+            )
+        if (
+            op.status == WhatsAppOperationStatus.CANCELLED
+            and target != WhatsAppOperationStatus.QUOTED
+        ):
+            # Reactivar una cancelada tiene un solo camino sancionado: `restore_quote`
+            # (CANCELLED -> QUOTED, con su propio refresh de `expires_at`). Dejar que este
+            # cambio administrativo la mande directo a PENDING o COMPLETED se salta esa
+            # revisión y resucita movimientos de fondo/transacción para un trato que el
+            # operador había cancelado a propósito.
+            raise QuoteServiceError(
+                "cancelled_must_be_restored_first",
+                "Una operación cancelada sólo puede reactivarse con /restore (vuelve a "
+                "QUOTED); desde ahí sigue su curso normal",
                 409,
             )
 
@@ -1164,6 +1316,7 @@ class WhatsAppQuoteService:
                 "username": m.user.username if m.user else None,
                 "group_uuid": group.uuid if group else None,
                 "group_name": group.name if group else None,
+                "group_currency": group.currency if group else None,
                 "group_jid": group.whatsapp_group_jid if group else None,
                 "is_fund_manager": bool(m.is_fund_manager),
             })
@@ -1191,12 +1344,190 @@ class WhatsAppQuoteService:
             )
             .count()
         )
+        # Semana corrida (hoy + 6 atrás), mismo corte UTC que `completed_today`: es lo que
+        # necesita `/admin/overview` para el ritmo («7 hoy, 5.4 en promedio»). Extra sobre
+        # `WhatsAppStatsResponse` (pydantic lo ignora en el endpoint viejo).
+        week_start = today_start - timedelta(days=6)
+        completed_week = (
+            self.db.query(WhatsAppOperation)
+            .filter(
+                WhatsAppOperation.status == WhatsAppOperationStatus.COMPLETED,
+                WhatsAppOperation.completed_at >= week_start,
+            )
+            .count()
+        )
         return {
             "pending": counts["PENDING"],
             "completed": counts["COMPLETED"],
             "quoted": counts["QUOTED"],
             "cancelled": counts["CANCELLED"],
             "completed_today": completed_today,
+            "completed_daily_avg_week": round(completed_week / 7, 2),
+            **self._actionable_stats(),
+        }
+
+    def _settled_subquery(self):
+        """Cuánto cubren ya los comprobantes de cada operación, agregado en SQL."""
+        from sqlalchemy import func as safunc
+
+        from app.models.whatsapp_payment import WhatsAppOutgoingSettlement
+
+        return (
+            self.db.query(
+                WhatsAppOutgoingSettlement.whatsapp_operation_id.label("op_id"),
+                safunc.coalesce(safunc.sum(WhatsAppOutgoingSettlement.settled_amount), 0).label(
+                    "delivered"
+                ),
+            )
+            .group_by(WhatsAppOutgoingSettlement.whatsapp_operation_id)
+            .subquery()
+        )
+
+    def _filter_needs_action(self, q, needs: str):
+        """
+        Filtra por lo que hace falta HACER, no por el estado.
+
+        Es lo que convierte las tarjetas de la cabecera en una bandeja: cada una aplica su
+        segmento en vez de obligar al operador a armarlo con tres selects. `action` es la
+        unión de las cuatro — todo lo que espera algo de alguien.
+        """
+        from sqlalchemy import func as safunc, or_ as sa_or
+
+        key = needs.strip().lower()
+        valid = {"settle", "deliver", "client", "expiring", "action"}
+        if key not in valid:
+            raise QuoteServiceError(
+                "invalid_needs", f"needs inválido: {needs}. Use uno de {sorted(valid)}", 400
+            )
+
+        now = datetime.now(timezone.utc)
+        settled = self._settled_subquery()
+        value = safunc.coalesce(WhatsAppOperation.amount, WhatsAppOperation.from_amount)
+        missing = value - safunc.coalesce(settled.c.delivered, 0) - safunc.coalesce(
+            WhatsAppOperation.uncovered_amount, 0
+        )
+
+        needs_settle = and_(
+            WhatsAppOperation.status.in_(
+                [WhatsAppOperationStatus.PENDING, WhatsAppOperationStatus.QUOTED]
+            ),
+            missing > 0,
+        )
+        needs_deliver = and_(
+            WhatsAppOperation.delivery_status == WhatsAppDeliveryStatus.PENDING,
+            WhatsAppOperation.status != WhatsAppOperationStatus.CANCELLED,
+        )
+        needs_client = and_(
+            WhatsAppOperation.client_id.is_(None),
+            WhatsAppOperation.status != WhatsAppOperationStatus.CANCELLED,
+        )
+        is_expiring = and_(
+            WhatsAppOperation.status == WhatsAppOperationStatus.QUOTED,
+            WhatsAppOperation.expires_at.isnot(None),
+            WhatsAppOperation.expires_at >= now,
+        )
+
+        # El join va siempre: sin él, `missing` no puede resolverse.
+        q = q.outerjoin(settled, settled.c.op_id == WhatsAppOperation.id)
+        clauses = {
+            "settle": needs_settle,
+            "deliver": needs_deliver,
+            "client": needs_client,
+            "expiring": is_expiring,
+        }
+        if key == "action":
+            return q.filter(sa_or(*clauses.values()))
+        return q.filter(clauses[key])
+
+    def _actionable_stats(self) -> dict:
+        """
+        Los cuatro números que sí cambian lo que haces al abrir la pantalla.
+
+        El censo por estado no es una bandeja: dice cuántas hay de cada color, no cuál hay
+        que tocar hoy. Estos cuentan TODO, no la página — el listado los usa como filtros.
+
+        `por cuadrar` necesita el valor menos lo ya cubierto, y lo cubierto vive en los
+        settlements, así que se agregan en SQL: recorrerlo en Python obligaría a cargar
+        todas las operaciones abiertas con sus comprobantes.
+        """
+        from sqlalchemy import func as safunc
+
+        now = datetime.now(timezone.utc)
+        # El valor del trato: `amount` cuando existe, si no el monto de origen.
+        value = safunc.coalesce(WhatsAppOperation.amount, WhatsAppOperation.from_amount)
+        settled = self._settled_subquery()
+        delivered = safunc.coalesce(settled.c.delivered, 0)
+        uncovered = safunc.coalesce(WhatsAppOperation.uncovered_amount, 0)
+        missing = value - delivered - uncovered
+
+        # Una operación viva a la que aún le falta comprobante por cubrir. Se agregan también
+        # el valor total y lo ya cubierto (no solo lo que falta) en la MISMA consulta: es lo
+        # que necesita `/admin/overview` para pintar «4.920 cubiertos de 7.230 · faltan 2.310»
+        # sin disparar una segunda query idéntica con una proyección distinta.
+        open_ops = (
+            self.db.query(
+                safunc.count(WhatsAppOperation.id),
+                safunc.coalesce(safunc.sum(missing), 0),
+                safunc.coalesce(safunc.sum(value), 0),
+                safunc.coalesce(safunc.sum(delivered + uncovered), 0),
+            )
+            .outerjoin(settled, settled.c.op_id == WhatsAppOperation.id)
+            .filter(
+                WhatsAppOperation.status.in_(
+                    [WhatsAppOperationStatus.PENDING, WhatsAppOperationStatus.QUOTED]
+                ),
+                missing > 0,
+            )
+            .one()
+        )
+
+        to_deliver = (
+            self.db.query(
+                safunc.count(WhatsAppOperation.id),
+                safunc.min(WhatsAppOperation.created_at),
+            )
+            .filter(
+                WhatsAppOperation.delivery_status == WhatsAppDeliveryStatus.PENDING,
+                WhatsAppOperation.status != WhatsAppOperationStatus.CANCELLED,
+            )
+            .one()
+        )
+
+        without_client = (
+            self.db.query(safunc.count(WhatsAppOperation.id))
+            .filter(
+                WhatsAppOperation.client_id.is_(None),
+                WhatsAppOperation.status != WhatsAppOperationStatus.CANCELLED,
+            )
+            .scalar()
+        )
+
+        expiring = (
+            self.db.query(
+                safunc.count(WhatsAppOperation.id),
+                safunc.min(WhatsAppOperation.expires_at),
+            )
+            .filter(
+                WhatsAppOperation.status == WhatsAppOperationStatus.QUOTED,
+                WhatsAppOperation.expires_at.isnot(None),
+                WhatsAppOperation.expires_at >= now,
+            )
+            .one()
+        )
+
+        return {
+            "to_settle": open_ops[0] or 0,
+            "to_settle_amount": round(float(open_ops[1] or 0), 2),
+            # Extra sobre `WhatsAppStatsResponse` (pydantic los ignora): total del trato y lo
+            # ya cubierto, para el overview. OJO nombre: `to_settle_amount` de este dict es lo
+            # que FALTA (missing); estos dos son otra cosa.
+            "to_settle_total_amount": round(float(open_ops[2] or 0), 2),
+            "to_settle_covered_amount": round(float(open_ops[3] or 0), 2),
+            "to_deliver": to_deliver[0] or 0,
+            "to_deliver_oldest_at": to_deliver[1],
+            "without_client": without_client or 0,
+            "expiring": expiring[0] or 0,
+            "expiring_next_at": expiring[1],
         }
 
     # ---------- Helpers ----------

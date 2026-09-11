@@ -16,6 +16,10 @@ class CurrencyPairBase(BaseModel):
     description: Optional[str] = None
     is_active: bool = True
     is_monitored: bool = True
+    #: El par se cambia en efectivo, mano a mano: no hay comprobante entrante ni lo habrá.
+    #: «Por entregar» deja de exigirlo en este par —si no, el par entero sale vacío— y lo
+    #: que quede sin cuadrar se lee al revés: no es lo que debemos, es lo que nos deben.
+    settles_in_cash: bool = False
     binance_tracked: bool = False
     banks_to_track: Optional[List[str]] = None
     amount_to_track: Optional[Decimal] = None
@@ -27,6 +31,8 @@ class CurrencyPairBase(BaseModel):
     rounding_step: Optional[Decimal] = Field(None, description="Multiple to round to (e.g. 100, 5)")
     rounding_direction: Optional[Literal["UP", "DOWN"]] = Field(None, description="Rounding direction")
     rounding_amount_side: Optional[Literal["FROM", "TO"]] = Field(None, description="AMOUNT mode only: which side's amount is rounded (rounded only when it is the calculated side)")
+    negotiation_step: Optional[Decimal] = Field(None, description="Multiple this pair is negotiated in (e.g. 10000). Not applied automatically: only suggests round amounts when an operator creates a quote by hand")
+    negotiation_step_side: Optional[Literal["FROM", "TO"]] = Field(None, description="Which of the pair's currencies negotiation_step is expressed in")
 
     # Un par NO tiene por qué cruzar dos monedas distintas: `USDT-USDT` es una paridad 1:1 y
     # es la única forma de expresar «un porcentaje sobre la par» en un modelo donde todo
@@ -54,7 +60,10 @@ class CurrencyPairBase(BaseModel):
         # to ensure base_pair exists and is not self-referencing
         return v
 
-    @validator('rounding_amount_side')
+    # `always=True` o el validador se salta justo cuando el lado viene ausente,
+    # que es el caso que existe para rechazar. Sin él, un `rounding_mode="AMOUNT"`
+    # sin lado se guardaba y el bot acababa sin saber qué monto redondear.
+    @validator('rounding_amount_side', always=True)
     def validate_rounding_config(cls, v, values):
         mode = values.get('rounding_mode')
         if mode is not None:
@@ -64,6 +73,19 @@ class CurrencyPairBase(BaseModel):
                 raise ValueError('rounding_direction is required when rounding_mode is set')
             if mode == 'AMOUNT' and v is None:
                 raise ValueError("rounding_amount_side is required when rounding_mode is 'AMOUNT'")
+        return v
+
+    # `always=True` es imprescindible: sin él el validador no corre cuando el
+    # lado viene ausente, que es justo el caso que hay que rechazar.
+    @validator('negotiation_step_side', always=True)
+    def validate_negotiation_step(cls, v, values):
+        # Declared after negotiation_step, so it is already in `values`.
+        step = values.get('negotiation_step')
+        if step is not None:
+            if step <= 0:
+                raise ValueError('negotiation_step must be > 0')
+            if v is None:
+                raise ValueError('negotiation_step_side is required when negotiation_step is set')
         return v
 
     @validator('pair_type', pre=True)
@@ -87,6 +109,7 @@ class CurrencyPairUpdate(BaseModel):
     description: Optional[str] = None
     is_active: Optional[bool] = None
     is_monitored: Optional[bool] = None
+    settles_in_cash: Optional[bool] = None
     binance_tracked: Optional[bool] = None
     banks_to_track: Optional[List[str]] = None
     amount_to_track: Optional[Decimal] = None
@@ -98,6 +121,39 @@ class CurrencyPairUpdate(BaseModel):
     rounding_step: Optional[Decimal] = None
     rounding_direction: Optional[Literal["UP", "DOWN"]] = None
     rounding_amount_side: Optional[Literal["FROM", "TO"]] = None
+    negotiation_step: Optional[Decimal] = None
+    negotiation_step_side: Optional[Literal["FROM", "TO"]] = None
+
+    # Igual que arriba: el detalle guarda por aquí, así que sin esta copia la
+    # regla no correría en el camino que de hecho edita el redondeo.
+    #
+    # Solo exige la config completa cuando el payload trae `rounding_mode`. Un
+    # update parcial que toque otra cosa —o solo el múltiplo— no dispara nada:
+    # aquí no hay acceso al par guardado, así que exigir campos que el llamante
+    # no está cambiando rechazaría peticiones legítimas.
+    @validator('rounding_amount_side', always=True)
+    def validate_rounding_config(cls, v, values):
+        mode = values.get('rounding_mode')
+        if mode is not None:
+            if not values.get('rounding_step') or values['rounding_step'] <= 0:
+                raise ValueError('rounding_step is required and must be > 0 when rounding_mode is set')
+            if not values.get('rounding_direction'):
+                raise ValueError('rounding_direction is required when rounding_mode is set')
+            if mode == 'AMOUNT' and v is None:
+                raise ValueError("rounding_amount_side is required when rounding_mode is 'AMOUNT'")
+        return v
+
+    # El detalle del par guarda por aquí, no por `CurrencyPairCreate`: sin esta
+    # copia la validación de arriba no cubriría el único camino que se usa.
+    @validator('negotiation_step_side', always=True)
+    def validate_negotiation_step(cls, v, values):
+        step = values.get('negotiation_step')
+        if step is not None:
+            if step <= 0:
+                raise ValueError('negotiation_step must be > 0')
+            if v is None:
+                raise ValueError('negotiation_step_side is required when negotiation_step is set')
+        return v
 
     @validator('pair_type', pre=True)
     def validate_pair_type(cls, v):
@@ -143,6 +199,7 @@ class CurrencyPairResponse(BaseModel):
     description: Optional[str] = None
     is_active: bool
     is_monitored: bool
+    settles_in_cash: bool = False
     binance_tracked: bool
     banks_to_track: Optional[List[str]] = None
     amount_to_track: Optional[Decimal] = None
@@ -155,6 +212,8 @@ class CurrencyPairResponse(BaseModel):
     rounding_step: Optional[Decimal] = None
     rounding_direction: Optional[str] = None
     rounding_amount_side: Optional[str] = None
+    negotiation_step: Optional[Decimal] = None
+    negotiation_step_side: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
     # Solo lo llenan los endpoints de listado y de detalle; el resto lo deja en None.

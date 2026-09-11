@@ -140,16 +140,25 @@ class WhatsAppRateResolver:
         if direct is not None:
             return self._to_entry(direct)
 
-        # 2. Par inverso: swap y se invierte la tasa
+        # 2. Par inverso: sólo existe la fila en sentido (to_currency -> from_currency).
+        #
+        # OJO — no invertir `rate` (ni `base_rate`) aquí. La reciprocidad ya la resuelve
+        # el flag `inverse_percentage`: una entrada (A→B, rate=r, inverse=False) significa
+        # B = A × r (ver `apply_rate` / `applyRate` en whatsapp-bot/src/rates.ts:159), así
+        # que leída al revés es A = B / r — la MISMA r, sólo se voltea el flag. Si además
+        # se invierte `rate` (como hacía antes esta rama: `1.0 / inverse.rate`), la
+        # reciprocidad se aplica dos veces y el resultado queda multiplicado por r² en vez
+        # de por 1. Con una tasa de ~900 eso son ~800.000 veces de error: así se cotizaron
+        # en producción 200 BRL con la tasa de VES (777) en vez de la de USDT/BRL (~5), y
+        # la operación quedó en 0,26 PAYPAL en lugar del monto correcto.
         inverse = self._fetch_latest_active(to_currency, from_currency, at)
         if inverse is not None and inverse.rate != 0:
             base_inv = self._to_entry(inverse)
-            inverted_base = (1.0 / base_inv.base_rate) if base_inv.base_rate != 0 else 0.0
             return RateEntry(
-                rate=1.0 / inverse.rate,
+                rate=base_inv.rate,
                 inverse_percentage=not base_inv.inverse_percentage,
                 base_percentage=base_inv.base_percentage,
-                base_rate=inverted_base,
+                base_rate=base_inv.base_rate,
             )
 
         return None

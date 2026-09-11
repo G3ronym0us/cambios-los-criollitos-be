@@ -15,6 +15,7 @@ class WhatsAppClientUpsert(BaseModel):
     is_tracked: Optional[bool] = None
     is_blocked: Optional[bool] = None
     is_usdt_authorized: Optional[bool] = None
+    is_rate_setter: Optional[bool] = None
     default_payment_info: Optional[str] = None
     default_payment_currency: Optional[str] = None
 
@@ -32,6 +33,7 @@ class WhatsAppClientResponse(BaseModel):
     is_tracked: bool
     is_blocked: bool
     is_usdt_authorized: bool
+    is_rate_setter: bool = False
     default_payment_info: Optional[str] = None
     default_payment_currency: Optional[str] = None
     last_seen_at: Optional[datetime] = None
@@ -118,7 +120,24 @@ class WhatsAppOperationResponse(BaseModel):
     amount: Optional[float] = None
     currency: Optional[str] = None
     delivered_amount: Optional[float] = None
+    #: El hueco declarado sin comprobante (efectivo). NO está en `delivered_amount` —que
+    #: sólo cuenta comprobantes— pero SÍ está descontado de `pending_amount`. Sin este
+    #: campo, una operación de 75 con 40 entregados en efectivo llega al front como si
+    #: valiera 35 desde el principio, y los 40 desaparecen de la pantalla.
+    uncovered_amount: Optional[float] = None
+    uncovered_reason: Optional[str] = None
     pending_amount: Optional[float] = None
+    #: La OTRA pata, y sólo dice algo en un par que se cambia en efectivo: cuánto de los
+    #: billetes del cliente ya está recogido, y cuánto falta. `pending_amount` mide lo
+    #: nuestro —lo que no hemos cubierto— y en esos pares llega a cero en cuanto se vincula
+    #: el comprobante en bolívares, sin que nadie haya recogido un dólar. Sin estos dos
+    #: campos la pantalla no puede distinguir «ya está pagada» de «ya está cobrada».
+    collected_amount: Optional[float] = None
+    to_collect: Optional[float] = None
+    # Cuántos comprobantes cubren la operación, y la tasa que resulta de ellos
+    # (entregado ÷ valor). `rate_used` es la que se cotizó; esta es la que salió.
+    payments_count: int = 0
+    real_rate: Optional[float] = None
     amount_usdt: Optional[float] = None
     usdt_rate: Optional[float] = None
     bcv_amount: Optional[float] = None
@@ -148,6 +167,22 @@ class WhatsAppOperationResponse(BaseModel):
     no_payments_ack_note: Optional[str] = None
     transaction_uuid: Optional[UUID] = None
     legacy_sqlite_id: Optional[str] = None
+    # Las dos fechas que de verdad sitúan la operación en el tiempo, y que no son
+    # `created_at`: cuándo entró el dinero del cliente y cuándo salió el nuestro. Una
+    # operación que el bot no reconoció se arma a mano días después de las dos.
+    first_incoming_payment_at: Optional[datetime] = None
+    #: Su par se cambia en efectivo. Entonces `first_incoming_payment_at` vacío no dice que
+    #: el cliente no haya pagado: dice que de un billete no hay comprobante que adjuntar.
+    settles_in_cash: bool = False
+    # Distinto de `first_incoming_payment_at`: ese mide antigüedad (primer pago), este es
+    # el pago más reciente — lo que un listado debe mostrar como "fecha del pago" cuando
+    # el cliente pagó en varias partes. Ver el docstring de la property en el modelo.
+    last_incoming_payment_at: Optional[datetime] = None
+    # El espejo de `first_incoming_payment_at` del lado de la salida: mide antigüedad, no el
+    # hecho más reciente. Es la única fecha real que tiene una operación de par en efectivo,
+    # donde el comprobante entrante no existe.
+    first_outgoing_payment_at: Optional[datetime] = None
+    last_outgoing_payment_at: Optional[datetime] = None
     quoted_at: datetime
     expires_at: datetime
     approved_at: Optional[datetime] = None
@@ -170,13 +205,16 @@ class WhatsAppOperationScenarioUpdate(BaseModel):
     """
     Setear/editar el escenario, los fondos y el receptor del entrante de una operación.
     Todos opcionales (PATCH parcial). El fondo de la pata que ENTRA se resuelve por
-    `fund_group_uuid` o, para el bot, por `group_jid` (FundGroup.whatsapp_group_jid);
+    `fund_group_uuid` o, para el bot, por `group_jid` (FundGroup.whatsapp_group_jid) o por
+    `fund_manager_phone` (el fondo que se lleva en el chat directo con su gestor);
     el de la pata que SALE, por `fund_group_out_uuid`.
     """
     scenario: Optional[Literal["NORMAL", "ZELLE_DIRECT", "VIA_PARTNER"]] = None
     fund_group_uuid: Optional[UUID] = None
     fund_group_out_uuid: Optional[UUID] = None
     group_jid: Optional[str] = None
+    #: Chat directo del gestor, para los fondos que no se llevan en un grupo.
+    fund_manager_phone: Optional[str] = None
     received_by_user_uuid: Optional[UUID] = None
     # Permite explícitamente limpiar los fondos / receptor (poner a NULL) cuando True.
     clear_fund_group: bool = False
@@ -202,7 +240,9 @@ class WhatsAppOperationUpdate(WhatsAppOperationScenarioUpdate):
     """Edición atómica de los datos administrativos de una operación."""
 
     currency_pair_uuid: Optional[UUID] = None
-    applied_percentage: Optional[float] = Field(None, ge=0, le=99)
+    #: Puede ser NEGATIVO: se entregó por encima de la tasa base. Es una pérdida real contra
+    #: la referencia y esconderla en un cero sería mentir sobre la operación.
+    applied_percentage: Optional[float] = Field(None, gt=-100, lt=99)
     client_phone: Optional[str] = Field(None, min_length=4, max_length=32)
     client_display_name: Optional[str] = Field(None, max_length=120)
 
@@ -224,6 +264,10 @@ class WhatsAppPartnerResponse(BaseModel):
     username: Optional[str] = None
     group_uuid: UUID
     group_name: str
+    # Moneda base del fondo. El bot la necesita para decidir si el comprobante ya trae el
+    # monto que vale: un fondo en COP repuesto con un envío en USDT no lo trae.
+    group_currency: Optional[str] = None
+    # Sin jid, el fondo no se lleva en un grupo sino en el chat directo con este gestor.
     group_jid: Optional[str] = None
     is_fund_manager: bool = False
 
@@ -234,8 +278,14 @@ class WhatsAppPartnerList(BaseModel):
 
 
 class WhatsAppPendingDepositCreate(BaseModel):
-    """El bot reporta un comprobante subido al grupo por un gestor → depósito PENDING."""
-    group_jid: str
+    """
+    El bot reporta un comprobante de un gestor → depósito PENDING.
+
+    Llega por el grupo (`group_jid`) o por el chat directo con el gestor (`manager_phone`):
+    no todo fondo se lleva en un grupo de WhatsApp. Hace falta uno de los dos.
+    """
+    group_jid: Optional[str] = None
+    manager_phone: Optional[str] = None
     detected_phone: Optional[str] = None     # autor del mensaje en el grupo (gestor)
     amount: Optional[float] = None
     currency: Optional[str] = None
@@ -243,10 +293,19 @@ class WhatsAppPendingDepositCreate(BaseModel):
     reference: Optional[str] = None
     raw_text: Optional[str] = None
 
+    @validator("manager_phone", always=True)
+    def uno_de_los_dos(cls, v, values):
+        if not v and not values.get("group_jid"):
+            raise ValueError("hace falta group_jid o manager_phone")
+        return v
+
 
 class WhatsAppOperationList(BaseModel):
     operations: List[WhatsAppOperationResponse]
+    # El total tras los filtros, no el tamaño de la página.
     total: int
+    page: int = 1
+    limit: Optional[int] = None
 
 
 class WhatsAppStatsResponse(BaseModel):
@@ -255,6 +314,14 @@ class WhatsAppStatsResponse(BaseModel):
     quoted: int
     cancelled: int
     completed_today: int
+    # Lo accionable: cuentan TODO, no la página. El listado los usa como filtros.
+    to_settle: int = 0
+    to_settle_amount: float = 0
+    to_deliver: int = 0
+    to_deliver_oldest_at: Optional[datetime] = None
+    without_client: int = 0
+    expiring: int = 0
+    expiring_next_at: Optional[datetime] = None
 
 
 # ===== De qué mensaje nació la operación =====
@@ -275,6 +342,28 @@ class WhatsAppSourceMessageResponse(BaseModel):
     operation_uuid: Optional[UUID] = None
     client_phone: Optional[str] = None
     wa_message_id: Optional[str] = None
+
+
+# ===== Bitácora del analizador (corpus) =====
+
+class WhatsAppAnalysisLog(BaseModel):
+    """
+    Una corrida del analizador de mensajes. El bot la manda sin esperar respuesta: no
+    alimenta ninguna decisión, es el corpus con el que después se mide y se entrena.
+    """
+    client_phone: str = Field(..., min_length=3, max_length=64)
+    # La ventana tal cual la vio el analizador, el mensaje más viejo primero.
+    messages: List[str] = Field(..., min_length=1, max_length=10)
+    # El AnalysisResult crudo. Sin esquema fijo a propósito: cuando el analizador cambie de
+    # forma, las filas viejas siguen siendo legibles y `analyzer` dice cuál las produjo.
+    output: dict
+    wa_message_id: Optional[str] = Field(None, max_length=255)
+    analyzer: str = Field("heuristic-v1", min_length=1, max_length=32)
+    context: Optional[dict] = None
+
+
+class WhatsAppAnalysisLogResponse(BaseModel):
+    uuid: UUID
 
 
 # ===== Payments (comprobantes OCR) =====
@@ -331,6 +420,22 @@ class PaymentAllocationsUpdate(BaseModel):
     pago (contando lo ya acreditado al saldo del cliente) ni quedar vacía.
     """
     allocations: List[PaymentAllocationItem]
+
+
+class OutgoingSettlementItem(BaseModel):
+    """
+    Parte del valor de UNA operación que cubre un comprobante de salida.
+
+    El monto va en la moneda del VALOR de esa operación (80 ZELLE), no en la del comprobante:
+    un solo pago en bolívares puede cubrir dos tratos en Zelle a la vez.
+    """
+    operation_uuid: UUID
+    settled_amount: float = Field(..., gt=0)
+
+
+class OutgoingSettlementsUpdate(BaseModel):
+    """Reparto completo del comprobante de salida: reemplaza el anterior y no puede ir vacío."""
+    settlements: List[OutgoingSettlementItem]
 
 
 class OrphanDecision(BaseModel):
@@ -418,10 +523,54 @@ class ClientLoanRepaymentCreate(BaseModel):
     notes: Optional[str] = None
 
 
+class OperationCoveragePayment(BaseModel):
+    payment_id: int
+    #: Sólo cuando ese comprobante abarca DOS tratos; si no, aporta su monto completo y no hay
+    #: nada que teclear.
+    settled_amount: Optional[float] = Field(None, gt=0)
+
+
+class OperationCoverageUncovered(BaseModel):
+    """La parte del valor que no tiene comprobante, con el motivo que la deja cerrar."""
+
+    amount: float = Field(..., ge=0)
+    reason: Optional[Literal["CASH", "OTHER_CHANNEL", "BALANCE", "ADJUSTMENT"]] = None
+
+
+class OperationCoverageUpdate(BaseModel):
+    """
+    Con qué comprobantes se cubre la operación. Es el conjunto COMPLETO, no deltas.
+
+    `partial` distingue «guardo lo que llevo» de «esto ya está cuadrado»: la tasa se deriva de
+    la suma sólo al cuadrar, porque a medias la suma está incompleta.
+    """
+
+    payments: List[OperationCoveragePayment]
+    value_amount: Optional[float] = Field(None, gt=0)
+    uncovered: Optional[OperationCoverageUncovered] = None
+    partial: bool = False
+
+
 class WhatsAppForwardToGroup(BaseModel):
-    """Marcar un pago entrante como contabilizado en un grupo (escenario ZELLE_DIRECT)."""
+    """
+    Marcar un pago entrante como contabilizado en un fondo (escenario ZELLE_DIRECT).
+
+    El canal del fondo es su grupo (`group_jid`) o el chat directo con su gestor
+    (`manager_phone`): no todo fondo se lleva en un grupo.
+    """
     group_jid: Optional[str] = None
     group_uuid: Optional[UUID] = None
+    manager_phone: Optional[str] = None
+
+
+class WhatsAppPaymentTransferRequest(BaseModel):
+    """
+    Mudar un comprobante a otro cliente. El motivo es obligatorio: es lo que queda en el
+    rastro, y sin él la mudanza es indistinguible de un error.
+    """
+    client_uuid: UUID = Field(..., description="Cliente destino")
+    reason: str = Field(..., description="THIRD_PARTY | BOT_MISMATCH | DUPLICATE_CLIENT")
+    note: Optional[str] = None
 
 
 class WhatsAppBalanceCredit(BaseModel):
@@ -470,6 +619,10 @@ class WhatsAppCreateOpManual(BaseModel):
     amount_side: str = "SEND"
     fund_group_uuid: Optional[UUID] = None
     exchange_user_uuid: Optional[UUID] = None
+    # Por qué el valor de la operación no es el del comprobante: cuando el operador decide
+    # dejar la diferencia (y con ella una tasa efectiva distinta a la cotizada), la decisión
+    # se guarda con la operación en vez de perderse en el diálogo que la preguntó.
+    notes: Optional[str] = Field(None, max_length=2000)
 
     @validator('from_currency', 'to_currency')
     def upper_currency(cls, v: str) -> str:

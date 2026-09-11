@@ -125,6 +125,7 @@ class CurrencyPairRepository:
             description=pair_data.description,
             is_active=pair_data.is_active,
             is_monitored=pair_data.is_monitored,
+            settles_in_cash=pair_data.settles_in_cash,
             binance_tracked=pair_data.binance_tracked,
             banks_to_track=pair_data.banks_to_track,
             amount_to_track=pair_data.amount_to_track,
@@ -136,6 +137,8 @@ class CurrencyPairRepository:
             rounding_step=pair_data.rounding_step,
             rounding_direction=pair_data.rounding_direction,
             rounding_amount_side=pair_data.rounding_amount_side,
+            negotiation_step=pair_data.negotiation_step,
+            negotiation_step_side=pair_data.negotiation_step_side,
         )
         
         # Validate base pair configuration

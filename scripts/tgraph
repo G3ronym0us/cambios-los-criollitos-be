@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Query the merged tasas-project graph (backend + whatsapp-bot + frontend) from
+# any directory, without cd'ing to the project root.
+#
+# Plain `graphify query` resolves graphify-out/graph.json against the current
+# directory, so running it inside backend/ silently answers from the backend-only
+# graph. This forwards --graph to the merged one at the project root.
+#
+#   tgraph query "how does the frontend mark an operation delivered"
+#   tgraph path "operationService.markDelivered" "mark_delivered" --undirected
+#   tgraph explain "OperationService"
+#
+# Install:  ln -s "$PWD/backend/scripts/tgraph" ~/.local/bin/tgraph
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
+GRAPH="$ROOT/graphify-out/graph.json"
+
+if [[ ! -f "$GRAPH" ]]; then
+  echo "error: merged graph not found at $GRAPH" >&2
+  echo "build it with: python $ROOT/backend/scripts/graphify_all.py" >&2
+  exit 1
+fi
+
+if [[ $# -eq 0 ]]; then
+  echo "usage: tgraph <query|path|explain> ... " >&2
+  echo "  graph: $GRAPH" >&2
+  exit 2
+fi
+
+exec graphify "$@" --graph "$GRAPH"

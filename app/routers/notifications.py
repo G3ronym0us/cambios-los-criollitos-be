@@ -6,7 +6,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from uuid import UUID
 
-from app.core.dependencies import get_current_active_user, get_moderator_user
+from app.core.dependencies import get_root_user
 from app.database.connection import get_db
 from app.models.user import User
 from app.repositories.rate_alert_repository import RateAlertRepository
@@ -53,7 +53,9 @@ async def _sse_generator(current_user: User) -> AsyncGenerator[str, None]:
 
 @router.get("/stream")
 async def notification_stream(
-    current_user: User = Depends(get_moderator_user),
+    # Rate divergence surveillance is ROOT-only (same policy as GET /admin/overview's
+    # "alerts" block) — a MODERATOR must not be able to reach it through this channel.
+    current_user: User = Depends(get_root_user),
 ):
     """
     SSE endpoint — streams real-time rate divergence alerts to the frontend.
@@ -74,7 +76,9 @@ def get_alerts(
     limit: int = 50,
     unacknowledged_only: bool = False,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_moderator_user),
+    # ROOT-only: rate divergence is "vigilancia", same as the "alerts" block of
+    # GET /admin/overview. Do not relax to get_moderator_user again — that was the bug.
+    current_user: User = Depends(get_root_user),
 ):
     """Return recent rate divergence alerts."""
     repo = RateAlertRepository(db)
@@ -86,7 +90,7 @@ def get_alerts(
 def acknowledge_alert(
     alert_uuid: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_moderator_user),
+    current_user: User = Depends(get_root_user),
 ):
     """Mark a rate alert as acknowledged."""
     repo = RateAlertRepository(db)
@@ -101,7 +105,9 @@ def acknowledge_alert(
 
 @router.get("/push/public-key", response_model=PushPublicKeyOut)
 def get_push_public_key(
-    current_user: User = Depends(get_moderator_user),
+    # Subscribing to push is how ROOT gets alerts on their phone: same ROOT-only
+    # policy as GET /alerts, not "any moderator+".
+    current_user: User = Depends(get_root_user),
 ):
     """VAPID public key que el navegador necesita para suscribirse."""
     if not web_push_service.is_configured():
@@ -113,7 +119,7 @@ def get_push_public_key(
 def push_subscribe(
     subscription: PushSubscriptionIn,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_moderator_user),
+    current_user: User = Depends(get_root_user),
 ):
     """Registra (o actualiza) la suscripción push de este dispositivo."""
     repo = PushSubscriptionRepository(db)
@@ -130,7 +136,7 @@ def push_subscribe(
 def push_unsubscribe(
     body: PushUnsubscribeIn,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_moderator_user),
+    current_user: User = Depends(get_root_user),
 ):
     """Elimina la suscripción push de este dispositivo."""
     repo = PushSubscriptionRepository(db)
@@ -141,7 +147,7 @@ def push_unsubscribe(
 @router.post("/push/test")
 def push_test(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_moderator_user),
+    current_user: User = Depends(get_root_user),
 ):
     """Envía una notificación de prueba a los dispositivos del usuario actual."""
     repo = PushSubscriptionRepository(db)

@@ -265,10 +265,16 @@ class FundPendingDepositStatus(enum.Enum):
 
 
 class FundPendingDepositOrigin(enum.Enum):
-    """De dónde salió el pendiente. GROUP = comprobante que el gestor subió al grupo (bot);
-    MANUAL = lo cargó un operador desde /admin/funds porque el bot no lo detectó."""
-    GROUP  = "GROUP"
-    MANUAL = "MANUAL"
+    """
+    De dónde salió el pendiente. GROUP = comprobante que el gestor subió al grupo (bot);
+    MANUAL = lo cargó un operador desde /admin/funds porque el bot no lo detectó;
+    RECEIPT = el operador señaló un comprobante concreto de la bandeja de Pagos y dijo que ESE
+    es el depósito — el caso de alguien que te debe dinero, te manda su comprobante y el dinero
+    se queda en el fondo en vez de retirarse.
+    """
+    GROUP   = "GROUP"
+    MANUAL  = "MANUAL"
+    RECEIPT = "RECEIPT"
 
 
 class FundPendingDeposit(UUIDMixin, Base):
@@ -315,6 +321,13 @@ class FundPendingDeposit(UUIDMixin, Base):
         Integer, ForeignKey("whatsapp_incoming_payments.id", ondelete="SET NULL"),
         nullable=True, index=True,
     )
+    #: El comprobante SALIENTE que prueba el depósito. Existe porque el que llega al chat
+    #: del propio operador se archiva como saliente, y ahí `source_incoming_payment_id` no
+    #: sirve — es la evidencia del caso "alguien que me debe me manda su comprobante".
+    source_outgoing_payment_id = Column(
+        Integer, ForeignKey("whatsapp_outgoing_payments.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
     created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     confirmed_movement_id = Column(
         Integer, ForeignKey("fund_movements.id", ondelete="SET NULL"), nullable=True, index=True
@@ -341,6 +354,7 @@ class FundPendingDeposit(UUIDMixin, Base):
             "origin": self.origin.value if self.origin else None,
             "created_by_username": self.created_by.username if self.created_by else None,
             "source_incoming_payment_id": self.source_incoming_payment_id,
+            "source_outgoing_payment_id": self.source_outgoing_payment_id,
             "source_incoming_payment_phone": src.client_phone if src else None,
             "detected_user_uuid": self.detected_user.uuid if self.detected_user else None,
             "detected_username": self.detected_user.username if self.detected_user else None,

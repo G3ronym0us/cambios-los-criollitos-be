@@ -17,6 +17,8 @@ from app.models.whatsapp_operation import WhatsAppOperationScenario
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.schemas.whatsapp import (
+    WhatsAppAnalysisLog,
+    WhatsAppAnalysisLogResponse,
     WhatsAppSourceMessage,
     WhatsAppSourceMessageLookup,
     WhatsAppSourceMessageResponse,
@@ -52,6 +54,7 @@ from app.schemas.operation_match import (
     OutgoingMatchRequest,
     OutgoingMatchResponse,
 )
+from app.services.analysis_log_service import AnalysisLogService
 from app.services.bank_email_service import BankEmailService
 from app.services.bcv_service import fetch_bcv_rate, get_cached_bcv_rate
 from app.services.operation_match_service import (
@@ -293,6 +296,34 @@ def find_operation_by_source_message(
     )
 
 
+@router.post(
+    "/analyses",
+    response_model=WhatsAppAnalysisLogResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def log_message_analysis(
+    payload: WhatsAppAnalysisLog,
+    db: Session = Depends(get_db),
+    principal: BotPrincipal = Depends(get_bot_principal),
+):
+    """
+    Registra qué leyó el analizador y qué dedujo. Es corpus, no decisión.
+
+    El bot llama sin esperar la respuesta, así que este endpoint no puede tener efectos
+    sobre nada más: escribe una fila en una tabla que nadie lee en caliente y devuelve el
+    uuid por si algún día hace falta enganchar la etiqueta desde el front.
+    """
+    row = AnalysisLogService(db).record(
+        client_phone=payload.client_phone,
+        messages=payload.messages,
+        output=payload.output,
+        wa_message_id=payload.wa_message_id,
+        analyzer=payload.analyzer,
+        context=payload.context,
+    )
+    return WhatsAppAnalysisLogResponse(uuid=row.uuid)
+
+
 @router.get("/operations", response_model=WhatsAppOperationList)
 def list_operations(
     phone: Optional[str] = Query(None),
@@ -305,7 +336,8 @@ def list_operations(
 ):
     service = WhatsAppQuoteService(db)
     try:
-        ops = service.list_operations(
+        # El bot no pagina: se queda con la página que pide y descarta el total.
+        ops, _total = service.list_operations(
             phone=phone, status=status_filter, since=since, limit=limit, delivery_status=delivery_status
         )
     except QuoteServiceError as exc:
@@ -505,6 +537,8 @@ def upsert_client(
         client.is_blocked = payload.is_blocked
     if payload.is_usdt_authorized is not None:
         client.is_usdt_authorized = payload.is_usdt_authorized
+    if payload.is_rate_setter is not None:
+        client.is_rate_setter = payload.is_rate_setter
     if "default_payment_info" in payload.model_fields_set:
         WhatsAppClientAccountService(db).set_default_account(
             client, payload.default_payment_info, payload.default_payment_currency
@@ -671,7 +705,9 @@ def forward_incoming_to_group(
     """Marca un pago entrante como contabilizado en un grupo (ZELLE_DIRECT). No crea saliente."""
     service = WhatsAppPaymentService(db)
     try:
-        return service.mark_incoming_forwarded_to_group(payment_id, payload.group_jid, payload.group_uuid)
+        return service.mark_incoming_forwarded_to_group(
+            payment_id, payload.group_jid, payload.group_uuid, payload.manager_phone
+        )
     except QuoteServiceError as exc:
         _handle_service_error(exc)
 
@@ -699,7 +735,7 @@ def set_irrelevant(
 ):
     service = WhatsAppPaymentService(db)
     try:
-        return service.set_irrelevant(payment_id, payload.is_irrelevant, payload.irrelevant_description)
+        return service.set_irrelevant("outgoing", payment_id, payload.is_irrelevant, payload.irrelevant_description)
     except QuoteServiceError as exc:
         _handle_service_error(exc)
 
@@ -712,11 +748,17 @@ def create_pending_deposit(
     db: Session = Depends(get_db),
     principal: BotPrincipal = Depends(get_bot_principal),
 ):
-    """Un gestor subió un comprobante al grupo → crea un depósito PENDING (confirmable en /admin/funds)."""
+    """
+    Un gestor reportó un comprobante → crea un depósito PENDING (confirmable en /admin/funds).
+
+    El comprobante puede venir del grupo del fondo o del chat directo con el gestor, según
+    cómo se lleve ese fondo.
+    """
     service = FundPendingDepositService(db)
     try:
         return service.create_pending(
             group_jid=payload.group_jid,
+            manager_phone=payload.manager_phone,
             detected_phone=payload.detected_phone,
             amount=payload.amount,
             currency=payload.currency,

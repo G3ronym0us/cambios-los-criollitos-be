@@ -18,14 +18,17 @@ from sqlalchemy.orm import Session
 from app.models.fund import (
     FundGroup,
     FundGroupMember,
+    FundMovement,
     FundMovementType,
     FundPendingDeposit,
     FundPendingDepositOrigin,
     FundPendingDepositStatus,
 )
 from app.models.user import User
-from app.models.whatsapp_payment import WhatsAppIncomingPayment
+from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from app.repositories.fund_repository import FundRepository
+from app.services import valuation
+from app.services.fund_channel import resolve_fund_channel
 from app.services.whatsapp_quote_service import QuoteServiceError
 
 # Ventana para el match por monto: sin referencia, dos comprobantes del mismo monto y moneda
@@ -45,6 +48,7 @@ class FundPendingDepositService:
         self,
         group_jid: Optional[str] = None,
         group_uuid: Optional[UUID] = None,
+        manager_phone: Optional[str] = None,
         detected_phone: Optional[str] = None,
         amount: Optional[float] = None,
         currency: Optional[str] = None,
@@ -52,7 +56,7 @@ class FundPendingDepositService:
         reference: Optional[str] = None,
         raw_text: Optional[str] = None,
     ) -> dict:
-        group = self._resolve_group(group_jid, group_uuid)
+        group = self._resolve_group(group_jid, group_uuid, manager_phone)
         detected_user_id = None
         if detected_phone:
             member = (
@@ -161,7 +165,26 @@ class FundPendingDepositService:
 
         # Duplicado de un entrante: ese dinero ya entró al fondo como pata USD de un cambio.
         # Se puede forzar (el operador ve el comprobante y decide) pero nunca por defecto.
-        if row.source_incoming_payment_id is not None and not override_duplicate:
+        #
+        # Dos casos se ven idénticos en la base —un entrante suelto que coincide— y sólo los
+        # separa QUIÉN lo afirmó:
+        #   * origen GROUP/MANUAL: nadie afirmó nada. El gestor reenvió al grupo el Zelle de un
+        #     cliente y el bot lo detectó; ese dinero va a ser la pata de un cambio aunque
+        #     todavía no tenga operación. Se frena, como siempre.
+        #   * origen RECEIPT: el operador abrió UN comprobante concreto y dijo que ése es el
+        #     depósito. Ahí no hay nada que adivinar y pedirle que fuerce sobra.
+        # Lo que ya está contado —tiene operación o ya movió el fondo— frena en los dos casos:
+        # ninguna afirmación puede justificar contar el mismo dinero dos veces.
+        ya_contado = (
+            row.source_incoming_payment_id is not None
+            and self._incoming_is_already_counted(row.source_incoming_payment_id)
+        )
+        afirmado_sobre_el_comprobante = row.origin == FundPendingDepositOrigin.RECEIPT
+        if (
+            row.source_incoming_payment_id is not None
+            and not override_duplicate
+            and (ya_contado or not afirmado_sobre_el_comprobante)
+        ):
             src = row.source_incoming_payment
             raise QuoteServiceError(
                 "duplicate_of_incoming",
@@ -191,13 +214,22 @@ class FundPendingDepositService:
                 "missing_depositor", "No se pudo determinar el depositante (envía user_uuid)", 400
             )
 
+        # Equivalente en USDT al momento del depósito: sin esto, `get_group_balance` suma
+        # `amount_usdt` de este movimiento como 0 y un fondo que no lleva USD (COP, BRL)
+        # reporta balance consolidado cero aunque el dinero sí entró — no es que falte,
+        # es que nunca se calculó. Igual que `_sync_fund_legs` para las patas de operación.
+        now = datetime.now(timezone.utc)
+        equivalents = valuation.equivalents(self.db, final_amount, final_currency, now)
+
         movement = self.fund_repo.create_movement(
             group_id=row.group_id,
             user_id=depositor_id,
             movement_type=FundMovementType.DEPOSIT,
             amount=final_amount,
             currency=final_currency,
-            movement_date=datetime.now(timezone.utc),
+            movement_date=now,
+            amount_usdt=equivalents["usdt_amount"],
+            usdt_rate=equivalents["usdt_rate"],
             reference=reference or row.reference,
             notes=notes,
             recorded_by_user_id=recorded_by_user_id,
@@ -224,6 +256,169 @@ class FundPendingDepositService:
         return row.dict()
 
     # ---------- Helpers ----------
+
+    def _incoming_is_already_counted(self, incoming_id: int) -> bool:
+        """
+        ¿Ese entrante ya está contado en algún sitio? Lo está si cuelga de una operación o si
+        ya movió un fondo. Suelto en la bandeja no cuenta como contado: es dinero que entró y
+        que nadie ha atribuido todavía.
+        """
+        row = (
+            self.db.query(WhatsAppIncomingPayment)
+            .filter(WhatsAppIncomingPayment.id == incoming_id)
+            .first()
+        )
+        if row is None:
+            return False
+        if row.whatsapp_operation_id is not None:
+            return True
+        return (
+            self.db.query(FundMovement)
+            .filter(FundMovement.incoming_payment_id == incoming_id)
+            .first()
+            is not None
+        )
+
+    def suggest_for_receipt(self, table: str, payment_id: int) -> dict:
+        """
+        Qué fondo y qué gestor proponer para el depósito de este comprobante.
+
+        Nada se adivina: las dos salen de datos que ya existen.
+          * **El fondo** sale del CANAL — la conversación donde llegó el comprobante—, con la
+            misma `resolve_fund_channel` del reenvío contable. Un chat de cliente no resuelve a
+            ningún fondo y entonces no se propone nada.
+          * **El gestor** sale de QUIÉN LO MANDÓ. En un grupo WhatsApp da el autor y el bot ya
+            lo guarda; en un chat directo no hay autor aparte, pero la dirección lo dice: un
+            entrante lo mandó el dueño del chat, un saliente lo mandó el operador.
+
+        Las dos son propuestas, no candados: el pago 4928 llegó por el chat de Dionis y su
+        depósito es de Diohandres.
+        """
+        payment = self._get_payment_or_404(table, payment_id)
+        canal = payment.client_phone or ""
+        grupo = None
+        try:
+            grupo = resolve_fund_channel(
+                self.db,
+                group_jid=canal if canal.endswith("@g.us") else None,
+                manager_phone=None if canal.endswith("@g.us") else canal,
+            )
+        except QuoteServiceError:
+            grupo = None
+
+        gestor = None
+        if grupo is not None:
+            miembros = [m for m in grupo.members if m.user is not None]
+            if table == "incoming" and not canal.endswith("@g.us"):
+                # Lo mandó el dueño del chat.
+                gestor = next((m.user for m in miembros if m.whatsapp_phone == canal), None)
+            elif table == "outgoing" and not canal.endswith("@g.us"):
+                # Lo mandó el operador: el gestor cuyo teléfono NO es el de este chat.
+                otros = [m.user for m in miembros if m.whatsapp_phone != canal and m.is_fund_manager]
+                gestor = otros[0] if len(otros) == 1 else None
+
+        return {
+            "payment_id": payment.id,
+            "table": table,
+            "amount": payment.amount,
+            "currency": payment.currency,
+            "provider": payment.provider,
+            "reference": payment.reference,
+            "fund_group_uuid": grupo.uuid if grupo else None,
+            "fund_group_name": grupo.name if grupo else None,
+            "fund_currency": grupo.currency if grupo else None,
+            "user_uuid": gestor.uuid if gestor else None,
+            "username": gestor.username if gestor else None,
+            "members": [
+                {"user_uuid": m.user.uuid, "username": m.user.username}
+                for m in (grupo.members if grupo else [])
+                if m.user is not None
+            ],
+        }
+
+    def create_from_receipt(
+        self,
+        table: str,
+        payment_id: int,
+        group_uuid: UUID,
+        user_uuid: UUID,
+        created_by_user_id: int,
+    ) -> dict:
+        """
+        El comprobante ES el depósito: nace con monto, moneda y referencia sacados de él, él
+        enganchado como evidencia, y **ya CONFIRMADO**.
+
+        No pasa por PENDING porque el pendiente existe para que alguien decida, y aquí la
+        decisión ya se tomó: el operador abrió ESE comprobante concreto y dijo que es el
+        depósito. Dejarlo esperando pedía repetir la misma afirmación en /admin/funds y,
+        mientras tanto, el dinero no estaba en el fondo aunque el comprobante ya lo probara.
+
+        Los guardarraíles de `confirm` siguen corriendo enteros: si ese dinero YA está contado
+        —el entrante tiene operación o ya movió el fondo— esto falla con 409 y no se crea nada.
+        """
+        payment = self._get_payment_or_404(table, payment_id)
+        if not payment.amount or payment.amount <= 0:
+            raise QuoteServiceError(
+                "missing_fields",
+                "El comprobante no tiene monto legible: corrígelo en Pagos antes de registrarlo",
+                400,
+            )
+        group = self._resolve_group(None, group_uuid)
+        user = self.db.query(User).filter(User.uuid == str(user_uuid)).first()
+        if user is None:
+            raise QuoteServiceError("user_not_found", "Gestor no encontrado", 404)
+
+        row = FundPendingDeposit(
+            group_id=group.id,
+            detected_user_id=user.id,
+            amount=payment.amount,
+            currency=(payment.currency or group.currency or "").upper() or None,
+            provider=payment.provider,
+            reference=payment.reference,
+            raw_text=payment.raw_text,
+            status=FundPendingDepositStatus.PENDING,
+            origin=FundPendingDepositOrigin.RECEIPT,
+            created_by_user_id=created_by_user_id,
+            source_incoming_payment_id=(
+                payment.id if table == "incoming"
+                else self._find_duplicate_incoming(payment.amount, payment.currency, payment.reference)
+            ),
+            source_outgoing_payment_id=payment.id if table == "outgoing" else None,
+        )
+        self.db.add(row)
+        self.db.flush()
+
+        try:
+            return self.confirm(
+                row.uuid,
+                deposit_method=self._deposit_method_from(payment),
+                recorded_by_user_id=created_by_user_id,
+            )
+        except QuoteServiceError:
+            # El pendiente no llegó a existir: sin esto quedaría una fila PENDING que nadie
+            # puede confirmar, justo el registro huérfano que esta pantalla vino a eliminar.
+            self.db.rollback()
+            raise
+
+    @staticmethod
+    def _deposit_method_from(payment) -> str:
+        """
+        Cómo se movió el dinero lo dice el propio comprobante, no el operador: `provider` es lo
+        que leyó el OCR. Lo que no cae en un método propio es una transferencia — pix, paypal o
+        un comprobante sin proveedor legible entran ahí.
+        """
+        provider = (payment.provider or "").strip().lower()
+        for method in ("zelle", "binance", "kraken"):
+            if method in provider:
+                return method.upper()
+        return "TRANSFER"
+
+    def _get_payment_or_404(self, table: str, payment_id: int):
+        model = WhatsAppIncomingPayment if table == "incoming" else WhatsAppOutgoingPayment
+        row = self.db.query(model).filter(model.id == payment_id).first()
+        if row is None:
+            raise QuoteServiceError("payment_not_found", f"Comprobante {payment_id} no encontrado", 404)
+        return row
 
     def _find_duplicate_incoming(
         self,
@@ -253,14 +448,11 @@ class FundPendingDepositService:
         match = q.order_by(WhatsAppIncomingPayment.created_at.desc()).first()
         return match.id if match else None
 
-    def _resolve_group(self, group_jid: Optional[str], group_uuid: Optional[UUID]) -> FundGroup:
-        group = None
-        if group_uuid is not None:
-            group = self.db.query(FundGroup).filter(FundGroup.uuid == str(group_uuid)).first()
-        elif group_jid:
-            group = self.db.query(FundGroup).filter(FundGroup.whatsapp_group_jid == group_jid).first()
-        if group is None:
-            raise QuoteServiceError(
-                "fund_group_not_found", f"Fondo para {group_uuid or group_jid} no encontrado", 404
-            )
-        return group
+    def _resolve_group(
+        self,
+        group_jid: Optional[str],
+        group_uuid: Optional[UUID],
+        manager_phone: Optional[str] = None,
+    ) -> FundGroup:
+        """El fondo al que pertenece un depósito. La regla vive en `fund_channel`."""
+        return resolve_fund_channel(self.db, group_jid, group_uuid, manager_phone)

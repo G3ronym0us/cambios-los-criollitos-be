@@ -128,6 +128,25 @@ class WhatsAppOperation(UUIDMixin, Base):
     no_payments_ack_at = Column(DateTime(timezone=True), nullable=True)
     no_payments_ack_note = Column(Text, nullable=True)
 
+    #: Parte del valor que no tiene comprobante porque no se puede representar acá: efectivo
+    #: en mano, un canal que el bot no lee, saldo a favor, un ajuste. No es un error a
+    #: corregir — se declara, y declararlo es lo que deja cerrar el trato.
+    uncovered_amount = Column(Float, nullable=True)
+    uncovered_reason = Column(String(24), nullable=True)
+
+    #: Cuánto del efectivo del CLIENTE ya está en la mano, en los pares que se cambian en
+    #: efectivo (`CurrencyPair.settles_in_cash`).
+    #:
+    #: Es la otra pata del trato y no tenía dónde vivir. `uncovered_amount` y
+    #: `delivered_amount` miden lo NUESTRO —cuánto del valor hemos cubierto—, y en un par de
+    #: efectivo eso ya está resuelto en cuanto se vincula el comprobante en bolívares: la
+    #: operación queda cubierta y sigue sin cobrarse. Lo único que decía «ya me pagó» era
+    #: `delivery_status`, que es un sí/no y no admite que el cliente traiga la mitad.
+    #:
+    #: Va en la moneda del VALOR del trato (los USD de un USD-VES), igual que
+    #: `pending_amount`. En un par normal no se usa.
+    collected_amount = Column(Float, nullable=True)
+
     # Vínculo con la Transaction derivada. Puede existir desde QUOTED/PENDING si hay fondo.
     transaction_id = Column(Integer, ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True, index=True)
 
@@ -145,11 +164,33 @@ class WhatsAppOperation(UUIDMixin, Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     client = relationship("WhatsAppClient", back_populates="operations")
-    # Los comprobantes de salida dicen cómo se pagó el trato; su `settled_amount` suma lo
-    # entregado. Solo lectura: el vínculo lo maneja el servicio de pagos.
+    # Los comprobantes de salida dicen cómo se pagó el trato. Solo lectura: el vínculo lo
+    # maneja el servicio de pagos. OJO: este FK es solo la operación PRINCIPAL del
+    # comprobante; lo entregado se cuenta desde `outgoing_settlements`, porque un mismo
+    # saliente puede cubrir varias operaciones.
     outgoing_payments = relationship(
         "WhatsAppOutgoingPayment",
         primaryjoin="WhatsAppOperation.id == foreign(WhatsAppOutgoingPayment.whatsapp_operation_id)",
+        viewonly=True,
+    )
+    # Qué parte del valor cubre cada comprobante de salida — incluidos los que llegan por el
+    # reparto y cuyo FK apunta a otra operación.
+    outgoing_settlements = relationship(
+        "WhatsAppOutgoingSettlement",
+        primaryjoin="WhatsAppOperation.id == foreign(WhatsAppOutgoingSettlement.whatsapp_operation_id)",
+        viewonly=True,
+    )
+    # Los comprobantes de ENTRADA: cuándo llegó el dinero del cliente. Un pago puede
+    # apuntar a la operación por su FK o por el reparto (`WhatsAppPaymentAllocation`), y hay
+    # que mirar los dos — un Zelle repartido entre dos cambios sólo tiene FK a uno.
+    incoming_payments = relationship(
+        "WhatsAppIncomingPayment",
+        primaryjoin="WhatsAppOperation.id == foreign(WhatsAppIncomingPayment.whatsapp_operation_id)",
+        viewonly=True,
+    )
+    incoming_allocations = relationship(
+        "WhatsAppPaymentAllocation",
+        primaryjoin="WhatsAppOperation.id == foreign(WhatsAppPaymentAllocation.whatsapp_operation_id)",
         viewonly=True,
     )
     currency_pair = relationship("CurrencyPair", lazy="joined")
@@ -174,29 +215,165 @@ class WhatsAppOperation(UUIDMixin, Base):
 
     @property
     def delivered_amount(self) -> float:
-        """Cuánto del valor cubren ya sus comprobantes de salida."""
+        """Cuánto del valor cubren ya sus comprobantes de salida, vengan del FK o del reparto."""
         return round(
-            sum(p.settled_amount or 0 for p in (self.outgoing_payments or [])),
+            sum(s.settled_amount or 0 for s in (self.outgoing_settlements or [])),
             2,
         )
+
+    @property
+    def payments_count(self) -> int:
+        """Cuántos comprobantes de salida cubren esta operación."""
+        return len(self.outgoing_settlements or [])
+
+    @property
+    def to_collect(self) -> float:
+        """
+        Cuánto efectivo falta por recoger del cliente. Sólo dice algo en un par de efectivo.
+
+        No se resta lo cubierto: lo que cubre el comprobante en bolívares es NUESTRA pata, y
+        descontarlo aquí daría cero justo en las operaciones que sí hay que ir a cobrar —las
+        que nacen de su propio comprobante de salida, cubiertas desde el primer segundo.
+        """
+        value = self.amount if self.amount is not None else self.from_amount
+        return round(float(value or 0) - float(self.collected_amount or 0), 2)
+
+    @property
+    def last_outgoing_payment_at(self):
+        """
+        Cuándo se pagó el trato: la fecha del comprobante de SALIDA más reciente.
+
+        Es la fecha que el operador busca en el listado — «cuándo salió esta plata» —, y no
+        coincide con `created_at`, que es cuándo se registró la operación. Una operación que
+        el bot no reconoció se arma a mano días después de haberse pagado.
+
+        Se toma el MÁS RECIENTE y no el primero porque un trato pagado en dos veces no está
+        pagado hasta el último comprobante. `None` mientras no haya ninguno: entonces no hay
+        fecha de pago que enseñar y quien lo consuma se cae a la de la operación.
+        """
+        dates = [
+            s.payment.created_at
+            for s in (self.outgoing_settlements or [])
+            if s.payment is not None and s.payment.created_at
+        ]
+        return max(dates) if dates else None
+
+    @property
+    def first_outgoing_payment_at(self):
+        """
+        Cuándo salió NUESTRA plata: la fecha del primer comprobante de salida.
+
+        Es el espejo de `first_incoming_payment_at` y existe por la misma razón: mide
+        antigüedad, no el hecho más reciente. En un par que se cambia en efectivo el
+        comprobante entrante no existe —de un billete no hay foto—, así que lo único que
+        sitúa la operación en el tiempo es la salida: los bolívares que ya mandamos. Sin
+        esta fecha, la antigüedad de esas operaciones cae a `created_at`, que es cuándo el
+        operador las tecleó, y una tanda registrada a mano el mismo minuto sale toda con la
+        misma espera aunque los pagos fueran de días distintos.
+
+        El MÍNIMO y no el máximo: un segundo comprobante sobre la misma operación no puede
+        rejuvenecer una deuda vieja. Para «cuándo se pagó», que es el hecho más reciente,
+        está `last_outgoing_payment_at`.
+
+        `None` si todavía no hay ninguno; entonces la fecha de la operación es lo mejor que
+        hay y quien lo consuma se cae a ella.
+        """
+        dates = [
+            s.payment.created_at
+            for s in (self.outgoing_settlements or [])
+            if s.payment is not None and s.payment.created_at
+        ]
+        return min(dates) if dates else None
+
+    @property
+    def first_incoming_payment_at(self):
+        """
+        Cuándo llegó el dinero del cliente: la fecha de su primer comprobante entrante.
+
+        Es lo que mide de verdad cuánto lleva esperando, y no es lo mismo que `created_at`.
+        Cuando el bot no reconoce un comprobante, el operador crea la operación a mano días
+        después (`POST /payments/{table}/{id}/create-operation`, que no lleva fecha): la
+        operación nace hoy aunque el dinero entrara la semana pasada. Ordenar por la
+        operación manda esas al final de la cola justo cuando son las más viejas.
+
+        `None` si no tiene ningún entrante; entonces la fecha de la operación es lo mejor
+        que hay y quien lo consuma se cae a ella.
+        """
+        dates = [p.created_at for p in (self.incoming_payments or []) if p.created_at]
+        dates += [
+            a.payment.created_at
+            for a in (self.incoming_allocations or [])
+            if a.payment is not None and a.payment.created_at
+        ]
+        return min(dates) if dates else None
+
+    @property
+    def last_incoming_payment_at(self):
+        """
+        Cuándo llegó el ÚLTIMO comprobante del cliente: el más reciente, no el primero.
+
+        Distinto a propósito de `first_incoming_payment_at`, que mide antigüedad (cuánto
+        lleva esperando la operación desde que llegó el PRIMER pago). Este campo es para
+        mostrar «cuándo fue el pago» en un listado — si el cliente pagó en dos partes, la
+        fecha que importa mostrar es la del último abono, no la del primero. No los
+        colapses en una sola función: una cuenta antigüedad desde el inicio, la otra
+        muestra el hecho más reciente, y una operación con dos o más comprobantes
+        necesita las dos al mismo tiempo.
+
+        `None` si no tiene ningún entrante (p.ej. `VIA_PARTNER` sin comprobante propio, o
+        un par que `settles_in_cash`); entonces la fecha de la operación es lo mejor que
+        hay y quien lo consuma se cae a ella.
+        """
+        dates = [p.created_at for p in (self.incoming_payments or []) if p.created_at]
+        dates += [
+            a.payment.created_at
+            for a in (self.incoming_allocations or [])
+            if a.payment is not None and a.payment.created_at
+        ]
+        return max(dates) if dates else None
+
+    def real_rate(self, value: float | None, delivered: float) -> float | None:
+        """
+        La tasa que de verdad salió del trato: lo entregado entre el valor.
+
+        `rate_used` es la que se COTIZÓ; esta es la que resulta de los comprobantes, y su
+        desviación es lo que el listado y la franja de cuadre necesitan mostrar. Sin valor
+        o sin nada entregado todavía no hay tasa real que enseñar.
+        """
+        if not value or value <= 0 or delivered <= 0:
+            return None
+        return round(delivered / value, 6)
 
     def dict(self):
         cp = self.currency_pair
         value = self.amount if self.amount is not None else self.from_amount
         delivered = self.delivered_amount
         return {
+            "payments_count": self.payments_count,
+            "real_rate": self.real_rate(value, delivered),
             "uuid": self.uuid,
             "client_uuid": self.client.uuid if self.client else None,
             "client_phone": self.client.phone if self.client else None,
             "client_display_name": self.client.display_name if self.client else None,
             "currency_pair_uuid": cp.uuid if cp else None,
             "pair_symbol": cp.pair_symbol if cp else None,
+            # El par se cambia en efectivo: no hay ni habrá comprobante entrante, así que
+            # `first_incoming_payment_at` en None NO significa que el cliente no haya pagado.
+            "settles_in_cash": bool(cp.settles_in_cash) if cp else False,
             "from_currency": cp.from_currency.symbol if cp and cp.from_currency else None,
             "to_currency": cp.to_currency.symbol if cp and cp.to_currency else None,
             "amount": self.amount,
             "currency": self.currency,
             "delivered_amount": delivered,
-            "pending_amount": round((value or 0) - delivered, 2),
+            "uncovered_amount": self.uncovered_amount,
+            "uncovered_reason": self.uncovered_reason,
+            "pending_amount": round((value or 0) - delivered - (self.uncovered_amount or 0), 2),
+            # Las dos patas viajan por separado a propósito: `pending_amount` es lo que
+            # falta por CUBRIR (lo nuestro) y `to_collect` lo que falta por COBRAR (lo del
+            # cliente, sólo en pares de efectivo). Meterlas en el mismo número fue lo que
+            # dejó la cola de cobros mirando la columna equivocada.
+            "collected_amount": self.collected_amount,
+            "to_collect": self.to_collect,
             "amount_usdt": self.amount_usdt,
             "usdt_rate": self.usdt_rate,
             "bcv_amount": self.bcv_amount,
@@ -233,6 +410,10 @@ class WhatsAppOperation(UUIDMixin, Base):
             "no_payments_ack_note": self.no_payments_ack_note,
             "transaction_uuid": self.transaction.uuid if self.transaction else None,
             "legacy_sqlite_id": self.legacy_sqlite_id,
+            "first_incoming_payment_at": self.first_incoming_payment_at,
+            "last_incoming_payment_at": self.last_incoming_payment_at,
+            "first_outgoing_payment_at": self.first_outgoing_payment_at,
+            "last_outgoing_payment_at": self.last_outgoing_payment_at,
             "quoted_at": self.quoted_at,
             "expires_at": self.expires_at,
             "approved_at": self.approved_at,

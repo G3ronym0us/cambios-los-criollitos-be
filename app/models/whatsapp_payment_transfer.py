@@ -29,6 +29,10 @@ class PaymentTransferReason(enum.Enum):
     BOT_MISMATCH = "BOT_MISMATCH"
     #: El mismo cliente existe dos veces y el pago cayó en la ficha que no se usa.
     DUPLICATE_CLIENT = "DUPLICATE_CLIENT"
+    #: Se vinculó a la operación de otro cliente, y vincular afirma de quién es el dinero.
+    #: A diferencia de los otros tres, esta mudanza no la pide nadie a mano: la deja el
+    #: propio vínculo, para que el comprobante no cambie de dueño en silencio.
+    LINKED_TO_OPERATION = "LINKED_TO_OPERATION"
 
 
 class WhatsAppPaymentTransfer(UUIDMixin, Base):

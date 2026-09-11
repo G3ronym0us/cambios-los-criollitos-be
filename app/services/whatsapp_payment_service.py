@@ -97,6 +97,7 @@ _TRANSFER_REASON_LABELS = {
     "THIRD_PARTY": "pagó un tercero",
     "BOT_MISMATCH": "mal asignado por el bot",
     "DUPLICATE_CLIENT": "cliente duplicado",
+    "LINKED_TO_OPERATION": "vinculado a la operación de otro cliente",
 }
 
 # Los tres estados del filtro de la bandeja.
@@ -1282,6 +1283,66 @@ class WhatsAppPaymentService:
         )
         return True
 
+    def _sync_status_from_incoming(
+        self,
+        op: Optional[WhatsAppOperation],
+        actor: Optional[User],
+        *,
+        had_incoming: bool,
+    ) -> None:
+        """
+        El respaldo del cliente mueve la cotización a PENDING, y quedarse sin comprobantes la
+        devuelve a QUOTED.
+
+        **El TTL no bloquea este paso**, por el mismo razonamiento que ya está escrito para el
+        saliente en `whatsapp_quote_service.complete_operation`: la expiración protege «el
+        cliente no acepta una tasa vieja», y un comprobante vinculado es dinero que YA se
+        movió. Bloquearlo dejaba la operación colgada en QUOTED y vencida, fuera de todas las
+        bandejas — que es exactamente lo que pasó con 10 operaciones.
+
+        `had_incoming` dice si la operación tenía un entrante ANTES de esta llamada, y lo
+        decide el caller (que es el único que puede saberlo: aquí el FK ya se soltó). Sin ese
+        dato, el camino de vuelta arrasaría con lo que nunca tuvo comprobante entrante: una op
+        `VIA_PARTNER` -donde el socio le cobra al cliente en su propio WhatsApp- o de un par
+        con `settles_in_cash` -donde el cliente paga con billetes- está en PENDING
+        legítimamente y para siempre sin un solo entrante (ver `backend/CLAUDE.md`).
+        Devolverlas a QUOTED sería sacarlas de las bandejas, el mismo daño al revés.
+
+        El paso a COMPLETED sigue siendo del lado saliente. Aquí no se toca.
+        """
+        if op is None or op.status not in (
+            WhatsAppOperationStatus.QUOTED,
+            WhatsAppOperationStatus.PENDING,
+        ):
+            return
+        # La sesión va sin autoflush: sin esto, el vínculo que acaba de ponerse (o soltarse)
+        # todavía no lo ve la consulta.
+        self.db.flush()
+        # Se miran las dos huellas del entrante: el FK directo -que es lo único que tienen los
+        # comprobantes anteriores a `whatsapp_payment_allocations`- y el reparto, que es donde
+        # vive la parte de un pago repartido entre varias operaciones (ahí el FK apunta a una
+        # sola de ellas).
+        tiene_entrante = (
+            self.db.query(WhatsAppIncomingPayment.id)
+            .filter(WhatsAppIncomingPayment.whatsapp_operation_id == op.id)
+            .first()
+            is not None
+        ) or (
+            self.db.query(WhatsAppPaymentAllocation.id)
+            .filter(WhatsAppPaymentAllocation.whatsapp_operation_id == op.id)
+            .first()
+            is not None
+        )
+        ahora = datetime.now(timezone.utc)
+        if tiene_entrante and op.status == WhatsAppOperationStatus.QUOTED:
+            op.status = WhatsAppOperationStatus.PENDING
+            op.approved_at = op.approved_at or ahora
+            op.updated_at = ahora
+        elif not tiene_entrante and had_incoming and op.status == WhatsAppOperationStatus.PENDING:
+            op.status = WhatsAppOperationStatus.QUOTED
+            op.approved_at = None
+            op.updated_at = ahora
+
     # ---------- Reparto de un entrante entre operaciones ----------
 
     def _allocated_total(self, payment_id: int, exclude_op_id: Optional[int] = None) -> float:
@@ -2005,6 +2066,17 @@ class WhatsAppPaymentService:
         row = self.db.query(Model).filter(Model.id == payment_id).with_for_update().first()
         if row is None:
             raise QuoteServiceError("not_found", f"Pago {table}/{payment_id} no encontrado", 404)
+        # La operación de la que viene este comprobante, capturada ANTES de soltar el FK: al
+        # desvincular, `op` queda en None y sin esto no habría a quién sincronizarle el estado.
+        # Que exista es además la prueba de que esa op TENÍA un entrante antes de esta llamada
+        # (ver `_sync_status_from_incoming`).
+        op_previa = None
+        if table == "incoming" and row.whatsapp_operation_id is not None:
+            op_previa = (
+                self.db.query(WhatsAppOperation)
+                .filter(WhatsAppOperation.id == row.whatsapp_operation_id)
+                .first()
+            )
         orphaned_op = (
             self._resolve_orphan(row, table, payment_id, orphan_action, orphan_note, completing_user)
             if operation_uuid is None and not allow_orphan
@@ -2043,6 +2115,22 @@ class WhatsAppPaymentService:
             # vincular después el pago saliente real, ese número es la primera referencia
             # confiable del destinatario: adoptarlo antes de sincronizar los pagos.
             payment_client_phone = row.client_phone
+            # El vínculo principal es EXCLUSIVO: si el comprobante se va a otra operación, la
+            # anterior lo pierde —reparto incluido—, igual que si se hubiera desvinculado a
+            # mano. Sin esto la fila de reparto de la vieja sobrevivía y se quedaba con todo
+            # el dinero del pago, así que la nueva heredaba el vínculo pero cero respaldo
+            # (`_default_allocation_amount` solo reparte lo que queda libre) y las DOS
+            # terminaban en PENDING con un solo comprobante detrás.
+            #
+            # Esto no toca el reparto explícito entre varias operaciones, que se declara
+            # aparte con `PUT /incoming/{id}/allocations` y sigue valiendo: aquí solo se
+            # suelta la operación que era la principal hasta este momento.
+            if (
+                table == "incoming"
+                and row.whatsapp_operation_id is not None
+                and row.whatsapp_operation_id != op.id
+            ):
+                self._drop_allocation(row.id, row.whatsapp_operation_id)
             row.whatsapp_operation_id = op.id
             operation_client_phone = op.client.phone if op.client else None
             should_infer_client = (
@@ -2058,8 +2146,44 @@ class WhatsAppPaymentService:
                     display_name=None,
                     update_display_name=False,
                 )
-            # En el resto de los casos se conserva el criterio existente: vincular
-            # el comprobante a una operación afirma que pertenece a su cliente.
+            # Vincular un entrante sigue afirmando que el comprobante pertenece al cliente de
+            # la operación, pero eso es una OPINIÓN y va en `owner_client_id`, no en
+            # `client_phone`, que es el hecho observado de en qué chat llegó el dinero. Es el
+            # mismo criterio de `transfer_client` —que a propósito no toca `client_phone`— y
+            # por eso deja el mismo rastro: sin él, el comprobante desaparecía del chat donde
+            # el operador lo había visto, sin que nada lo explicara (caso #582, José Bogao).
+            elif table == "incoming":
+                # Si el "cliente" de la op es un marcador (JID de grupo o anónimo) no hay de
+                # quién afirmar nada: mudar el comprobante a un placeholder sería perder al
+                # dueño real a cambio de nada.
+                if op.client is not None and not is_unassigned_client_phone(
+                    operation_client_phone
+                ):
+                    origen = row.owner_client or (
+                        self.db.query(WhatsAppClient)
+                        .filter(WhatsAppClient.phone == payment_client_phone)
+                        .first()
+                    )
+                    # Mismo cliente (el caso normal, con el pool de candidatas ya acotado al
+                    # cliente): no hay mudanza, así que no se anota nada.
+                    if origen is None or origen.id != op.client.id:
+                        row.owner_client_id = op.client.id
+                        self.db.add(
+                            WhatsAppPaymentTransfer(
+                                incoming_payment_id=row.id,
+                                from_client_id=origen.id if origen else None,
+                                from_client_phone=payment_client_phone,
+                                from_client_name=origen.display_name if origen else None,
+                                to_client_id=op.client.id,
+                                reason=PaymentTransferReason.LINKED_TO_OPERATION,
+                                created_by_user_id=(
+                                    completing_user.id if completing_user else None
+                                ),
+                            )
+                        )
+            # El saliente se queda como estaba. Ahí el comprobante lo sube el operador (ver
+            # `backend/CLAUDE.md`), así que `client_phone` no es «el chat del cliente» sino la
+            # referencia que se adopta al vincular; cambiarlo es otra decisión, y no es esta.
             elif operation_client_phone:
                 row.client_phone = operation_client_phone
             # La op vuelve a tener respaldo: el aval de "sin pago asociado" ya no aplica.
@@ -2093,6 +2217,20 @@ class WhatsAppPaymentService:
             WhatsAppClientAccountService(self.db).learn_from_outgoing(op, row)
             if complete_outgoing:
                 self._sync_status_from_delivery(op, completing_user)
+
+        # Espejo del lado saliente: el respaldo del cliente mueve la cotización a PENDING, y
+        # quitarle el último comprobante la devuelve a QUOTED.
+        #
+        # Se sincronizan LAS DOS operaciones, porque re-vincular un comprobante toca dos: la
+        # que lo recibe y la que lo pierde. Con solo la primera, mover un pago de la op A a la
+        # B dejaba a A en PENDING sin un solo entrante — la misma operación colgada que este
+        # método viene a eliminar, nada más que en espejo. El orden importa: primero la que lo
+        # pierde, para que si A y B fueran la misma el estado final lo fije la que lo gana.
+        if table == "incoming":
+            if op_previa is not None and (op is None or op_previa.id != op.id):
+                self._sync_status_from_incoming(op_previa, completing_user, had_incoming=True)
+            if op is not None:
+                self._sync_status_from_incoming(op, completing_user, had_incoming=True)
 
         # El libro sigue a la operación: si vincular este pago la completó, las patas del
         # fondo quedan al día. `_sync_status_from_delivery` ya comitea al completar la op;

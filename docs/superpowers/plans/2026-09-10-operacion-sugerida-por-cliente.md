@@ -19,6 +19,21 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-10-operacion-sugerida-por-cliente-design.md`
 
+## Correcciones al plan, aprendidas ejecutándolo
+
+Los ejemplos de test de las tareas se escribieron con fixtures que **no existen**. Lo real, verificado al implementar la Task 7:
+
+- **La sesión de BD es el fixture `db`**, no `db_session`.
+- **No hay `make_client` / `make_operation` / `make_incoming_payment` / `make_pair` / `make_rate`.** Lo que hay:
+  - Fixtures de `tests/conftest.py`: `db`, `operator`, `partner`, `bot_user`, `fund`, `fund_with_shares`, `pairs` (dict con `ZELLE-BRL`, `ZELLE-VES`, `ZELLE-COP`, `USDT-BRL`, `COP-VES`), `client` (WhatsAppClient «Naldin», `13174961478`, tracked).
+  - Pagos: `tests/factories.py` → `incoming(db, amount, currency="ZELLE", phone=...)`, `outgoing(db, amount, currency, phone=...)`.
+  - **Las operaciones se construyen a mano** con `WhatsAppOperation(...)` (patrón de `tests/test_operation_scenario_auto.py`), o con un helper `_op` local. `create_op_from_payment` **no sirve para estos tests**: nace siempre en `PENDING` y ya vinculada.
+  - Pares nuevos: helpers privados `_pair` / `_currency` de `conftest.py`.
+- **`orphan_action` va en MAYÚSCULAS**: `"KEEP"` / `"DELETE_OPERATION"`. Con `"keep"` la llamada revienta con `QuoteServiceError("operation_would_be_orphan", 409)`. Y hay que pasar `completing_user`, o `no_payments_ack_by_user_id` queda en `None`.
+- **La sesión va sin autoflush**: `self.db.flush()` antes de consultar algo que dependa de un cambio recién hecho.
+- **El «tiene entrante» de una operación se mira por FK entrante OR `whatsapp_payment_allocations`.** Solo el FK no basta: un pago repartido entre varias ops deja el FK en una sola. Y las allocations solas tampoco: los comprobantes anteriores a esa tabla no tienen fila.
+- Postgres local en `:5433` **estaba disponible** al ejecutar la Task 7 (609 passed, 2 xfailed, 1 xpassed en la suite completa; el xpassed es `test_concurrency_cancel_vs_cover`, no estricto e intermitente a propósito, preexistente). Si en tu corrida los tests de integración **se saltan**, dilo: una suite verde vacía no prueba nada.
+
 ---
 
 ## File Structure

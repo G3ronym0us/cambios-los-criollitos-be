@@ -159,3 +159,26 @@ def test_link_item_now_carries_its_kind(db, fund, pairs, operator):
     item = OperationMatchService(db).suggest_for_payments([pago.id], "incoming")[0]
     assert item["kind"] == "LINK"
     assert item["operation_uuid"] == str(op_.uuid)
+
+
+# ---------------------------------------------------------------------------
+# Task 5: el contrato dice quién, cuándo y qué cubre
+# ---------------------------------------------------------------------------
+
+
+def test_link_item_carries_the_criteria_the_operator_needs(db, fund, pairs, operator):
+    cliente = _client(db, "584124640125", "Nelson")
+    op_ = _op(db, client_id=cliente.id, pair=pairs["ZELLE-VES"], from_amount=100.0, to_amount=88596.0)
+    pago = f.incoming(db, 100.0, "ZELLE", phone=cliente.phone)
+    db.flush()
+
+    item = OperationMatchService(db).suggest_for_payments([pago.id], "incoming")[0]
+
+    assert item["kind"] == "LINK"
+    assert item["coverage"] == "CLOSES"
+    assert item["client_name"] == "Nelson"
+    assert item["same_client"] is True
+    assert item["missing_before"] == 100.0
+    assert item["missing_after"] == 0.0
+    assert item["status"] == op_.status.value
+    assert item["hours_apart"] == pytest.approx(0.0, abs=0.5)

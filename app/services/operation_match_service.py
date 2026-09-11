@@ -1130,6 +1130,9 @@ class OperationMatchService:
             alias = {}
             por_telefono = {}
         by_uuid = {c.uuid: c for c in candidates}
+        # Modelo real de la op, para lo que la candidata plana no trae (nombre del cliente,
+        # vencimiento). Solo existe del lado entrante, donde `ops` sí se cargó arriba.
+        por_uuid_op = {str(o.uuid): o for o in ops} if table == "incoming" else {}
 
         out: list[dict] = []
         for payment in payments:
@@ -1161,19 +1164,52 @@ class OperationMatchService:
             best = next((s for s in scored if s.uuid == suggestion.uuid), None)
             if cand is None or best is None:
                 continue
-            out.append(
-                {
-                    "payment_id": payment.id,
-                    "kind": "LINK",
-                    "operation_uuid": cand.uuid,
-                    "confident": suggestion.confident,
-                    "score": round(best.score, 4),
-                    "delta": best.delta,
-                    "from_amount": cand.from_amount,
-                    "from_currency": cand.from_currency,
-                    "to_amount": cand.to_amount,
-                    "to_currency": cand.to_currency,
-                    "status": cand.status,
-                }
-            )
+            item = {
+                "payment_id": payment.id,
+                "kind": "LINK",
+                "operation_uuid": cand.uuid,
+                "confident": suggestion.confident,
+                "score": round(best.score, 4),
+                "delta": best.delta,
+                "from_amount": cand.from_amount,
+                "from_currency": cand.from_currency,
+                "to_amount": cand.to_amount,
+                "to_currency": cand.to_currency,
+                "status": cand.status,
+            }
+            if table == "incoming":
+                modelo = por_uuid_op.get(str(cand.uuid))
+                horas = (
+                    (_aware(payment.created_at) - cand.created_at).total_seconds() / 3600.0
+                    if cand.created_at and payment.created_at
+                    else None
+                )
+                item.update(
+                    {
+                        "coverage": best.coverage,
+                        "client_name": (
+                            modelo.client.display_name if modelo and modelo.client else None
+                        ),
+                        "client_uuid": (
+                            str(modelo.client.uuid) if modelo and modelo.client else None
+                        ),
+                        "same_client": bool(
+                            modelo
+                            and modelo.client
+                            and modelo.client.phone in alias.get(payment.client_phone, [])
+                        ),
+                        "operation_created_at": (
+                            cand.created_at.isoformat() if cand.created_at else None
+                        ),
+                        "hours_apart": round(horas, 2) if horas is not None else None,
+                        "expired": bool(
+                            modelo and modelo.expires_at and _aware(modelo.expires_at) <= now
+                        ),
+                        "missing_before": cand.missing_incoming,
+                        "missing_after": round(
+                            max(0.0, cand.missing_incoming - (payment.amount or 0)), 2
+                        ),
+                    }
+                )
+            out.append(item)
         return out

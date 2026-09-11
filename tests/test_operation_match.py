@@ -666,3 +666,20 @@ def test_a_tie_at_the_top_is_still_ambiguous():
     ]
     c = criteria(500.0, identification="V14110025")
     assert pick_auto_match(candidates, c, NOW) is None
+
+
+# ---------------------------------------------------------------------------
+# Task 1: lo que le falta cobrar del lado entrante
+# ---------------------------------------------------------------------------
+
+
+def test_candidate_missing_incoming_defaults_to_from_amount():
+    """Sin comprobantes entrantes, lo que falta cobrar es el lado `from` entero."""
+    c = op("a", 14757.0, from_amount=100.0)
+    assert c.collected_incoming == 0.0
+    assert c.missing_incoming == 100.0
+
+
+def test_candidate_missing_incoming_subtracts_what_is_already_allocated():
+    c = op("a", 14757.0, from_amount=100.0, collected_incoming=40.0)
+    assert c.missing_incoming == 60.0

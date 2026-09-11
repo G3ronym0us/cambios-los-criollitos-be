@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional, Sequence
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.whatsapp_operation import WhatsAppOperation, WhatsAppOperationScenario
@@ -108,6 +108,17 @@ class OperationCandidate:
     value_amount: Optional[float] = None
     delivered_amount: float = 0.0
     pending_amount: Optional[float] = None
+    # Lo que el cliente ya pagó de su lado (Σ whatsapp_payment_allocations) y lo que le
+    # falta. El lado saliente tiene su propio par (`delivered_amount`/`pending_amount`):
+    # son cosas distintas y no se mezclan.
+    collected_incoming: float = 0.0
+    missing_incoming: float = 0.0
+
+    def __post_init__(self) -> None:
+        # `from_model` ya lo calcula; esto cubre la construcción directa (tests y el helper
+        # `op()`), donde solo se pasa `collected_incoming`.
+        if not self.missing_incoming:
+            self.missing_incoming = round((self.from_amount or 0.0) - self.collected_incoming, 2)
 
     @classmethod
     def from_model(
@@ -116,6 +127,7 @@ class OperationCandidate:
         *,
         has_outgoing_payment: bool = False,
         has_incoming_payment: bool = False,
+        collected_incoming: float = 0.0,
     ) -> "OperationCandidate":
         value = op.amount if op.amount is not None else op.from_amount
         delivered = op.delivered_amount
@@ -134,6 +146,8 @@ class OperationCandidate:
             value_amount=value,
             delivered_amount=delivered,
             pending_amount=round((value or 0) - delivered, 2),
+            collected_incoming=collected_incoming,
+            missing_incoming=round((op.from_amount or 0.0) - collected_incoming, 2),
         )
 
 
@@ -664,16 +678,9 @@ class OperationMatchService:
 
     def _to_candidates(self, ops: Sequence[WhatsAppOperation]) -> list[OperationCandidate]:
         op_ids = [o.id for o in ops]
-        inc_taken: set[int] = set()
         out_taken: set[int] = set()
+        collected: dict[int, float] = {}
         if op_ids:
-            inc_taken = {
-                r[0]
-                for r in self.db.query(WhatsAppIncomingPayment.whatsapp_operation_id)
-                .filter(WhatsAppIncomingPayment.whatsapp_operation_id.in_(op_ids))
-                .distinct()
-                .all()
-            }
             out_taken = {
                 r[0]
                 for r in self.db.query(WhatsAppOutgoingPayment.whatsapp_operation_id)
@@ -681,11 +688,27 @@ class OperationMatchService:
                 .distinct()
                 .all()
             }
+            # Suma de lo ya asignado por operación: un entrante puede repartirse entre varias
+            # (Zelle de 220 → 200 a BRL y 20 a VES), así que el "tiene entrante" del FK crudo
+            # no basta para saber CUÁNTO cubre cada una.
+            from app.models.whatsapp_payment import WhatsAppPaymentAllocation
+
+            collected = {
+                row[0]: float(row[1] or 0)
+                for row in self.db.query(
+                    WhatsAppPaymentAllocation.whatsapp_operation_id,
+                    func.sum(WhatsAppPaymentAllocation.amount).label("total"),
+                )
+                .filter(WhatsAppPaymentAllocation.whatsapp_operation_id.in_(op_ids))
+                .group_by(WhatsAppPaymentAllocation.whatsapp_operation_id)
+                .all()
+            }
         return [
             OperationCandidate.from_model(
                 o,
                 has_outgoing_payment=o.id in out_taken,
-                has_incoming_payment=o.id in inc_taken,
+                has_incoming_payment=collected.get(o.id, 0.0) > 0,
+                collected_incoming=collected.get(o.id, 0.0),
             )
             for o in ops
         ]

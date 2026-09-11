@@ -97,6 +97,7 @@ _TRANSFER_REASON_LABELS = {
     "THIRD_PARTY": "pagó un tercero",
     "BOT_MISMATCH": "mal asignado por el bot",
     "DUPLICATE_CLIENT": "cliente duplicado",
+    "LINKED_TO_OPERATION": "vinculado a la operación de otro cliente",
 }
 
 # Los tres estados del filtro de la bandeja.
@@ -2129,8 +2130,44 @@ class WhatsAppPaymentService:
                     display_name=None,
                     update_display_name=False,
                 )
-            # En el resto de los casos se conserva el criterio existente: vincular
-            # el comprobante a una operación afirma que pertenece a su cliente.
+            # Vincular un entrante sigue afirmando que el comprobante pertenece al cliente de
+            # la operación, pero eso es una OPINIÓN y va en `owner_client_id`, no en
+            # `client_phone`, que es el hecho observado de en qué chat llegó el dinero. Es el
+            # mismo criterio de `transfer_client` —que a propósito no toca `client_phone`— y
+            # por eso deja el mismo rastro: sin él, el comprobante desaparecía del chat donde
+            # el operador lo había visto, sin que nada lo explicara (caso #582, José Bogao).
+            elif table == "incoming":
+                # Si el "cliente" de la op es un marcador (JID de grupo o anónimo) no hay de
+                # quién afirmar nada: mudar el comprobante a un placeholder sería perder al
+                # dueño real a cambio de nada.
+                if op.client is not None and not is_unassigned_client_phone(
+                    operation_client_phone
+                ):
+                    origen = row.owner_client or (
+                        self.db.query(WhatsAppClient)
+                        .filter(WhatsAppClient.phone == payment_client_phone)
+                        .first()
+                    )
+                    # Mismo cliente (el caso normal, con el pool de candidatas ya acotado al
+                    # cliente): no hay mudanza, así que no se anota nada.
+                    if origen is None or origen.id != op.client.id:
+                        row.owner_client_id = op.client.id
+                        self.db.add(
+                            WhatsAppPaymentTransfer(
+                                incoming_payment_id=row.id,
+                                from_client_id=origen.id if origen else None,
+                                from_client_phone=payment_client_phone,
+                                from_client_name=origen.display_name if origen else None,
+                                to_client_id=op.client.id,
+                                reason=PaymentTransferReason.LINKED_TO_OPERATION,
+                                created_by_user_id=(
+                                    completing_user.id if completing_user else None
+                                ),
+                            )
+                        )
+            # El saliente se queda como estaba. Ahí el comprobante lo sube el operador (ver
+            # `backend/CLAUDE.md`), así que `client_phone` no es «el chat del cliente» sino la
+            # referencia que se adopta al vincular; cambiarlo es otra decisión, y no es esta.
             elif operation_client_phone:
                 row.client_phone = operation_client_phone
             # La op vuelve a tener respaldo: el aval de "sin pago asociado" ya no aplica.

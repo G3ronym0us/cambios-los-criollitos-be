@@ -13,11 +13,16 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from app.models.whatsapp_client import WhatsAppClient
 from app.models.whatsapp_operation import (
     WhatsAppAmountSide,
     WhatsAppOperation,
     WhatsAppOperationScenario,
     WhatsAppOperationStatus,
+)
+from app.models.whatsapp_payment_transfer import (
+    PaymentTransferReason,
+    WhatsAppPaymentTransfer,
 )
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
 from tests import factories as f
@@ -194,3 +199,113 @@ def test_moving_a_receipt_returns_the_operation_it_left_to_quoted(svc, db, clien
     db.refresh(b)
     assert b.status.value == "PENDING"
     assert a.status.value == "QUOTED"
+
+
+# ---------------------------------------------------------------------------
+# Vincular afirma de quién es el dinero, pero no borra dónde llegó
+# ---------------------------------------------------------------------------
+
+
+def _client(db, phone: str, name: str) -> WhatsAppClient:
+    row = WhatsAppClient(phone=phone, display_name=name, is_tracked=True)
+    db.add(row)
+    db.flush()
+    return row
+
+
+def test_linking_to_another_clients_operation_leaves_a_trail(svc, db, pairs, operator):
+    """
+    Caso #582: el Zelle llegó en el chat de José Bogao y se vinculó a la operación de
+    Arianna. Vincular puede afirmar que el dinero es de Arianna —eso va en `owner_client_id`,
+    que es una opinión— pero no puede pisar el chat en el que llegó, que es un hecho
+    observado: el operador lo buscó donde lo había visto y ya no estaba.
+    """
+    bogao = _client(db, "584267169499", "Jose Bogao")
+    arianna = _client(db, "584128580852", "Arianna")
+    op = _op(db, arianna, pairs, from_amount=200.0)
+    pago = f.incoming(db, 200.0, phone=bogao.phone)
+
+    svc.set_operation("incoming", pago.id, op.uuid, completing_user=operator)
+
+    db.refresh(pago)
+    # El chat de origen NO se pisa: sigue siendo un hecho observado.
+    assert pago.client_phone == "584267169499"
+    assert pago.owner_client_id == arianna.id
+
+    fila = (
+        db.query(WhatsAppPaymentTransfer)
+        .filter(WhatsAppPaymentTransfer.incoming_payment_id == pago.id)
+        .one()
+    )
+    assert fila.reason == PaymentTransferReason.LINKED_TO_OPERATION
+    assert fila.from_client_id == bogao.id
+    assert fila.from_client_phone == "584267169499"
+    assert fila.from_client_name == "Jose Bogao"
+    assert fila.to_client_id == arianna.id
+    assert fila.created_by_user_id == operator.id
+
+
+def test_linking_to_an_operation_of_the_same_client_leaves_no_trail(svc, db, client, pairs, operator):
+    """Con el filtro por cliente puesto, este es el caso normal: no hay mudanza que anotar."""
+    op = _op(db, client, pairs)
+    pago = f.incoming(db, 100.0, phone=client.phone)
+
+    svc.set_operation("incoming", pago.id, op.uuid, completing_user=operator)
+
+    db.refresh(pago)
+    assert pago.owner_client_id is None
+    assert db.query(WhatsAppPaymentTransfer).count() == 0
+
+
+def test_the_move_shows_up_in_the_payment_timeline(svc, db, pairs, operator):
+    """Sin línea en la bitácora el rastro existe en la base pero el operador no lo ve."""
+    bogao = _client(db, "584267169499", "Jose Bogao")
+    arianna = _client(db, "584128580852", "Arianna")
+    op = _op(db, arianna, pairs, from_amount=200.0)
+    pago = f.incoming(db, 200.0, phone=bogao.phone)
+
+    svc.set_operation("incoming", pago.id, op.uuid, completing_user=operator)
+
+    items = svc.payment_timeline("incoming", pago.id)["items"]
+    mudanza = next(i for i in items if i["kind"] == "TRANSFER")
+    assert "Jose Bogao" in mudanza["detail"]
+    assert "Arianna" in mudanza["detail"]
+    assert "vinculado a la operación de otro cliente" in mudanza["detail"]
+    assert mudanza["actor"] == operator.username
+
+
+def test_linking_to_an_anonymous_operation_claims_nothing(svc, db, pairs, operator):
+    """
+    La operación anónima de un socio no tiene dueño conocido: su «cliente» es un marcador
+    (`anon:partner:{uid}`). Mudarle el comprobante sería afirmar que el dinero es de un
+    placeholder, así que no se toca nada ni se anota ninguna mudanza.
+    """
+    anonimo = _client(db, f"anon:partner:{operator.id}", "Anónimo")
+    bogao = _client(db, "584267169499", "Jose Bogao")
+    op = _op(db, anonimo, pairs, from_amount=200.0)
+    pago = f.incoming(db, 200.0, phone=bogao.phone)
+
+    svc.set_operation("incoming", pago.id, op.uuid, completing_user=operator)
+
+    db.refresh(pago)
+    assert pago.client_phone == "584267169499"
+    assert pago.owner_client_id is None
+    assert db.query(WhatsAppPaymentTransfer).count() == 0
+
+
+def test_linking_an_outgoing_still_adopts_the_operation_client(svc, db, pairs, operator):
+    """
+    El saliente no entra en este cambio. Su comprobante lo sube el operador (ver
+    `backend/CLAUDE.md`), así que su `client_phone` no es «el chat del cliente» sino la
+    referencia que se adopta al vincular. Queda aquí escrito para que el alcance sea
+    explícito: si algún día se unifica, este test es el que hay que cambiar a conciencia.
+    """
+    arianna = _client(db, "584128580852", "Arianna")
+    op = _op(db, arianna, pairs, from_amount=200.0)
+    saliente = f.outgoing(db, 156584.0, "VES", phone="584267169499")
+
+    svc.set_operation("outgoing", saliente.id, op.uuid, completing_user=operator)
+
+    db.refresh(saliente)
+    assert saliente.client_phone == arianna.phone
+    assert db.query(WhatsAppPaymentTransfer).count() == 0

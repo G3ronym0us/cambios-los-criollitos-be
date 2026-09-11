@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.models.whatsapp_client import WhatsAppClient
+from app.models.whatsapp_payment import WhatsAppPaymentAllocation
 from app.models.whatsapp_operation import (
     WhatsAppAmountSide,
     WhatsAppOperation,
@@ -165,20 +166,6 @@ def test_a_via_partner_operation_never_falls_back_to_quoted(svc, db, client, pai
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason=(
-        "No lo impide el sync de estado, que ya sincroniza las DOS operaciones, sino el "
-        "reparto: re-vincular por `set_operation` muda el FK a B pero NO borra la fila de "
-        "`whatsapp_payment_allocations` de A (`_upsert_allocation` solo escribe la de B, "
-        "mientras que la ruta de desvincular sí llama a `_drop_allocation`). A conserva "
-        "respaldo y sigue en PENDING con razón. Desde el panel esta ruta no se alcanza -- "
-        "con `complete_outgoing=True` da 409 'desvincúlalo primero' -- así que solo llega "
-        "por el bot. Si el criterio es que un re-vínculo directo muda el pago entero, el "
-        "arreglo es soltar el reparto anterior ahí; si un pago puede cubrir A y B a la vez, "
-        "la ruta correcta es `PUT /incoming/{id}/allocations` y este test sobra."
-    ),
-    strict=False,
-)
 def test_moving_a_receipt_returns_the_operation_it_left_to_quoted(svc, db, client, pairs, operator):
     """
     Mover un comprobante de la op A a la op B deja a A sin ningún entrante. Si solo se
@@ -309,3 +296,23 @@ def test_linking_an_outgoing_still_adopts_the_operation_client(svc, db, pairs, o
     db.refresh(saliente)
     assert saliente.client_phone == arianna.phone
     assert db.query(WhatsAppPaymentTransfer).count() == 0
+
+
+def test_the_share_moves_with_the_link(svc, db, client, pairs, operator):
+    """
+    La otra mitad de la regla: la operación nueva no solo hereda el vínculo, hereda el dinero.
+    Sin soltar el reparto de la vieja, `_default_allocation_amount` no encontraba nada libre
+    que repartir y la nueva se quedaba en cero.
+    """
+    a = _op(db, client, pairs, status=WhatsAppOperationStatus.QUOTED)
+    b = _op(db, client, pairs, status=WhatsAppOperationStatus.QUOTED)
+    pago = f.incoming(db, 100.0, phone=client.phone)
+
+    svc.set_operation("incoming", pago.id, a.uuid, completing_user=operator)
+    svc.set_operation("incoming", pago.id, b.uuid, completing_user=operator)
+
+    repartos = {
+        r.whatsapp_operation_id: r.amount
+        for r in db.query(WhatsAppPaymentAllocation).filter_by(incoming_payment_id=pago.id).all()
+    }
+    assert repartos == {b.id: 100.0}

@@ -2115,6 +2115,22 @@ class WhatsAppPaymentService:
             # vincular después el pago saliente real, ese número es la primera referencia
             # confiable del destinatario: adoptarlo antes de sincronizar los pagos.
             payment_client_phone = row.client_phone
+            # El vínculo principal es EXCLUSIVO: si el comprobante se va a otra operación, la
+            # anterior lo pierde —reparto incluido—, igual que si se hubiera desvinculado a
+            # mano. Sin esto la fila de reparto de la vieja sobrevivía y se quedaba con todo
+            # el dinero del pago, así que la nueva heredaba el vínculo pero cero respaldo
+            # (`_default_allocation_amount` solo reparte lo que queda libre) y las DOS
+            # terminaban en PENDING con un solo comprobante detrás.
+            #
+            # Esto no toca el reparto explícito entre varias operaciones, que se declara
+            # aparte con `PUT /incoming/{id}/allocations` y sigue valiendo: aquí solo se
+            # suelta la operación que era la principal hasta este momento.
+            if (
+                table == "incoming"
+                and row.whatsapp_operation_id is not None
+                and row.whatsapp_operation_id != op.id
+            ):
+                self._drop_allocation(row.id, row.whatsapp_operation_id)
             row.whatsapp_operation_id = op.id
             operation_client_phone = op.client.phone if op.client else None
             should_infer_client = (

@@ -657,6 +657,29 @@ class OperationMatchService:
     def __init__(self, db: Session):
         self.db = db
 
+    def _client_phones_for_many(self, phones: Sequence[str]) -> dict[str, list[str]]:
+        """
+        `_client_phones_for` para un lote, en UNA consulta.
+
+        Llamarla en bucle sobre una página de 50 comprobantes son 50 viajes a la base para
+        resolver lo mismo: qué teléfonos son de un socio y por tanto alcanzan sus operaciones
+        anónimas (`anon:partner:{user_id}`, ver `_apply_scenario` en whatsapp_quote_service).
+        """
+        from app.models.fund import FundGroupMember
+
+        unicos = [p for p in dict.fromkeys(phones) if p]
+        if not unicos:
+            return {}
+        socios: dict[str, list[int]] = {}
+        for phone, user_id in (
+            self.db.query(FundGroupMember.whatsapp_phone, FundGroupMember.user_id)
+            .filter(FundGroupMember.whatsapp_phone.in_(unicos))
+            .distinct()
+            .all()
+        ):
+            socios.setdefault(phone, []).append(user_id)
+        return {p: [p, *(f"anon:partner:{uid}" for uid in socios.get(p, []))] for p in unicos}
+
     def _client_phones_for(self, phone: str) -> list[str]:
         """
         Bajo qué clientes pueden estar las ops de este teléfono. Normalmente solo el suyo,
@@ -664,18 +687,10 @@ class OperationMatchService:
         reasignan al cliente anónimo `anon:partner:{user_id}` (ver `_apply_scenario` en
         whatsapp_quote_service): el comprobante que llega en su chat directo tiene que poder
         alcanzarlas igual. Sin esto, todo saliente pagado en el chat de un socio quedaba
-        suelto (caso Dionis, 6→11 de agosto de 2026: 40 comprobantes sin operación).
+        suelto (caso Dionis, 6→11 de agosto de 2026: 40 comprobantes sin operación). Ver
+        `_client_phones_for_many`.
         """
-        from app.models.fund import FundGroupMember
-
-        user_ids = [
-            r[0]
-            for r in self.db.query(FundGroupMember.user_id)
-            .filter(FundGroupMember.whatsapp_phone == phone)
-            .distinct()
-            .all()
-        ]
-        return [phone, *(f"anon:partner:{uid}" for uid in user_ids)]
+        return self._client_phones_for_many([phone]).get(phone, [phone])
 
     def _operations_query(
         self,
@@ -685,6 +700,9 @@ class OperationMatchService:
         group_jid: Optional[str] = None,
         scenario: Optional[WhatsAppOperationScenario] = None,
         statuses: Optional[Sequence[str]] = None,
+        phones: Optional[Sequence[str]] = None,
+        created_between: Optional[tuple[datetime, datetime]] = None,
+        payable_by_receipt: bool = False,
     ):
         """
         La consulta filtrada, SIN ordenar ni recortar — la comparten quien cuenta el total
@@ -695,7 +713,13 @@ class OperationMatchService:
         `search` es nuevo aquí: antes solo lo sabía `WhatsAppQuoteService.list_operations`
         (`GET /operations`). El cajón de "vincular pago" ahora pide filtro Y puntuación al
         mismo endpoint (`POST /operations/match`), así que tiene que poder buscar igual.
+
+        `phones` es la versión "ya resuelta" de `phone` (varios comprobantes a la vez, ver
+        `suggest_for_payments`); `created_between` acota por fecha de creación de la op —
+        la ventana del ranking del lado entrante — y `payable_by_receipt` excluye lo que
+        JAMÁS puede cerrarse con un comprobante entrante (pares en efectivo, VIA_PARTNER).
         """
+        from app.models.currency_pair import CurrencyPair
         from app.models.fund import FundGroup
         from app.models.whatsapp_client import WhatsAppClient
         from app.models.whatsapp_operation import WhatsAppOperationStatus
@@ -705,10 +729,16 @@ class OperationMatchService:
         )
         # El buscador cruza cliente (nombre o teléfono), así que el join tiene que existir
         # aunque no haya `phone` — mismo criterio que `list_operations`.
-        if phone or search:
+        if phone or search or phones:
             q = q.join(WhatsAppClient, WhatsAppClient.id == WhatsAppOperation.client_id)
         if phone:
             q = q.filter(WhatsAppClient.phone.in_(self._client_phones_for(phone)))
+        if phones:
+            q = q.filter(WhatsAppClient.phone.in_(list(phones)))
+        if created_between:
+            desde, hasta = created_between
+            q = q.filter(WhatsAppOperation.created_at >= desde)
+            q = q.filter(WhatsAppOperation.created_at <= hasta)
         if search:
             like = f"%{search.strip()}%"
             q = q.filter(
@@ -722,6 +752,20 @@ class OperationMatchService:
         if statuses:
             q = q.filter(
                 WhatsAppOperation.status.in_([WhatsAppOperationStatus(s) for s in statuses])
+            )
+        if payable_by_receipt:
+            # Ni un par en efectivo ni un trato VIA_PARTNER reciben nunca comprobante del
+            # cliente: el uno se paga con billetes y en el otro cobra el socio en su propio
+            # chat. Ofrecerlos como candidatos solo puede terminar en un vínculo falso.
+            q = q.join(CurrencyPair, CurrencyPair.id == WhatsAppOperation.currency_pair_id)
+            q = q.filter(
+                or_(
+                    CurrencyPair.settles_in_cash.is_(False),
+                    CurrencyPair.settles_in_cash.is_(None),
+                )
+            )
+            q = q.filter(
+                WhatsAppOperation.scenario != WhatsAppOperationScenario.VIA_PARTNER
             )
         if group_jid:
             # El bot conoce el grupo por su JID de WhatsApp; la op lo referencia por FK.
@@ -979,11 +1023,38 @@ class OperationMatchService:
         if not payments:
             return []
 
-        candidates = self._load_operations(limit=limit)
-        if not candidates:
-            return []
-        by_uuid = {c.uuid: c for c in candidates}
         now = datetime.now(timezone.utc)
+
+        if table == "incoming":
+            ventana = timedelta(hours=INCOMING_WINDOW_HOURS)
+            alias = self._client_phones_for_many([p.client_phone for p in payments])
+            todos = sorted({t for lista in alias.values() for t in lista})
+            fechas = [_aware(p.created_at) for p in payments if p.created_at]
+            if not todos or not fechas:
+                return []
+            ops = self._load_operation_models(
+                limit=MATCH_POOL_LIMIT,
+                phones=todos,
+                statuses=OPEN_STATUSES,
+                created_between=(min(fechas) - ventana, max(fechas) + ventana),
+                payable_by_receipt=True,
+            )
+            candidates = self._to_candidates(ops)
+            # Las candidatas se reparten por cliente en memoria: la consulta ya vino acotada
+            # al lote entero, y volver a la base una vez por comprobante no aporta nada.
+            # `_to_candidates` y `_load_operation_models` devuelven listas paralelas.
+            por_telefono: dict[str, list[OperationCandidate]] = {}
+            for cand, modelo in zip(candidates, ops):
+                telefono = modelo.client.phone if modelo.client else None
+                if telefono:
+                    por_telefono.setdefault(telefono, []).append(cand)
+        else:
+            candidates = self._load_operations(limit=limit)
+            if not candidates:
+                return []
+            alias = {}
+            por_telefono = {}
+        by_uuid = {c.uuid: c for c in candidates}
 
         out: list[dict] = []
         for payment in payments:
@@ -995,7 +1066,15 @@ class OperationMatchService:
                 bank_to=payment.bank_to,
                 created_at=_aware(payment.created_at),
             )
-            scored = rank_candidates(candidates, criteria, table, now)
+            if table == "incoming":
+                propias = [
+                    c
+                    for t in alias.get(payment.client_phone, [])
+                    for c in por_telefono.get(t, [])
+                ]
+                scored = rank_candidates(propias, criteria, table, now)
+            else:
+                scored = rank_candidates(candidates, criteria, table, now)
             suggestion = pick_suggestion(scored)
             if suggestion is None:
                 continue

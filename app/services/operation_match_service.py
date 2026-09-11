@@ -401,8 +401,18 @@ def score_candidate(
     )
 
 
-#: Orden de las clases de cobertura del lado entrante: un cierre siempre gana a un abono.
+#: Orden de las clases de cobertura del lado entrante: un cierre siempre gana a un abono, y
+#: lo que no es candidata (`None`) se hunde al fondo. Ese fondo importa porque el cajón
+#: enseña la lista ENTERA, no solo la sugerencia: sin esto una op que este comprobante no
+#: puede cubrir salía por delante de otra a la que sí le abona.
 _COVERAGE_RANK = {"CLOSES": 0, "PARTIAL": 1}
+
+
+def _coverage_rank(score: MatchScore, table: str) -> int:
+    """El saliente no tiene clases: todas empatan y ordena el puntaje, como siempre."""
+    if table != "incoming":
+        return 0
+    return _COVERAGE_RANK.get(score.coverage, 2)
 
 
 def rank_candidates(
@@ -415,16 +425,17 @@ def rank_candidates(
     Puntúa todas y devuelve de mejor a peor.
 
     Del lado ENTRANTE la clase manda sobre el puntaje: primero todo lo que CIERRA, después
-    todo lo que ABONA. Un cierre exacto es una afirmación mucho más fuerte que una
-    coincidencia horaria. Del lado saliente `coverage` es siempre None y el orden queda
-    exactamente como estaba. Desempate, en ambos: la más reciente primero.
+    todo lo que ABONA, y al final lo que este comprobante no puede cubrir. Un cierre exacto
+    es una afirmación mucho más fuerte que una coincidencia horaria. Del lado saliente
+    `coverage` es siempre None y el orden queda exactamente como estaba. Desempate, en
+    ambos: la más reciente primero.
     """
     scores: list[tuple[MatchScore, Optional[datetime]]] = [
         (score_candidate(cand, criteria, table, now), cand.created_at) for cand in candidates
     ]
     scores.sort(
         key=lambda pair: (
-            _COVERAGE_RANK.get(pair[0].coverage, 0),
+            _coverage_rank(pair[0], table),
             -pair[0].score,
             -(pair[1].timestamp() if pair[1] else 0),
         )

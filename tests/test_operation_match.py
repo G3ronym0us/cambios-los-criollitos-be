@@ -739,3 +739,14 @@ def test_outgoing_ranking_is_untouched_by_coverage():
     ranked = rank_candidates([op("a", 14757.0)], criteria(14757.0), "outgoing", NOW)
     assert ranked[0].coverage is None
     assert ranked[0].within_tolerance
+
+
+def test_an_operation_this_receipt_cannot_cover_sinks_below_a_partial():
+    """
+    El cajón enseña la lista entera, no solo la sugerencia: lo que no se puede cubrir va al
+    fondo, por debajo de la que sí recibe un abono, aunque sea más reciente.
+    """
+    cubierta = op("cubierta", 14757.0, from_amount=100.0, collected_incoming=100.0, minutes_ago=1)
+    abona = op("abona", 73785.0, from_amount=500.0, minutes_ago=200)
+    ranked = rank_candidates([cubierta, abona], criteria(100.0, currency="USDT"), "incoming", NOW)
+    assert [s.uuid for s in ranked] == ["abona", "cubierta"]

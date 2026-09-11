@@ -3196,7 +3196,21 @@ class WhatsAppPaymentService:
         el comprobante llegó reenviado al grupo, al cliente real lo atendió el operador por
         fuera del bot y todavía no sabemos quién es. La op nace con el cliente anónimo del
         grupo y se resuelve al vincular el saliente (`set_operation`) o desde su detalle.
+
+        `owner_client_id` manda sobre todo lo demás: es el dueño EXPLÍCITO del comprobante,
+        el que dejó una mudanza (`transfer_client`, o el vínculo que se llevó el pago a otra
+        operación). El teléfono del chat sigue siendo el de quien lo mandó, así que leerlo a
+        él hacía nacer la operación bajo el cliente del que acabábamos de sacar el pago —
+        justo el error que la mudanza venía a corregir.
         """
+        if getattr(row, "owner_client_id", None):
+            duenno = (
+                self.db.query(WhatsAppClient)
+                .filter(WhatsAppClient.id == row.owner_client_id)
+                .first()
+            )
+            if duenno is not None:
+                return duenno
         if (row.client_phone or "").endswith("@g.us"):
             source_group = (
                 self.db.query(FundGroup)

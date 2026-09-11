@@ -1,6 +1,6 @@
 """Schemas del emparejamiento comprobante ↔ operación (app/services/operation_match_service.py)."""
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -82,6 +82,11 @@ class OperationRankRequest(BaseModel):
     order_by: str = Field("suggested", pattern="^(suggested|amount|time)$")
     page: int = Field(1, ge=1)
     limit: int = Field(200, ge=1, le=500)
+    #: client (default) = solo las operaciones del cliente del comprobante (y sus alias de
+    #: socio), abiertas. all = el botón «buscar en todos los clientes» del cajón, a sabiendas.
+    #: Deviation del plan: el endpoint recibe TODO por body (`OperationRankRequest`), no hay
+    #: otros query params — así que `scope` va aquí como un campo más, no como `Query(...)`.
+    scope: Literal["client", "all"] = "client"
 
 
 class OperationScoreResponse(BaseModel):
@@ -94,6 +99,8 @@ class OperationScoreResponse(BaseModel):
     time_score: float
     score: float
     within_tolerance: bool
+    #: Solo del lado entrante: "CLOSES" | "PARTIAL". `None` en salientes.
+    coverage: Optional[str] = None
 
 
 class SuggestionResponse(BaseModel):
@@ -129,3 +136,50 @@ class PaymentSuggestionsRequest(BaseModel):
     """Sugerencia para una tanda de comprobantes: una página del listado de pagos."""
 
     payment_ids: list[int] = Field(..., max_length=200)
+
+
+class CreateHint(BaseModel):
+    """Con qué par nacería la operación de este comprobante, y cuánto daría."""
+
+    pair_uuid: Optional[str] = None
+    pair_symbol: Optional[str] = None
+    #: preferred | most_used | currency — por qué se eligió ese par. El front lo redacta.
+    reason: Optional[str] = None
+    rate: Optional[float] = None
+    rate_at: Optional[str] = None
+    from_amount: Optional[float] = None
+    to_amount: Optional[float] = None
+    from_currency: Optional[str] = None
+    to_currency: Optional[str] = None
+
+
+class PaymentSuggestionItem(BaseModel):
+    payment_id: int
+    #: LINK = hay una operación que la cubre. CREATE = el cliente no tiene ninguna abierta.
+    kind: Literal["LINK", "CREATE"]
+    operation_uuid: Optional[str] = None
+    confident: bool = False
+    #: CLOSES = deja la op sin faltante. PARTIAL = abona y queda resto. Solo del lado entrante.
+    coverage: Optional[Literal["CLOSES", "PARTIAL"]] = None
+    client_name: Optional[str] = None
+    client_uuid: Optional[str] = None
+    #: ¿La op es del mismo cliente que el chat del comprobante? En ámbar cuando es False.
+    same_client: bool = True
+    operation_created_at: Optional[str] = None
+    #: Firmado: negativo significa que la operación nació DESPUÉS del comprobante.
+    hours_apart: Optional[float] = None
+    status: Optional[str] = None
+    expired: bool = False
+    score: Optional[float] = None
+    delta: Optional[float] = None
+    from_amount: Optional[float] = None
+    from_currency: Optional[str] = None
+    to_amount: Optional[float] = None
+    to_currency: Optional[str] = None
+    missing_before: Optional[float] = None
+    missing_after: Optional[float] = None
+    create_hint: Optional[CreateHint] = None
+
+
+class PaymentSuggestionsResponse(BaseModel):
+    items: list[PaymentSuggestionItem]

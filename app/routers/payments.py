@@ -36,7 +36,7 @@ from app.schemas.whatsapp import (
     ClientLoanCreate,
 )
 from app.core.timezones import day_bounds
-from app.schemas.operation_match import PaymentSuggestionsRequest
+from app.schemas.operation_match import PaymentSuggestionsRequest, PaymentSuggestionsResponse
 from app.services.client_loan_service import ClientLoanService
 from app.services.operation_match_service import OperationMatchService
 from app.services.whatsapp_balance_service import WhatsAppBalanceService
@@ -158,7 +158,7 @@ async def get_payments_stats(
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
 
-@router.post("/{table}/suggestions")
+@router.post("/{table}/suggestions", response_model=PaymentSuggestionsResponse)
 async def suggest_operations_for_payments(
     table: Literal["incoming", "outgoing"],
     payload: PaymentSuggestionsRequest,

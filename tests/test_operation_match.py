@@ -666,3 +666,87 @@ def test_a_tie_at_the_top_is_still_ambiguous():
     ]
     c = criteria(500.0, identification="V14110025")
     assert pick_auto_match(candidates, c, NOW) is None
+
+
+# ---------------------------------------------------------------------------
+# Task 1: lo que le falta cobrar del lado entrante
+# ---------------------------------------------------------------------------
+
+
+def test_candidate_missing_incoming_defaults_to_from_amount():
+    """Sin comprobantes entrantes, lo que falta cobrar es el lado `from` entero."""
+    c = op("a", 14757.0, from_amount=100.0)
+    assert c.collected_incoming == 0.0
+    assert c.missing_incoming == 100.0
+
+
+def test_candidate_missing_incoming_subtracts_what_is_already_allocated():
+    c = op("a", 14757.0, from_amount=100.0, collected_incoming=40.0)
+    assert c.missing_incoming == 60.0
+
+
+# ---------------------------------------------------------------------------
+# Task 2: elegibilidad por faltante y clase de cobertura
+# ---------------------------------------------------------------------------
+
+
+def test_incoming_closes_when_the_receipt_leaves_nothing_missing():
+    from app.services.operation_match_service import incoming_coverage
+
+    assert incoming_coverage(100.0, 100.0) == "CLOSES"
+    assert incoming_coverage(100.5, 100.0) == "CLOSES"   # dentro del 1%
+
+
+def test_incoming_is_partial_when_the_receipt_fits_inside_what_is_missing():
+    from app.services.operation_match_service import incoming_coverage
+
+    assert incoming_coverage(500.0, 100.0) == "PARTIAL"
+
+
+def test_incoming_is_not_a_candidate_when_the_receipt_exceeds_what_is_missing():
+    """Eso es saldo a favor, no una sugerencia."""
+    from app.services.operation_match_service import incoming_coverage
+
+    assert incoming_coverage(60.0, 100.0) is None
+    assert incoming_coverage(0.0, 100.0) is None
+
+
+def test_closing_beats_a_much_more_recent_partial():
+    """La clase manda sobre el puntaje: el cierre viejo le gana al abono reciente."""
+    cierra = op("cierra", 14757.0, from_amount=100.0, minutes_ago=300)
+    abona = op("abona", 73785.0, from_amount=500.0, minutes_ago=10)
+    ranked = rank_candidates([abona, cierra], criteria(100.0, currency="USDT"), "incoming", NOW)
+    sug = pick_suggestion(ranked)
+    assert sug is not None and sug.uuid == "cierra" and sug.confident
+
+
+def test_a_fully_covered_operation_is_not_a_candidate():
+    cubierta = op("cubierta", 14757.0, from_amount=100.0, collected_incoming=100.0)
+    ranked = rank_candidates([cubierta], criteria(100.0, currency="USDT"), "incoming", NOW)
+    assert pick_suggestion(ranked) is None
+
+
+def test_two_closing_candidates_are_suggested_but_not_confident():
+    a = op("a", 14757.0, from_amount=100.0, minutes_ago=3)
+    b = op("b", 14757.0, from_amount=100.0, minutes_ago=3)
+    ranked = rank_candidates([a, b], criteria(100.0, currency="USDT"), "incoming", NOW)
+    sug = pick_suggestion(ranked)
+    assert sug is not None and not sug.confident
+
+
+def test_outgoing_ranking_is_untouched_by_coverage():
+    """El lado saliente no conoce las clases: su `coverage` es None."""
+    ranked = rank_candidates([op("a", 14757.0)], criteria(14757.0), "outgoing", NOW)
+    assert ranked[0].coverage is None
+    assert ranked[0].within_tolerance
+
+
+def test_an_operation_this_receipt_cannot_cover_sinks_below_a_partial():
+    """
+    El cajón enseña la lista entera, no solo la sugerencia: lo que no se puede cubrir va al
+    fondo, por debajo de la que sí recibe un abono, aunque sea más reciente.
+    """
+    cubierta = op("cubierta", 14757.0, from_amount=100.0, collected_incoming=100.0, minutes_ago=1)
+    abona = op("abona", 73785.0, from_amount=500.0, minutes_ago=200)
+    ranked = rank_candidates([cubierta, abona], criteria(100.0, currency="USDT"), "incoming", NOW)
+    assert [s.uuid for s in ranked] == ["abona", "cubierta"]

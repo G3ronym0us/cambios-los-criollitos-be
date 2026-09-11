@@ -11,7 +11,7 @@ import pytest
 from app.models.whatsapp_client import WhatsAppClient
 from app.models.whatsapp_operation import WhatsAppOperationStatus
 from app.services.whatsapp_payment_service import WhatsAppPaymentService
-from app.services.whatsapp_quote_service import QuoteServiceError
+from app.services.whatsapp_quote_service import QuoteServiceError, WhatsAppQuoteService
 from tests import factories as f
 
 
@@ -324,3 +324,24 @@ def test_outgoing_timeline_reads_the_move(service, db, client, destination, oper
     move = next(i for i in items if i["kind"] == "TRANSFER")
     assert "cliente duplicado" in move["detail"]
     assert "misma persona" in move["detail"]
+
+
+def test_an_operation_born_from_a_moved_receipt_belongs_to_its_new_owner(
+    service, db, client, destination, operator
+):
+    """
+    El bug: `_resolve_operation_client` leía `client_phone` —el teléfono de quien MANDÓ el
+    comprobante— e ignoraba la mudanza. Un pago transferido y luego convertido en operación
+    nacía bajo el cliente del que se acababa de sacar.
+    """
+    pay = f.incoming(db, 220.0)
+    _transfer(service, pay, destination, operator, note="El dinero es de ella")
+    db.flush()
+
+    quote_svc = WhatsAppQuoteService(db)
+    resuelto = service._resolve_operation_client(quote_svc, pay, None)
+
+    assert resuelto.id == destination.id
+    # Y el comprobante conserva el teléfono de quien lo mandó: la mudanza es una opinión
+    # sobre el dueño, no un borrado del origen.
+    assert pay.client_phone == client.phone

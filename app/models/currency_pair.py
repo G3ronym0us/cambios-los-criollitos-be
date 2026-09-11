@@ -38,12 +38,29 @@ class CurrencyPair(UUIDMixin, Base):
     rounding_step = Column(Numeric(15, 4), nullable=True)
     rounding_direction = Column(String(4), nullable=True)
     rounding_amount_side = Column(String(4), nullable=True)
+
+    # Negotiation step — the figures this pair is *talked about* in with the client.
+    # Nothing applies it automatically: unlike rounding_step above (which the bot
+    # applies to every quote), this one only feeds the round-amount suggestions
+    # when an operator creates a quote by hand. The two are independent and are
+    # usually different: VES-COP rounds amounts to 100 COP but is negotiated in
+    # steps of 10.000 COP.
+    #   negotiation_step:      the multiple to suggest (e.g. 10000, 5)
+    #   negotiation_step_side: "FROM" | "TO" — which of the pair's currencies the
+    #                          step is expressed in.
+    negotiation_step = Column(Numeric(15, 4), nullable=True)
+    negotiation_step_side = Column(String(4), nullable=True)
     
     # Pair identifier (e.g., "USDT-VES", "ZELLE-COP")
     pair_symbol = Column(String(20), unique=True, index=True, nullable=False)
 
     # Pair type (base, derived, cross)
     pair_type = Column(SQLEnum(PairType), nullable=False, default=PairType.BASE)
+
+    # Se cambia en efectivo, mano a mano: en este par NO existe comprobante entrante y
+    # nunca lo habrá. Lo lee `ClientPendingService` para no exigirlo al decidir qué se debe;
+    # sin esto, un par como USD-VES desaparece entero de «por entregar».
+    settles_in_cash = Column(Boolean, default=False, nullable=False, server_default="false")
 
     # Configuration
     is_active = Column(Boolean, default=True, nullable=False)
@@ -103,6 +120,7 @@ class CurrencyPair(UUIDMixin, Base):
             "display_name": self.display_name,
             "is_active": self.is_active,
             "is_monitored": self.is_monitored,
+            "settles_in_cash": self.settles_in_cash,
             "binance_tracked": self.binance_tracked,
             "banks_to_track": self.banks_to_track,
             "amount_to_track": float(self.amount_to_track) if self.amount_to_track else None,
@@ -115,6 +133,8 @@ class CurrencyPair(UUIDMixin, Base):
             "rounding_step": float(self.rounding_step) if self.rounding_step is not None else None,
             "rounding_direction": self.rounding_direction,
             "rounding_amount_side": self.rounding_amount_side,
+            "negotiation_step": float(self.negotiation_step) if self.negotiation_step is not None else None,
+            "negotiation_step_side": self.negotiation_step_side,
             "usdt_reference_side": self.usdt_reference_side,
             "usdt_manual_rate": self.usdt_manual_rate,
             "usdt_pair_uuid": self.usdt_pair.uuid if self.usdt_pair else None,

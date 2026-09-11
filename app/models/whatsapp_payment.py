@@ -38,11 +38,35 @@ class WhatsAppIncomingPayment(UUIDMixin, Base):
     whatsapp_operation_id = Column(
         Integer, ForeignKey("whatsapp_operations.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Dueño explícito del comprobante, cuando NO es quien lo mandó (el esposo pagó por la
+    # esposa, el bot lo pegó al cliente equivocado). NULL = el de siempre, el que sale de
+    # `client_phone`. Es un override, no un reemplazo: el teléfono del que mandó el dinero no
+    # se toca nunca — es lo que leyó el OCR, y es lo que mantiene al origen encontrable en la
+    # búsqueda de la bandeja. Se pone desde «Transferir a otro cliente», que deja además su
+    # fila en `whatsapp_payment_transfers`.
+    owner_client_id = Column(
+        Integer, ForeignKey("whatsapp_clients.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # Comprobante que llegó al chat pero NO es en realidad un pago al negocio (captura
+    # reenviada por error, duplicado del mismo Zelle, plata que el cliente mandó por otra
+    # cosa). Espejo del mismo flag en `WhatsAppOutgoingPayment`, pero el significado es
+    # distinto: ahí es dinero NUESTRO que salió por algo que no es un cambio; aquí es dinero
+    # que NUNCA fue nuestro. Marcarlo desvincula la operación (ver `set_irrelevant`).
+    is_irrelevant = Column(Boolean, nullable=False, server_default="false")
+    irrelevant_description = Column(Text, nullable=True)
     corrected_at = Column(DateTime(timezone=True), nullable=True)
     correction_original = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     operation = relationship("WhatsAppOperation", foreign_keys=[whatsapp_operation_id])
+    owner_client = relationship("WhatsAppClient", foreign_keys=[owner_client_id])
+    # Mudanzas de dueño, de la más vieja a la más nueva: la primera dice de dónde salió.
+    transfers = relationship(
+        "WhatsAppPaymentTransfer",
+        foreign_keys="WhatsAppPaymentTransfer.incoming_payment_id",
+        cascade="all, delete-orphan",
+        order_by="WhatsAppPaymentTransfer.id",
+    )
     # Reparto del pago entre operaciones (un Zelle puede cubrir varios cambios). El FK de
     # arriba es la op principal — la de la asignación mayor — y se mantiene por compatibilidad
     # con el bot y el matcher.
@@ -92,6 +116,8 @@ class WhatsAppIncomingPayment(UUIDMixin, Base):
             "operation_uuid": self.operation.uuid if self.operation else None,
             "fund_group_uuid": self.fund_group.uuid if self.fund_group else None,
             "fund_group_name": self.fund_group.name if self.fund_group else None,
+            "is_irrelevant": 1 if self.is_irrelevant else 0,
+            "irrelevant_description": self.irrelevant_description,
             "corrected_at": self.corrected_at,
             "correction_original": self.correction_original,
             "created_at": self.created_at,
@@ -183,11 +209,32 @@ class WhatsAppOutgoingPayment(UUIDMixin, Base):
     source_payment_id = Column(
         Integer, ForeignKey("whatsapp_incoming_payments.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Dueño explícito del comprobante, cuando NO es quien lo mandó (el esposo pagó por la
+    # esposa, el bot lo pegó al cliente equivocado). NULL = el de siempre, el que sale de
+    # `client_phone`. Es un override, no un reemplazo: el teléfono del que mandó el dinero no
+    # se toca nunca — es lo que leyó el OCR, y es lo que mantiene al origen encontrable en la
+    # búsqueda de la bandeja. Se pone desde «Transferir a otro cliente», que deja además su
+    # fila en `whatsapp_payment_transfers`.
+    owner_client_id = Column(
+        Integer, ForeignKey("whatsapp_clients.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     corrected_at = Column(DateTime(timezone=True), nullable=True)
     correction_original = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     operation = relationship("WhatsAppOperation", foreign_keys=[whatsapp_operation_id])
+    owner_client = relationship("WhatsAppClient", foreign_keys=[owner_client_id])
+    transfers = relationship(
+        "WhatsAppPaymentTransfer",
+        foreign_keys="WhatsAppPaymentTransfer.outgoing_payment_id",
+        cascade="all, delete-orphan",
+        order_by="WhatsAppPaymentTransfer.id",
+    )
+    settlements = relationship(
+        "WhatsAppOutgoingSettlement",
+        back_populates="payment",
+        cascade="all, delete-orphan",
+    )
 
     def dict(self):
         return {
@@ -219,5 +266,61 @@ class WhatsAppOutgoingPayment(UUIDMixin, Base):
             "source_payment_id": self.source_payment_id,
             "corrected_at": self.corrected_at,
             "correction_original": self.correction_original,
+            "created_at": self.created_at,
+        }
+
+
+class WhatsAppOutgoingSettlement(UUIDMixin, Base):
+    """
+    Qué parte del valor de cada operación cubre un comprobante SALIENTE.
+
+    Es el espejo de `WhatsAppPaymentAllocation`, que hace lo mismo del lado entrante. Hacía
+    falta porque el reparto solo existía en una dirección: un cliente que manda dos Zelle
+    (80 y 35) y recibe UN pago de 98.711,4 no se podía representar — el saliente tenía un
+    solo FK y había que elegir a cuál de los dos tratos mentirle.
+
+    Los montos van en la moneda del VALOR de cada operación (80 ZELLE, 35 ZELLE), no en la
+    del comprobante: es la misma convención que tenía `settled_amount` en el pago, del que
+    esta tabla es la generalización. `whatsapp_outgoing_payments.settled_amount` se conserva
+    como el total ya cubierto por el comprobante, y su `whatsapp_operation_id` sigue siendo
+    la operación principal —la de mayor parte—, igual que en los entrantes.
+    """
+    __tablename__ = "whatsapp_outgoing_settlements"
+    __table_args__ = (
+        UniqueConstraint(
+            "outgoing_payment_id", "whatsapp_operation_id", name="uq_settlement_payment_operation"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    outgoing_payment_id = Column(
+        Integer, ForeignKey("whatsapp_outgoing_payments.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    whatsapp_operation_id = Column(
+        Integer, ForeignKey("whatsapp_operations.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    #: En la moneda del valor de la operación.
+    settled_amount = Column(Float, nullable=False)
+    #: Tasa contra la que se comparó al vincular, para que la diferencia siga siendo auditable.
+    settled_reference_rate = Column(Float, nullable=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    payment = relationship("WhatsAppOutgoingPayment", back_populates="settlements")
+    operation = relationship("WhatsAppOperation", foreign_keys=[whatsapp_operation_id])
+    created_by = relationship("User", foreign_keys=[created_by_user_id])
+
+    def dict(self):
+        op = self.operation
+        cp = op.currency_pair if op else None
+        return {
+            "uuid": self.uuid,
+            "settled_amount": self.settled_amount,
+            "settled_reference_rate": self.settled_reference_rate,
+            "operation_uuid": op.uuid if op else None,
+            "operation_status": op.status.value if op and op.status else None,
+            "pair_symbol": cp.pair_symbol if cp else None,
             "created_at": self.created_at,
         }

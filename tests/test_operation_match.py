@@ -9,6 +9,8 @@ camino que corre en producción — estos tests la reemplazan. Si aparece una re
 el caso se agrega AQUÍ.
 """
 
+import pytest
+
 from datetime import datetime, timedelta, timezone
 
 from app.services.operation_match_service import (
@@ -357,8 +359,42 @@ def test_forwarded_tolerance_is_tighter_than_the_outgoing_one():
     assert pick_forwarded_incoming([inc(7, 200.0)], set(), fwd(200.1), NOW) == 7
 
 
-def test_forwarded_outside_60_minute_window_does_not_match():
-    assert pick_forwarded_incoming([inc(7, 200.0, minutes_ago=90)], set(), fwd(200.0), NOW) is None
+def test_forwarded_outside_the_window_does_not_match():
+    assert pick_forwarded_incoming([inc(7, 200.0, minutes_ago=8 * 60)], set(), fwd(200.0), NOW) is None
+
+
+def test_forwarded_matches_hours_later_within_the_window():
+    """El reenvío al grupo es un asiento contable que el operador hace cuando puede. Con la
+    ventana de 60 min, el Zelle de $25 del 2026-08-24 23:39 reenviado a las 00:56 (77 min)
+    no calzaba y quedaba un saliente fantasma (pago 4975)."""
+    assert pick_forwarded_incoming([inc(7, 25.0, minutes_ago=77)], set(), fwd(25.0), NOW) == 7
+
+
+def test_forwarded_zelle_matches_when_only_the_forward_has_a_confirmation():
+    """Son dos capturas de la MISMA transferencia: el cliente manda la pantalla en español,
+    sin código a la vista, y el operador reenvía la de su banco, que sí trae
+    'Confirmation: JLXOWIF757BX'. La igualdad estricta rechazaba el par por un dato que sólo
+    un lado tenía (pago 4975)."""
+    candidates = [inc(7, 25.0, reference=None)]
+    criteria = fwd(25.0, reference="JLXOWIF757BX")
+    assert pick_forwarded_incoming(candidates, set(), criteria, NOW) == 7
+
+
+def test_forwarded_rejects_two_different_confirmations():
+    """Aflojar a «sólo cuando la traen los dos» no puede unir transferencias distintas."""
+    candidates = [inc(7, 25.0, reference="OTRACONF99")]
+    criteria = fwd(25.0, reference="JLXOWIF757BX")
+    assert pick_forwarded_incoming(candidates, set(), criteria, NOW) is None
+
+
+def test_forwarded_non_zelle_still_needs_proof_when_only_one_side_has_a_reference():
+    """Fuera de Zelle el monto no basta: sin referencia en los dos lados, la prueba tiene que
+    ser la huella del OCR."""
+    candidates = [inc(7, 500.0, currency="BRL", reference=None, raw_text="Comprovante PIX 14:32")]
+    criteria = fwd(500.0, currency="BRL", reference="E2E-778", raw_text="Comprovante PIX 15:07")
+    assert pick_forwarded_incoming(candidates, set(), criteria, NOW) is None
+    misma = fwd(500.0, currency="BRL", reference="E2E-778", raw_text="Comprovante PIX 14:32")
+    assert pick_forwarded_incoming(candidates, set(), misma, NOW) == 7
 
 
 def test_forwarded_skips_an_already_reused_incoming():
@@ -384,6 +420,31 @@ def test_forwarded_disambiguates_by_identification():
     got = pick_forwarded_incoming(candidates, set(), fwd(200.0, identification="V87654321"), NOW)
     assert got == 8
 
+def test_forwarded_non_zelle_ocr_fingerprint_breaks_on_a_single_misread_character():
+    """
+    HALLAZGO (agente 5, 2026-09-03): la huella del OCR (`receipt_fingerprint`) solo
+    normaliza espacios y mayúsculas — es igualdad de texto EXACTA. Dos lecturas de Tesseract
+    sobre la MISMA imagen (una del chat del cliente, otra de la que reenvía el operador al
+    grupo, a veces recomprimida por WhatsApp al reenviar) casi nunca producen el carácter por
+    carácter idéntico: basta que UNA cifra se lea distinto (el clásico O/0, o un separador de
+    miles) para que la huella no calce. Sin referencia bancaria en el comprobante (Pix,
+    Pago Móvil, muchos bancos VE no la imprimen fuera de "Referencia:"), la huella es la
+    ÚNICA prueba fuera de Zelle — así que este typo de un carácter hace que
+    `pick_forwarded_incoming` trate el reenvío como un pago NUEVO en vez de la reposición del
+    mismo comprobante, con el mismo resultado que ya costó el caso BRL→VES de 2026-08-06:
+    un saliente fantasma sumado al pago real.
+    """
+    candidates = [inc(7, 500.0, currency="BRL", raw_text="Comprovante PIX R$ 500,00 13/07 14:32")]
+    # Un solo carácter distinto (O en vez de 0 en el segundo cero del monto) — el mismo
+    # comprobante, la misma imagen, una segunda pasada de Tesseract.
+    criteria = fwd(500.0, currency="BRL", raw_text="Comprovante PIX R$ 5O0,00 13/07 14:32")
+    assert pick_forwarded_incoming(candidates, set(), criteria, NOW) is None, (
+        "Documentando el estado ACTUAL: la huella exacta no perdona un solo carácter de OCR "
+        "ruidoso. Si esto empieza a fallar, alguien ya lo arregló con matching difuso — "
+        "genial, pero hay que revisar que no una comprobantes que NO son el mismo."
+    )
+
+
 
 # ---------------------------------------------------------------------------
 # Capa con BD (OperationMatchService) — necesita Postgres local; si no, se salta
@@ -407,19 +468,23 @@ def test_service_ranks_a_real_payment_against_real_operations(db, fund, client, 
     out = f.outgoing(db, 1005.44, "BRL")
     db.flush()
 
-    scored, suggestion = OperationMatchService(db).rank_for_payment(out.id, "outgoing")
+    result = OperationMatchService(db).rank_for_payment(out.id, "outgoing")
 
-    assert scored, "el servicio debe devolver candidatas desde la BD"
-    assert suggestion is not None
-    assert str(suggestion.uuid) == str(created["uuid"])
-    assert suggestion.confident
+    assert result.items, "el servicio debe devolver candidatas desde la BD"
+    assert result.total == len(result.items)
+    assert result.suggestion is not None
+    assert str(result.suggestion.uuid) == str(created["uuid"])
+    assert result.suggestion.confident
+    # La sugerida encabeza la página en el orden por defecto ("suggested").
+    top_op, _ = result.items[0]
+    assert str(top_op.uuid) == str(created["uuid"])
 
 
 def test_service_returns_nothing_for_an_unknown_payment(db):
     from app.services.operation_match_service import OperationMatchService
 
-    scored, suggestion = OperationMatchService(db).rank_for_payment(999_999, "outgoing")
-    assert scored == [] and suggestion is None
+    result = OperationMatchService(db).rank_for_payment(999_999, "outgoing")
+    assert result.items == [] and result.suggestion is None and result.total == 0
 
 
 def test_service_auto_match_finds_the_operation_by_client_phone(db, fund, client, operator):
@@ -512,3 +577,176 @@ def test_service_auto_match_reaches_the_anonymous_operations_of_a_partner(db, fu
         OutgoingCriteria(amount=7612.17, currency="VES"), phone=phone
     )
     assert matched is not None and matched.id == op_row.id
+
+
+def test_an_operation_born_from_a_partial_payout_still_suggests_itself_to_its_siblings(
+    db, fund, client, operator
+):
+    """
+    El caso real (op 3898, 2026-08-27): 350 → 315.000 Bs pagados con TRES pagos móviles.
+    El operador arma la operación desde el primero (65.723 Bs, ~73 USD) y luego quiere
+    engancharle los otros dos, pero la operación no aparecía entre las sugeridas.
+
+    Crear la op desde un comprobante de salida afirmaba que ese pago la cubría ENTERA: el
+    pendiente quedaba en cero, el prorrateo de `expected_amount` no se activaba y los otros
+    comprobantes se comparaban contra los 315.000 completos, fuera de toda tolerancia.
+    """
+    from app.services.operation_match_service import OperationMatchService
+    from app.services.whatsapp_payment_service import WhatsAppPaymentService
+    from tests import factories as f
+
+    payment_service = WhatsAppPaymentService(db)
+    primero = f.outgoing(db, 65_723, "VES", phone="584148861273")
+    op = f.create_op_from_payment(
+        payment_service, "outgoing", primero, frm="ZELLE", to="VES",
+        from_amount=350, to_amount=315_000, recorded_by=operator.id,
+    )
+
+    # Cubre lo suyo a la tasa de la op (65.723 / 900 ≈ 73,03), no los 350 enteros.
+    assert op["delivered_amount"] == pytest.approx(73.03, abs=0.01)
+    assert op["pending_amount"] == pytest.approx(276.97, abs=0.01)
+
+    # El segundo pago móvil cubre justo el pendiente prorrateado (315.000 × 276,97/350).
+    segundo = f.outgoing(db, 250_000, "VES", phone="584148861273")
+    db.flush()
+    result = OperationMatchService(db).rank_for_payment(segundo.id, "outgoing")
+
+    assert result.suggestion is not None, "la op con saldo pendiente tiene que aparecer entre las sugeridas"
+    assert str(result.suggestion.uuid) == str(op["uuid"])
+
+
+def test_an_operation_paid_in_full_by_one_receipt_is_settled_whole(db, fund, client, operator):
+    """
+    Guardarraíl del corte: cuando el comprobante SÍ es la pata que sale, la operación nace
+    saldada y con el valor que puso el operador —incluido el descuento, que es a propósito—.
+    """
+    from app.services.whatsapp_payment_service import WhatsAppPaymentService
+    from tests import factories as f
+
+    payment_service = WhatsAppPaymentService(db)
+    pago = f.outgoing(db, 315_000, "VES", phone="584148861273")
+    op = f.create_op_from_payment(
+        payment_service, "outgoing", pago, frm="ZELLE", to="VES",
+        from_amount=350, to_amount=315_000, recorded_by=operator.id,
+    )
+    assert op["delivered_amount"] == pytest.approx(350, abs=0.01)
+    assert op["pending_amount"] == pytest.approx(0, abs=0.01)
+
+
+def test_the_bank_code_no_longer_drags_the_wrong_operation_back_in():
+    """
+    Caso real (pago 5079, 2026-08-27): dos tratos del mismo monto, mismo banco, personas
+    distintas. La cédula y el teléfono señalan uno solo, pero el 0102 —que comparten— hacía
+    que los dos «coincidieran» y el bot se abstenía. Banco de Venezuela es el 0102: emparejar
+    por ahí no distingue nada.
+    """
+    candidates = [
+        op("op-otra", 15826.496, notes="0102\nV30166167\n04147925265"),
+        op("op-buena", 15826.496, notes="0102\nV14110025\n04221411002"),
+    ]
+    c = criteria(15826.5, identification="V14110025", phone_to="04221411002", bank_to="0102")
+    assert pick_auto_match(candidates, c, NOW) == "op-buena"
+
+
+def test_the_best_match_wins_over_a_partial_one():
+    """Gana la que calza en MÁS datos, no «la única que calza en alguno»."""
+    candidates = [
+        op("op-a-medias", 500.0, notes="0134\nV14110025\n04140000000"),
+        op("op-completa", 500.0, notes="0102\nV14110025\n04221411002"),
+    ]
+    c = criteria(500.0, identification="V14110025", phone_to="04221411002")
+    assert pick_auto_match(candidates, c, NOW) == "op-completa"
+
+
+def test_a_tie_at_the_top_is_still_ambiguous():
+    """Dos que calzan igual de bien siguen siendo dudosas: el bot no adivina."""
+    candidates = [
+        op("op-1", 500.0, notes="V14110025"),
+        op("op-2", 500.0, notes="V14110025"),
+    ]
+    c = criteria(500.0, identification="V14110025")
+    assert pick_auto_match(candidates, c, NOW) is None
+
+
+# ---------------------------------------------------------------------------
+# Task 1: lo que le falta cobrar del lado entrante
+# ---------------------------------------------------------------------------
+
+
+def test_candidate_missing_incoming_defaults_to_from_amount():
+    """Sin comprobantes entrantes, lo que falta cobrar es el lado `from` entero."""
+    c = op("a", 14757.0, from_amount=100.0)
+    assert c.collected_incoming == 0.0
+    assert c.missing_incoming == 100.0
+
+
+def test_candidate_missing_incoming_subtracts_what_is_already_allocated():
+    c = op("a", 14757.0, from_amount=100.0, collected_incoming=40.0)
+    assert c.missing_incoming == 60.0
+
+
+# ---------------------------------------------------------------------------
+# Task 2: elegibilidad por faltante y clase de cobertura
+# ---------------------------------------------------------------------------
+
+
+def test_incoming_closes_when_the_receipt_leaves_nothing_missing():
+    from app.services.operation_match_service import incoming_coverage
+
+    assert incoming_coverage(100.0, 100.0) == "CLOSES"
+    assert incoming_coverage(100.5, 100.0) == "CLOSES"   # dentro del 1%
+
+
+def test_incoming_is_partial_when_the_receipt_fits_inside_what_is_missing():
+    from app.services.operation_match_service import incoming_coverage
+
+    assert incoming_coverage(500.0, 100.0) == "PARTIAL"
+
+
+def test_incoming_is_not_a_candidate_when_the_receipt_exceeds_what_is_missing():
+    """Eso es saldo a favor, no una sugerencia."""
+    from app.services.operation_match_service import incoming_coverage
+
+    assert incoming_coverage(60.0, 100.0) is None
+    assert incoming_coverage(0.0, 100.0) is None
+
+
+def test_closing_beats_a_much_more_recent_partial():
+    """La clase manda sobre el puntaje: el cierre viejo le gana al abono reciente."""
+    cierra = op("cierra", 14757.0, from_amount=100.0, minutes_ago=300)
+    abona = op("abona", 73785.0, from_amount=500.0, minutes_ago=10)
+    ranked = rank_candidates([abona, cierra], criteria(100.0, currency="USDT"), "incoming", NOW)
+    sug = pick_suggestion(ranked)
+    assert sug is not None and sug.uuid == "cierra" and sug.confident
+
+
+def test_a_fully_covered_operation_is_not_a_candidate():
+    cubierta = op("cubierta", 14757.0, from_amount=100.0, collected_incoming=100.0)
+    ranked = rank_candidates([cubierta], criteria(100.0, currency="USDT"), "incoming", NOW)
+    assert pick_suggestion(ranked) is None
+
+
+def test_two_closing_candidates_are_suggested_but_not_confident():
+    a = op("a", 14757.0, from_amount=100.0, minutes_ago=3)
+    b = op("b", 14757.0, from_amount=100.0, minutes_ago=3)
+    ranked = rank_candidates([a, b], criteria(100.0, currency="USDT"), "incoming", NOW)
+    sug = pick_suggestion(ranked)
+    assert sug is not None and not sug.confident
+
+
+def test_outgoing_ranking_is_untouched_by_coverage():
+    """El lado saliente no conoce las clases: su `coverage` es None."""
+    ranked = rank_candidates([op("a", 14757.0)], criteria(14757.0), "outgoing", NOW)
+    assert ranked[0].coverage is None
+    assert ranked[0].within_tolerance
+
+
+def test_an_operation_this_receipt_cannot_cover_sinks_below_a_partial():
+    """
+    El cajón enseña la lista entera, no solo la sugerencia: lo que no se puede cubrir va al
+    fondo, por debajo de la que sí recibe un abono, aunque sea más reciente.
+    """
+    cubierta = op("cubierta", 14757.0, from_amount=100.0, collected_incoming=100.0, minutes_ago=1)
+    abona = op("abona", 73785.0, from_amount=500.0, minutes_ago=200)
+    ranked = rank_candidates([cubierta, abona], criteria(100.0, currency="USDT"), "incoming", NOW)
+    assert [s.uuid for s in ranked] == ["abona", "cubierta"]

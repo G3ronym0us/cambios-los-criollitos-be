@@ -1,7 +1,16 @@
+# Los logs se rotan por servicio a propósito. Sin límite, el json-file del backend llegó a
+# 427 MB y el de celery a 237 MB, y el disco del EC2 (19 GB) se llenaba hasta hacer fallar el
+# build del deploy. El default del daemon en /etc/docker/daemon.json dice lo mismo, pero eso
+# vive fuera del repo y no se puede comprobar desde un `docker inspect`.
 version: '3.8'
 
 services:
   backend:
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     build: .
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     ports:
@@ -22,6 +31,11 @@ services:
       - tasas_network
 
   db:
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     image: postgres:15-alpine
     environment:
       POSTGRES_DB: tasas_db
@@ -36,6 +50,11 @@ services:
       - tasas_network
 
   redis:
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     image: redis:7-alpine
     ports:
       - "6380:6379"
@@ -44,6 +63,11 @@ services:
       - tasas_network
 
   celery_worker:
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     build: .
     command: celery -A app.tasks.scraping_tasks.celery_app worker --loglevel=info
     environment:
@@ -62,6 +86,11 @@ services:
       - tasas_network
 
   celery_beat:
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     build: .
     command: celery -A app.tasks.scraping_tasks.celery_app beat --loglevel=info
     environment:

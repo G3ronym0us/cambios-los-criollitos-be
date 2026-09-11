@@ -1,0 +1,643 @@
+"""
+Lo que le debemos al cliente: agregado por par, y las entregas que lo saldan.
+
+«Por entregar» es el trozo del valor de una operación que ningún comprobante de salida
+cubre todavía — el mismo `missing` que el listado de Operaciones llama «por cuadrar»
+(`needs=settle`), leído desde el lado del cliente en vez del de la operación.
+
+    missing = valor − entregado − hueco declarado
+
+**Cuidado con el nombre**: la tarjeta «por entregar» del listado de Operaciones es OTRA
+cosa (`delivery_status`, el efectivo que falta mover en mano). Aquí, y en el módulo de
+Clientes entero, «por entregar» es `missing > 0` **y su dinero ya entró**.
+
+Esa segunda condición es la que separa una deuda de un trato en el papel. `missing` sale
+de los comprobantes de SALIDA: mide lo que no le hemos pagado. Pero no le debemos nada
+hasta que su plata llega — una operación registrada sin comprobante entrante es una
+cotización o un trato a medio armar, no una deuda. Contarlas mezclaba las dos patas del
+cambio y hacía que la lista pidiera pagar cosas que nadie había pagado todavía.
+
+**En los pares que se cambian en efectivo** (`CurrencyPair.settles_in_cash`) todo esto se
+da la vuelta, y no es un matiz: es la otra pata del trato. Ahí los bolívares ya salieron y
+lo que falta es el efectivo del CLIENTE, así que lo pendiente no se mide con `missing` sino
+con `to_collect` — el valor menos lo que ya se le recogió (`collected_amount`).
+
+Medirlo con `missing` era el bug que vació la cola justo de lo que había que cobrar: una
+USD-VES creada desde su propio comprobante en bolívares nace cubierta (`missing = 0`) sin
+que nadie haya recogido un dólar, así que salía de la lista el mismo día en que empezaba a
+deberse. Las que sí aparecían eran las contrarias —aquellas a las que aún no les habíamos
+atado el comprobante—, que es la pata nuestra, no la suya.
+
+El comprobante entrante tampoco sirve de filtro ahí: no hay ni habrá —nadie fotografía un
+billete—, y exigirlo borraba el par entero (USD-VES: 134 operaciones sin cuadrar y CERO con
+entrante). Lo separa el ESTADO: cuenta lo que está en PENDING —un trato registrado— y no lo
+que sigue en QUOTED, que es una cotización que nadie confirmó.
+
+Por eso el par viaja en cada entrada (`settles_in_cash`), para que la pantalla sepa si eso
+que enseña es lo que debemos o lo que nos deben.
+
+**La moneda**: `missing` va en la moneda del VALOR del trato (lo que entrega el cliente:
+los USD de un USD/VES), no en la moneda con la que se le paga. Es la cifra exacta, la que
+se suma y por la que se ordena. El equivalente en moneda de pago sale de la proporción del
+propio trato y viaja aparte, para enseñarse con «≈» — nunca para sumarse.
+"""
+
+from datetime import datetime, timezone
+from typing import Iterable, Optional
+from uuid import UUID
+
+from sqlalchemy import Float, and_, case, func, or_
+from sqlalchemy.orm import Session, selectinload
+
+from app.models.currency_pair import CurrencyPair
+from app.models.user import User
+from app.models.whatsapp_client import WhatsAppClient
+from app.models.whatsapp_operation import (
+    WhatsAppDeliveryStatus,
+    WhatsAppOperation,
+    WhatsAppOperationStatus,
+)
+from app.models.whatsapp_payment import (
+    WhatsAppIncomingPayment,
+    WhatsAppOutgoingPayment,
+    WhatsAppOutgoingSettlement,
+    WhatsAppPaymentAllocation,
+)
+from app.models.whatsapp_pending_delivery import (
+    COLLECTION_KIND,
+    DELIVERY_KIND,
+    WhatsAppPendingDelivery,
+    WhatsAppPendingDeliveryItem,
+)
+from app.schemas.whatsapp import WhatsAppOperationComplete
+from app.services.whatsapp_quote_service import QuoteServiceError, WhatsAppQuoteService
+
+#: Debajo de esto es ruido de redondeo, no deuda. Igual que en el front.
+EPSILON = 0.01
+
+#: Motivo con el que se declara el hueco de una entrega sin comprobante.
+DELIVERY_REASON = "CASH"
+
+
+class ClientPendingService:
+    def __init__(self, db: Session):
+        self.db = db
+
+    # ── Lectura ──────────────────────────────────────────────────────────────
+
+    def _settled_subquery(self):
+        """Cuánto cubren ya los comprobantes de cada operación, agregado en SQL."""
+        return (
+            self.db.query(
+                WhatsAppOutgoingSettlement.whatsapp_operation_id.label("op_id"),
+                func.coalesce(func.sum(WhatsAppOutgoingSettlement.settled_amount), 0).label(
+                    "delivered"
+                ),
+            )
+            .group_by(WhatsAppOutgoingSettlement.whatsapp_operation_id)
+            .subquery()
+        )
+
+    def _first_outgoing_subquery(self):
+        """
+        Cuándo salió NUESTRA plata en cada operación: su primer comprobante de salida.
+
+        Va por `whatsapp_outgoing_settlements` y no por el FK del comprobante, que es la
+        misma razón por la que lo hace `_settled_subquery`: un saliente repartido entre dos
+        operaciones sólo apunta con el FK a una de ellas.
+        """
+        return (
+            self.db.query(
+                WhatsAppOutgoingSettlement.whatsapp_operation_id.label("op_id"),
+                func.min(WhatsAppOutgoingPayment.created_at).label("paid_at"),
+            )
+            .join(
+                WhatsAppOutgoingPayment,
+                WhatsAppOutgoingPayment.id == WhatsAppOutgoingSettlement.outgoing_payment_id,
+            )
+            .group_by(WhatsAppOutgoingSettlement.whatsapp_operation_id)
+            .subquery()
+        )
+
+    def _first_incoming_subquery(self):
+        """
+        Cuándo entró el dinero de cada operación: su primer comprobante entrante.
+
+        Mira los dos vínculos posibles —el FK del pago y el reparto— porque un Zelle
+        repartido entre dos cambios sólo tiene FK a uno de ellos.
+        """
+        direct = self.db.query(
+            WhatsAppIncomingPayment.whatsapp_operation_id.label("op_id"),
+            WhatsAppIncomingPayment.created_at.label("paid_at"),
+        ).filter(WhatsAppIncomingPayment.whatsapp_operation_id.isnot(None))
+
+        allocated = (
+            self.db.query(
+                WhatsAppPaymentAllocation.whatsapp_operation_id.label("op_id"),
+                WhatsAppIncomingPayment.created_at.label("paid_at"),
+            )
+            .join(
+                WhatsAppIncomingPayment,
+                WhatsAppIncomingPayment.id == WhatsAppPaymentAllocation.incoming_payment_id,
+            )
+        )
+
+        union = direct.union_all(allocated).subquery()
+        return (
+            self.db.query(
+                union.c.op_id.label("op_id"),
+                func.min(union.c.paid_at).label("paid_at"),
+            )
+            .group_by(union.c.op_id)
+            .subquery()
+        )
+
+    def _pending_query(self, pair: Optional[str] = None):
+        """
+        La consulta base de lo sin cubrir, ya unida a lo que hace falta para agregarla.
+
+        Devuelve `(query, missing, since)` para que quien la use elija qué proyectar sin
+        rearmar los joins.
+
+        El filtro sobre los comprobantes entrantes es lo que implementa «sólo debemos lo
+        que ya nos pagaron». Quitarlo volvería a meter en la deuda las operaciones que nadie
+        ha pagado; el único que se libra es el par de efectivo, donde ese comprobante no
+        existe por definición.
+        """
+        settled = self._settled_subquery()
+        paid = self._first_incoming_subquery()
+        sent = self._first_outgoing_subquery()
+
+        value = func.coalesce(WhatsAppOperation.amount, WhatsAppOperation.from_amount)
+        # Dos patas, dos cuentas — y el par decide cuál se debe.
+        #
+        # En un par normal lo que falta es lo NUESTRO: el valor menos lo que cubren los
+        # comprobantes de salida y menos el hueco declarado. En uno de efectivo lo que falta
+        # es lo del CLIENTE: el valor menos el efectivo ya recogido. Restar allí lo cubierto
+        # daba cero justo en las operaciones que sí hay que ir a cobrar —las que nacen de su
+        # propio comprobante en bolívares, cubiertas desde el primer segundo—, y por eso el
+        # par entero desaparecía de la cola en cuanto se pagaba.
+        missing = case(
+            (
+                CurrencyPair.settles_in_cash.is_(True),
+                value - func.coalesce(WhatsAppOperation.collected_amount, 0),
+            ),
+            else_=(
+                value
+                - func.coalesce(settled.c.delivered, 0)
+                - func.coalesce(WhatsAppOperation.uncovered_amount, 0)
+            ),
+        )
+        # La antigüedad se mide desde que se movió el dinero, nunca desde que se registró la
+        # operación: una que el bot no reconoció se teclea a mano días después, y ordenar por
+        # `created_at` manda al final de la cola justo las más viejas.
+        #
+        # Primero el entrante, que es el que abre la deuda en un par normal. Si no lo hay
+        # —los pares de efectivo, donde de un billete no existe comprobante— manda la SALIDA:
+        # los bolívares que ya mandamos son el único hecho fechado de esa operación. Sin ese
+        # segundo escalón una tanda registrada a mano en el mismo minuto salía entera con la
+        # misma espera, la del tecleo. `created_at` queda de último recurso.
+        since = func.coalesce(paid.c.paid_at, sent.c.paid_at, WhatsAppOperation.created_at)
+
+        q = (
+            self.db.query(WhatsAppOperation)
+            .join(CurrencyPair, CurrencyPair.id == WhatsAppOperation.currency_pair_id)
+            .outerjoin(settled, settled.c.op_id == WhatsAppOperation.id)
+            .outerjoin(paid, paid.c.op_id == WhatsAppOperation.id)
+            .outerjoin(sent, sent.c.op_id == WhatsAppOperation.id)
+            .filter(
+                WhatsAppOperation.status.in_(
+                    [WhatsAppOperationStatus.PENDING, WhatsAppOperationStatus.QUOTED]
+                ),
+                missing > EPSILON,
+                # «Sólo debemos lo que ya nos pagaron», excepto en los pares de efectivo,
+                # donde el comprobante entrante no existe y exigirlo borraría el par entero.
+                #
+                # Ahí el comprobante deja de poder separar el trato hecho de la cotización
+                # abandonada, así que lo separa el estado: sólo PENDING. Una QUOTED de un par
+                # de efectivo no tiene NINGUNA evidencia de que pasara nada — en USD-VES son
+                # 106 cotizaciones muertas que se colarían como deuda.
+                or_(
+                    paid.c.paid_at.isnot(None),
+                    and_(
+                        CurrencyPair.settles_in_cash.is_(True),
+                        WhatsAppOperation.status == WhatsAppOperationStatus.PENDING,
+                    ),
+                ),
+            )
+        )
+        if pair:
+            q = q.filter(CurrencyPair.pair_symbol == pair)
+        return q, missing, since
+
+    def client_ids_with_pending(self, pair: Optional[str] = None) -> list[int]:
+        """Los clientes a los que hoy les debemos algo. Para el filtro del listado."""
+        q, _, _ = self._pending_query(pair)
+        rows = q.with_entities(WhatsAppOperation.client_id).distinct().all()
+        return [r[0] for r in rows if r[0] is not None]
+
+    def pending_by_client_ids(
+        self, client_ids: Iterable[int], pair: Optional[str] = None
+    ) -> dict[int, list[dict]]:
+        """
+        La deuda de cada cliente agrupada por par, resuelta en UNA consulta.
+
+        Agrupar por par y no dar un total único es deliberado: USD, VES y USDT no se suman
+        sin inventarse una tasa. La moneda de cada grupo sale del par, que es lo que la hace
+        homogénea.
+
+        `payout_amount` se cae a `None` en cuanto una sola operación del grupo no se pueda
+        convertir: media suma miente más que ninguna.
+        """
+        ids = [i for i in client_ids if i is not None]
+        if not ids:
+            return {}
+
+        q, missing, since = self._pending_query(pair)
+        # La proporción del propio trato, que es la conversión honesta: no hay que adivinar
+        # de qué lado va la tasa ni leer `inverse_percentage`.
+        payout = func.cast(missing, Float) * WhatsAppOperation.to_amount / func.nullif(
+            WhatsAppOperation.from_amount, 0
+        )
+
+        rows = (
+            q.filter(WhatsAppOperation.client_id.in_(ids))
+            .with_entities(
+                WhatsAppOperation.client_id.label("client_id"),
+                CurrencyPair.id.label("pair_id"),
+                func.sum(missing).label("amount"),
+                func.count(WhatsAppOperation.id).label("operations"),
+                func.min(since).label("oldest_at"),
+                func.sum(payout).label("payout_amount"),
+                # Cuántas se pudieron convertir: si no son todas, el equivalente del grupo
+                # entero deja de ser cierto.
+                func.count(payout).label("convertible"),
+            )
+            .group_by(WhatsAppOperation.client_id, CurrencyPair.id)
+            .all()
+        )
+
+        pairs = {
+            p.id: p
+            for p in self.db.query(CurrencyPair)
+            .filter(CurrencyPair.id.in_({r.pair_id for r in rows}))
+            .options(
+                selectinload(CurrencyPair.from_currency),
+                selectinload(CurrencyPair.to_currency),
+            )
+            .all()
+        }
+
+        result: dict[int, list[dict]] = {}
+        for row in rows:
+            cp = pairs.get(row.pair_id)
+            whole = row.convertible == row.operations
+            result.setdefault(row.client_id, []).append(
+                {
+                    "pair_symbol": cp.pair_symbol if cp else None,
+                    # En un par de efectivo esto no es lo que debemos sino lo que nos deben:
+                    # la pantalla necesita el dato para no rotularlo al revés.
+                    "settles_in_cash": bool(cp.settles_in_cash) if cp else False,
+                    "currency": cp.from_currency.symbol if cp and cp.from_currency else None,
+                    "amount": round(float(row.amount or 0), 2),
+                    "operations": int(row.operations or 0),
+                    "oldest_at": row.oldest_at,
+                    "payout_currency": cp.to_currency.symbol if cp and cp.to_currency else None,
+                    "payout_amount": (
+                        round(float(row.payout_amount), 2)
+                        if whole and row.payout_amount is not None
+                        else None
+                    ),
+                }
+            )
+
+        # De mayor a menor deuda, que es el orden en que se lee.
+        for entries in result.values():
+            entries.sort(key=lambda e: e["amount"], reverse=True)
+        return result
+
+    def pending_overview(self, top_n: int = 3) -> dict:
+        """
+        Lo que le debemos a los clientes, para la home de admin: cuántos, cuánto por moneda, y
+        quiénes llevan más esperando.
+
+        Compone sobre `client_ids_with_pending` + `pending_by_client_ids` — las dos ya
+        agregan en SQL por cliente×par (nunca traen el pago crudo). El fold final por moneda
+        y el top de más viejos corren en Python, pero sobre ESE resultado ya reducido a un
+        puñado de filas (clientes × pares), no sobre las operaciones u origenes uno por uno.
+        """
+        client_ids = self.client_ids_with_pending()
+        if not client_ids:
+            return {"pending_count": 0, "totals": [], "oldest": []}
+
+        grouped = self.pending_by_client_ids(client_ids)
+
+        totals_by_currency: dict[str, float] = {}
+        # (client_id, entrada) aplanado: cada cliente puede aparecer una vez por par/moneda.
+        flat: list[tuple[int, dict]] = []
+        for client_id, items in grouped.items():
+            for item in items:
+                currency = item["currency"] or "?"
+                totals_by_currency[currency] = round(
+                    totals_by_currency.get(currency, 0.0) + item["amount"], 2
+                )
+                flat.append((client_id, item))
+
+        totals = [
+            {"currency": currency, "amount": amount}
+            for currency, amount in sorted(totals_by_currency.items(), key=lambda kv: -kv[1])
+        ]
+
+        flat.sort(key=lambda ce: ce[1]["oldest_at"] or datetime.max.replace(tzinfo=timezone.utc))
+        top = flat[:top_n]
+        names = {
+            c.id: c.display_name
+            for c in self.db.query(WhatsAppClient)
+            .filter(WhatsAppClient.id.in_({client_id for client_id, _ in top}))
+            .all()
+        }
+
+        now = datetime.now(timezone.utc)
+        oldest = []
+        for client_id, item in top:
+            oldest_at = item["oldest_at"]
+            waiting_days = None
+            if oldest_at is not None:
+                since = oldest_at if oldest_at.tzinfo else oldest_at.replace(tzinfo=timezone.utc)
+                waiting_days = max((now - since).days, 0)
+            oldest.append({
+                "name": names.get(client_id) or "Cliente sin nombre",
+                "waiting_days": waiting_days,
+                "amount": item["amount"],
+                "currency": item["currency"],
+            })
+
+        return {"pending_count": len(client_ids), "totals": totals, "oldest": oldest}
+
+    # ── Escritura ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _as_uuid(value) -> UUID:
+        """Acepta un UUID o su texto: el servicio es público y lo llaman los dos."""
+        if isinstance(value, UUID):
+            return value
+        try:
+            return UUID(str(value))
+        except (TypeError, ValueError):
+            raise QuoteServiceError("invalid_uuid", f"UUID inválido: {value}", 400)
+
+    def _client_or_404(self, client_uuid: UUID) -> WhatsAppClient:
+        client = (
+            self.db.query(WhatsAppClient)
+            .filter(WhatsAppClient.uuid == self._as_uuid(client_uuid))
+            .first()
+        )
+        if client is None:
+            raise QuoteServiceError("client_not_found", "Cliente no encontrado", 404)
+        return client
+
+    @staticmethod
+    def _settles_in_cash(op: WhatsAppOperation) -> bool:
+        cp = op.currency_pair
+        return bool(cp.settles_in_cash) if cp else False
+
+    def _pending_amount(self, op: WhatsAppOperation) -> float:
+        """Lo que falta de esta operación: el efectivo del cliente, o lo que no cubrimos."""
+        if self._settles_in_cash(op):
+            return op.to_collect
+        value = op.amount if op.amount is not None else op.from_amount
+        return round(
+            float(value or 0) - op.delivered_amount - float(op.uncovered_amount or 0), 2
+        )
+
+    def _close_collected(self, op: WhatsAppOperation, actor: Optional[User]) -> None:
+        """
+        Cierra la operación cuyo efectivo ya está recogido entero.
+
+        Es lo que faltaba para que el gesto significara algo: marcar «ya me pagó» escribía
+        el hueco y dejaba la operación en PENDING, así que Pagos la seguía enseñando
+        pendiente para siempre y la cuenta del cliente no cuadraba con ella. Recoger el
+        último dólar es exactamente lo que hace `mark_delivered` desde el detalle, y hace
+        falta lo mismo: estado, fecha de entrega y su transacción.
+        """
+        if actor is None:
+            raise QuoteServiceError(
+                "collect_user_required",
+                "Falta el usuario que registra el cobro",
+                400,
+            )
+
+        now = datetime.now(timezone.utc)
+        if op.delivery_status == WhatsAppDeliveryStatus.PENDING:
+            op.delivery_status = WhatsAppDeliveryStatus.RECEIVED
+            op.delivered_at = now
+        if op.status != WhatsAppOperationStatus.COMPLETED:
+            op.status = WhatsAppOperationStatus.COMPLETED
+            op.completed_at = now
+
+        tx = WhatsAppQuoteService(self.db)._create_transaction_for_op(
+            op, WhatsAppOperationComplete(), actor
+        )
+        op.transaction_id = tx.id
+        tx.completed_at = op.completed_at
+
+    def _reopen_collected(self, op: WhatsAppOperation, item) -> None:
+        """
+        Devuelve al estado previo la operación que un cobro había cerrado.
+
+        La transacción NO se borra: se quedó atada a la operación y volverá a sincronizarse
+        cuando se cobre de nuevo (`_create_transaction_for_op` actualiza la que ya existe).
+        Borrarla desde aquí sería tocar los libros para deshacer una marca de pantalla.
+        """
+        if item.previous_status:
+            op.status = WhatsAppOperationStatus(item.previous_status)
+            if op.status != WhatsAppOperationStatus.COMPLETED:
+                op.completed_at = None
+        if item.previous_delivery_status:
+            op.delivery_status = WhatsAppDeliveryStatus(item.previous_delivery_status)
+            if op.delivery_status != WhatsAppDeliveryStatus.RECEIVED:
+                op.delivered_at = None
+
+    def deliver(
+        self,
+        client_uuid: UUID,
+        items: list[dict],
+        note: Optional[str],
+        actor: Optional[User],
+    ) -> dict:
+        """
+        Salda a mano un lote de operaciones: lo que le entregamos, o lo que nos pagó.
+
+        **El gesto lo decide el par de cada operación, no quien llama.** En un par que se
+        cambia en efectivo lo que se marca es que el CLIENTE trajo sus billetes
+        (`collected_amount`), y recoger el último cierra la operación. En cualquier otro se
+        declara cubierto un trozo del valor sin comprobante que lo respalde
+        (`uncovered_amount`). Un mismo lote puede llevar de los dos —un cliente tiene las
+        dos cosas a la vez— y por eso el tipo va en cada fila.
+
+        **O todas o ninguna.** Una entrega a medias es peor que un error: deja dinero
+        marcado sin que nadie sepa cuánto, así que cualquier problema levanta y no se
+        guarda nada.
+
+        Las dos columnas guardan el TOTAL de la operación y no un incremento: lo marcado se
+        SUMA a lo que ya hubiera. Antes de tocarlo se guarda el valor previo en la fila del
+        lote, que es lo único que permite deshacer de verdad.
+        """
+        client = self._client_or_404(client_uuid)
+        if not items:
+            raise QuoteServiceError("empty_delivery", "No hay operaciones que entregar", 400)
+
+        delivery = WhatsAppPendingDelivery(
+            client_id=client.id,
+            note=(note or None),
+            created_by_user_id=actor.id if actor else None,
+        )
+        self.db.add(delivery)
+
+        seen: set = set()
+        for item in items:
+            op_uuid = self._as_uuid(item.get("operation_uuid"))
+            if op_uuid in seen:
+                raise QuoteServiceError(
+                    "duplicate_operation",
+                    f"La operación {op_uuid} viene dos veces en el mismo lote",
+                    400,
+                )
+            seen.add(op_uuid)
+
+            op = (
+                self.db.query(WhatsAppOperation)
+                .filter(WhatsAppOperation.uuid == op_uuid)
+                .first()
+            )
+            if op is None:
+                raise QuoteServiceError("operation_not_found", f"Operación {op_uuid} no encontrada", 404)
+            if op.client_id != client.id:
+                raise QuoteServiceError(
+                    "operation_client_mismatch",
+                    f"La operación {op_uuid} no es de este cliente",
+                    400,
+                )
+            if op.status == WhatsAppOperationStatus.CANCELLED:
+                raise QuoteServiceError(
+                    "operation_cancelled",
+                    f"La operación {op_uuid} está cancelada",
+                    409,
+                )
+            # Entregarle a alguien que no sabemos quién es no es entregar. La regla vive
+            # acá y no sólo en el front: el front la usa para no ofrecerlas.
+            #
+            # **Salvo en los pares de efectivo**, donde el gesto está invertido: los bolívares
+            # ya salieron y lo que se registra es que el CLIENTE pagó. A quién se le entregó
+            # lo dice el comprobante saliente, que ya cuelga de la operación; el campo sobra.
+            # Exigirlo aquí trababa 117 de 120 filas de USD-VES con «Falta dato».
+            cp = op.currency_pair
+            en_efectivo = bool(cp.settles_in_cash) if cp else False
+            if not en_efectivo and not op.beneficiary_alias and op.beneficiary_account_id is None:
+                raise QuoteServiceError(
+                    "operation_without_beneficiary",
+                    f"La operación {op_uuid} no tiene beneficiario: falta el dato",
+                    409,
+                )
+
+            pending = self._pending_amount(op)
+            if pending <= EPSILON:
+                raise QuoteServiceError(
+                    "nothing_pending",
+                    f"La operación {op_uuid} no tiene nada por entregar",
+                    409,
+                )
+
+            raw = item.get("amount")
+            amount = round(float(raw), 2) if raw is not None else pending
+            if amount <= 0:
+                raise QuoteServiceError(
+                    "invalid_amount", f"El monto de {op_uuid} debe ser > 0", 400
+                )
+            if amount > pending + EPSILON:
+                raise QuoteServiceError(
+                    "amount_exceeds_pending",
+                    f"La operación {op_uuid} sólo debe {pending}, no se puede entregar {amount}",
+                    400,
+                )
+
+            item = WhatsAppPendingDeliveryItem(
+                whatsapp_operation_id=op.id,
+                amount=amount,
+                previous_uncovered=op.uncovered_amount,
+                previous_uncovered_reason=op.uncovered_reason,
+                previous_collected=op.collected_amount,
+                previous_status=op.status.value if op.status else None,
+                previous_delivery_status=(
+                    op.delivery_status.value if op.delivery_status else None
+                ),
+            )
+            delivery.items.append(item)
+
+            if en_efectivo:
+                item.kind = COLLECTION_KIND
+                op.collected_amount = round(float(op.collected_amount or 0) + amount, 2)
+                # Recogido el último dólar, el trato se cierra. Sin esto la operación se
+                # quedaba en PENDING para siempre por mucho que el cliente hubiera pagado.
+                if op.to_collect <= EPSILON:
+                    self._close_collected(op, actor)
+            else:
+                item.kind = DELIVERY_KIND
+                op.uncovered_amount = round(float(op.uncovered_amount or 0) + amount, 2)
+                op.uncovered_reason = DELIVERY_REASON
+
+        self.db.commit()
+        self.db.refresh(delivery)
+        return delivery.dict()
+
+    def undo(self, client_uuid: UUID, delivery_uuid: UUID, actor: Optional[User]) -> dict:
+        """
+        Devuelve las operaciones del lote a como estaban, sin borrar el rastro.
+
+        Repone el valor previo en vez de restar lo marcado: si entre medias alguien tocó la
+        cobertura a mano, restar dejaría un número inventado. Un cobro que había cerrado la
+        operación la reabre al estado que tenía; su transacción se queda, porque deshacer
+        una marca de pantalla no es motivo para tocar los libros. Y deshacer no borra el
+        lote — queda quién marcó, quién deshizo y cuándo, que es lo que hace auditable un
+        error. Sin límite de tiempo: si se descubre mañana, se deshace mañana.
+        """
+        client = self._client_or_404(client_uuid)
+        delivery = (
+            self.db.query(WhatsAppPendingDelivery)
+            .filter(WhatsAppPendingDelivery.uuid == self._as_uuid(delivery_uuid))
+            .first()
+        )
+        if delivery is None or delivery.client_id != client.id:
+            raise QuoteServiceError("delivery_not_found", "Entrega no encontrada", 404)
+        if delivery.undone_at is not None:
+            raise QuoteServiceError("already_undone", "Esa entrega ya se deshizo", 409)
+
+        for item in delivery.items:
+            op = item.operation
+            if op is None:
+                continue
+            if item.kind == COLLECTION_KIND:
+                op.collected_amount = item.previous_collected
+                self._reopen_collected(op, item)
+            else:
+                op.uncovered_amount = item.previous_uncovered
+                op.uncovered_reason = item.previous_uncovered_reason
+
+        delivery.undone_at = datetime.now(timezone.utc)
+        delivery.undone_by_user_id = actor.id if actor else None
+        self.db.commit()
+        self.db.refresh(delivery)
+        return delivery.dict()
+
+    def history(self, client_uuid: UUID, limit: int = 50) -> list[dict]:
+        """Las entregas del cliente, de la más nueva a la más vieja."""
+        client = self._client_or_404(client_uuid)
+        rows = (
+            self.db.query(WhatsAppPendingDelivery)
+            .filter(WhatsAppPendingDelivery.client_id == client.id)
+            .options(selectinload(WhatsAppPendingDelivery.items))
+            .order_by(WhatsAppPendingDelivery.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return [row.dict() for row in rows]

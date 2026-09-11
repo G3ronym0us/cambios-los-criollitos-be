@@ -76,25 +76,53 @@ class AnalysisLogService:
         self.db.refresh(row)
         return row
 
-    def purge(self, days: int, include_labeled: bool = False, dry_run: bool = False) -> int:
+    def purge(
+        self,
+        transactional_days: int = 90,
+        personal_days: int = 30,
+        include_labeled: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, int]:
         """
-        Borra las filas más viejas que `days`. Devuelve cuántas (o cuántas borraría).
+        Borra por antigüedad, con dos plazos según la clase de mensaje.
 
-        Las etiquetadas se respetan por defecto: son el dataset ya revisado y su valor no
-        caduca, mientras que una fila cruda sin etiquetar es solo texto de un cliente
-        guardado sin haber servido para nada.
+        Lo que parece una operación —monto, moneda o palabra clave— es lo que el operador va
+        a querer revisar cuando una cotización salga mal, así que dura más. El chit-chat dura
+        menos, pero NO poco: son los ejemplos negativos, los que le enseñan al analizador
+        cuándo callarse, y el backfill histórico no los tiene por construcción. A 1,7 KB por
+        fila y ~300 filas diarias esto crece ~15 MB al mes; el plazo corto no se pone para
+        ahorrar disco sino para no guardar conversación ajena más de lo necesario.
+
+        La clase la marca el bot al registrar (`context.looks_transactional`) con la misma
+        función que decide si habla, para que el log y el comportamiento no discrepen. Sin
+        esa marca —filas viejas, o el backfill— se aplica el plazo largo: ante la duda, no
+        se borra.
+
+        Las etiquetadas nunca caducan: son dataset revisado a mano.
         """
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        query = self.db.query(WhatsAppMessageAnalysis).filter(
-            WhatsAppMessageAnalysis.created_at < cutoff
-        )
-        if not include_labeled:
-            query = query.filter(WhatsAppMessageAnalysis.label.is_(None))
-        if dry_run:
-            return query.count()
-        deleted = query.delete(synchronize_session=False)
-        self.db.commit()
-        return deleted
+        now = datetime.now(timezone.utc)
+        result: dict[str, int] = {}
+        for clase, days, is_transactional in (
+            ("transaccional", transactional_days, True),
+            ("personal", personal_days, False),
+        ):
+            query = self.db.query(WhatsAppMessageAnalysis).filter(
+                WhatsAppMessageAnalysis.created_at < now - timedelta(days=days)
+            )
+            marca = WhatsAppMessageAnalysis.context["looks_transactional"].astext
+            if is_transactional:
+                # Incluye las que no traen la marca: ante la duda, el plazo largo.
+                query = query.filter((marca == "true") | (marca.is_(None)))
+            else:
+                query = query.filter(marca == "false")
+            if not include_labeled:
+                query = query.filter(WhatsAppMessageAnalysis.label.is_(None))
+            result[clase] = (
+                query.count() if dry_run else query.delete(synchronize_session=False)
+            )
+        if not dry_run:
+            self.db.commit()
+        return result
 
     def _default_pair_symbol(self, phone: str) -> Optional[str]:
         row = (

@@ -334,3 +334,32 @@ def test_an_outgoing_receipt_is_never_deduplicated(service, db, fund, client, op
             client_phone="13174961478", raw_text="mismo texto", amount=100, currency="VES"))
 
     assert outgoing()["id"] != outgoing()["id"]
+
+
+def test_operation_created_from_a_payment_keeps_the_note_of_the_decision(
+    service, db, fund, client, operator
+):
+    """
+    El valor que no cuadra con el comprobante se puede dejar a propósito, y entonces la
+    operación guarda POR QUÉ: sin la nota, la tasa efectiva distinta a la cotizada queda sin
+    explicación y el diálogo que la preguntó se la lleva consigo.
+    """
+    inc = f.incoming(db, 220, "ZELLE")
+    note = "Diferencia con el comprobante dejada a propósito: sobran 20 ZELLE."
+    op = _op(db, service.create_operation_from_payment(
+        "incoming", inc.id, "ZELLE", "BRL", 200, 914.04,
+        fund_group_uuid=fund.uuid, exchange_user_uuid=operator.uuid,
+        recorded_by_user_id=operator.id, notes=note,
+    )["uuid"])
+    assert op.notes == note
+
+
+def test_operation_created_without_a_note_keeps_none(service, db, fund, client, operator):
+    """Sin diferencia que explicar no se inventa una nota vacía."""
+    inc = f.incoming(db, 220, "ZELLE")
+    op = _op(db, service.create_operation_from_payment(
+        "incoming", inc.id, "ZELLE", "BRL", 220, 1005.44,
+        fund_group_uuid=fund.uuid, exchange_user_uuid=operator.uuid,
+        recorded_by_user_id=operator.id, notes="",
+    )["uuid"])
+    assert op.notes is None

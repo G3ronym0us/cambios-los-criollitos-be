@@ -67,6 +67,11 @@ class Settings(BaseSettings):
     APP_ENV: str = "development"
     DEBUG: bool = True
     LOG_LEVEL: str = "INFO"
+    # El eco de SQL va aparte de DEBUG y por defecto apagado. Cuando colgaba de DEBUG —cuyo
+    # default es True— bastaba un .env sin la variable para que producción registrara cada
+    # sentencia: el json-file del backend llegó a 427 MB y llenó el disco del EC2 hasta hacer
+    # fallar el build del deploy. Encenderlo tiene que ser una decisión, no un descuido.
+    SQL_ECHO: bool = False
     
     # CORS - CORREGIDO: Usar Union para permitir string o lista
     CORS_ORIGINS: Union[str, List[str]] = "http://localhost:3000,http://localhost:8080"

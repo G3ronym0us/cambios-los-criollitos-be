@@ -13,9 +13,11 @@ from typing import Optional
 from uuid import UUID
 
 from sqlalchemy import and_, case, exists, func, or_, select
-from sqlalchemy.orm import Session, joinedload, selectinload
+from sqlalchemy.orm import Session, aliased, joinedload, selectinload
 
 from app.core.timezones import CARACAS_TZ
+from dataclasses import dataclass
+
 from app.models.currency import Currency
 from app.models.currency_pair import CurrencyPair
 from app.models.whatsapp_client import WhatsAppClient
@@ -23,22 +25,37 @@ from app.models.whatsapp_operation import (
     WhatsAppAmountSide,
     WhatsAppDeliveryStatus,
     WhatsAppOperation,
+    WhatsAppOperationScenario,
     WhatsAppOperationStatus,
 )
-from app.models.fund import FundGroup, FundMovement, FundMovementType
+from app.models.fund import (
+    FundGroup,
+    FundGroupMember,
+    FundMovement,
+    FundMovementType,
+    FundPendingDeposit,
+    FundPendingDepositOrigin,
+    FundPendingDepositStatus,
+)
 from app.models.user import User
 from app.models.whatsapp_balance import WhatsAppBalanceEntry, WhatsAppBalanceEntryType
 from app.models.whatsapp_payment import (
     WhatsAppIncomingPayment,
     WhatsAppOutgoingPayment,
     WhatsAppPaymentAllocation,
+    WhatsAppOutgoingSettlement,
+)
+from app.models.whatsapp_payment_transfer import (
+    PaymentTransferReason,
+    WhatsAppPaymentTransfer,
 )
 from app.models.client_loan import ClientLoan
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.repositories.fund_repository import FundRepository
 from app.services import valuation
 from app.schemas.whatsapp import WhatsAppOperationComplete
-from app.services.operation_match_service import receipt_fingerprint
+from app.services.operation_match_service import receipt_fingerprint, suggest_combination
+from app.services.fund_channel import resolve_fund_channel
 from app.services.whatsapp_client_account_service import WhatsAppClientAccountService
 from app.services.whatsapp_quote_service import (
     QuoteServiceError,
@@ -70,6 +87,19 @@ def _settlement_sql(column):
 # Redondeos de OCR y de tasa: por debajo de esto un pago se considera cuadrado.
 AMOUNT_EPSILON = 0.01
 
+# El dueño explícito de un comprobante transferido. Va aliased porque en la misma consulta
+# hace falta el OTRO cliente —el del teléfono del comprobante— y son la misma tabla.
+_OWNER_CLIENT = aliased(WhatsAppClient)
+
+# Los motivos de una mudanza, en las palabras del operador. Viven aquí porque es el backend
+# quien redacta las líneas de la bitácora (el front solo las pinta).
+_TRANSFER_REASON_LABELS = {
+    "THIRD_PARTY": "pagó un tercero",
+    "BOT_MISMATCH": "mal asignado por el bot",
+    "DUPLICATE_CLIENT": "cliente duplicado",
+    "LINKED_TO_OPERATION": "vinculado a la operación de otro cliente",
+}
+
 # Los tres estados del filtro de la bandeja.
 ATTENTION_FILTERS = ("ALL", "ATTENTION", "RECONCILED")
 
@@ -95,6 +125,51 @@ def _implicit_allocation_dict(op, amount: float) -> dict:
         "created_by_username": None,
         "created_at": None,
     }
+
+
+#: Desde qué fracción de la pata que sale se considera que UN comprobante la cubre entera.
+#: Separa dos cosas que se parecen en la base pero no en la vida: un descuento —el operador
+#: cierra la op con un poco menos y la tasa efectiva sale de ahí, que es a propósito— y un
+#: pago parcial, que es una fracción visible del total y deja hermanos esperando.
+FULL_PAYOUT_MIN_RATIO = 0.9
+
+
+def _covers_whole_payout(payment, to_amount: Optional[float]) -> bool:
+    """¿Este comprobante es la pata que sale de la operación, o sólo un trozo de ella?"""
+    if not to_amount or to_amount <= 0 or payment.amount is None:
+        # Sin con qué comparar se conserva lo de siempre: el comprobante la cubre.
+        # OJO: se compara con `is None`, no con falsy — un comprobante con monto 0 (OCR que
+        # no leyó nada) SÍ tiene "con qué comparar", y 0 nunca cubre nada.
+        return True
+    return float(payment.amount) >= to_amount * FULL_PAYOUT_MIN_RATIO
+
+
+#: Motivos por los que una parte del valor puede no tener comprobante. Ninguno es un error:
+#: son formas de pagar que el sistema no sabe representar.
+UNCOVERED_REASONS = ("CASH", "OTHER_CHANNEL", "BALANCE", "ADJUSTMENT")
+
+
+@dataclass
+class _RateProbe:
+    """Lo mínimo que `_reference_rate` mira de un comprobante: su moneda."""
+
+    currency: Optional[str]
+    amount: Optional[float] = None
+
+
+@dataclass
+class _IncomingCoverageSignals:
+    """Subconsultas SQL (no valores) que describen hasta dónde cubre un entrante.
+
+    Ver `WhatsAppPaymentService._incoming_coverage_signals`.
+    """
+
+    allocated: object
+    credited: object
+    has_allocation: object
+    has_deposit: object
+    op_from_amount: object
+    op_from_symbol: object
 
 
 class WhatsAppPaymentService:
@@ -133,11 +208,25 @@ class WhatsAppPaymentService:
             return None, None
         return client.display_name, str(client.uuid)
 
+    def _owner_ref(self, payment) -> tuple[Optional[str], Optional[str]]:
+        """
+        De quién es este comprobante: el dueño explícito si lo transfirieron, y si no el que
+        sale del teléfono que leyó el OCR.
+
+        El override manda pero no borra: `client_phone` sigue siendo el de quien mandó el
+        dinero, que es lo que deja al origen encontrable en la búsqueda de la bandeja.
+        """
+        owner = payment.owner_client
+        if owner is not None:
+            return owner.display_name, str(owner.uuid)
+        return self._client_ref(payment.client_phone)
+
     def _with_name(self, payment) -> dict:
         d = payment.dict()
-        name, client_uuid = self._client_ref(payment.client_phone)
+        name, client_uuid = self._owner_ref(payment)
         d["client_name"] = name
         d["client_uuid"] = client_uuid
+        d["transfer"] = self._transfer_summary(payment)
         return d
 
     def _assert_not_loan(self, payment_id: int) -> None:
@@ -146,6 +235,23 @@ class WhatsAppPaymentService:
             raise QuoteServiceError(
                 "payment_is_loan",
                 "Este pago está registrado como préstamo y no puede recibir otra clasificación",
+                409,
+            )
+
+    def _assert_not_credited(self, payment_id: int) -> None:
+        """
+        Solo entrantes: si ya se acreditó (total o parcialmente) como saldo a favor del
+        cliente, el ledger de `whatsapp_balance_entries` ya asume que ese dinero SÍ es del
+        negocio y quedó en cuenta del cliente. Declarar el comprobante irrelevante después
+        dejaría esa promesa sin respaldo, así que se rechaza — igual que un saliente que ya
+        es préstamo no puede reclasificarse (`_assert_not_loan`). Si el crédito fue un error,
+        se resuelve desde el saldo del cliente antes de tocar la clasificación del pago.
+        """
+        if self._credited_to_balance(payment_id) > 0:
+            raise QuoteServiceError(
+                "payment_is_credited",
+                "Este pago ya se acreditó como saldo a favor del cliente y no puede marcarse "
+                "irrelevante; resuelve el saldo primero",
                 409,
             )
 
@@ -261,15 +367,24 @@ class WhatsAppPaymentService:
         return None, None
 
     def _payments_base_query(self, Model):
-        """Query base con joins a cliente (display_name/uuid) y a la op (status)."""
+        """
+        Query base con joins a cliente (display_name/uuid) y a la op (status).
+
+        Hay DOS clientes por fila y los dos importan. `WhatsAppClient` es el del teléfono que
+        leyó el OCR —quien mandó el dinero—, y `_OWNER_CLIENT` es el dueño explícito que dejó
+        una transferencia. El `coalesce` hace que mande el segundo cuando existe; el primero
+        se conserva en el join porque es lo que mantiene al origen encontrable en la búsqueda
+        (ver `_filtered_payments_query`).
+        """
         return (
             self.db.query(
                 Model,
-                WhatsAppClient.display_name,
-                WhatsAppClient.uuid,
+                func.coalesce(_OWNER_CLIENT.display_name, WhatsAppClient.display_name),
+                func.coalesce(_OWNER_CLIENT.uuid, WhatsAppClient.uuid),
                 WhatsAppOperation.status,
             )
             .outerjoin(WhatsAppClient, WhatsAppClient.phone == Model.client_phone)
+            .outerjoin(_OWNER_CLIENT, _OWNER_CLIENT.id == Model.owner_client_id)
             .outerjoin(WhatsAppOperation, WhatsAppOperation.id == Model.whatsapp_operation_id)
         )
 
@@ -287,36 +402,46 @@ class WhatsAppPaymentService:
         rows = self._payments_base_query(Model).order_by(Model.created_at.desc()).limit(limit).all()
         return [self._row_to_dict(*r) for r in rows]
 
-    def _attention_condition(self, Model, table: str):
+    def _filed_as_fund_deposit(self, Model, table: str):
         """
-        Qué cuenta como «por atender»: comprobantes cuyo dinero todavía no respalda nada.
+        El comprobante que el operador señaló como depósito al fondo YA tiene destino: ese
+        dinero se quedó en el fondo en vez de retirarse, y su pendiente vive en /admin/funds.
 
-        Es la misma pregunta que responde el listado fila por fila, pero expresada en SQL
-        para poder filtrar y contar sin traerse la tabla entera. Un entrante está por
-        atender si el OCR no leyó el monto, si no tiene destino de ningún tipo (ni
-        operación, ni depósito a fondo, ni crédito de saldo), o si tiene destino pero le
-        sobra dinero. Un saliente, si no está clasificado y además le falta el monto o el
-        vínculo con su operación.
+        Sólo cuenta `origin=RECEIPT`. En los demás orígenes `source_incoming_payment_id` es
+        marca de DUPLICADO, no de destino — el gestor reenvió al grupo el Zelle de un cliente
+        y el sistema anotó que se parecen; ese entrante sigue esperando su operación y sacarlo
+        de la bandeja por eso lo perdería.
+
+        PENDING cuenta igual que CONFIRMED: la decisión ya se tomó. REJECTED lo devuelve a la
+        bandeja, que es exactamente lo que significa rechazar el pendiente.
         """
-        if table == "outgoing":
-            # Clasificar es una decisión terminal: personal, irrelevante o préstamo ya dicen
-            # dónde acabó ese dinero. Va PRIMERO porque antes mandaba `amount IS NULL` y un
-            # comprobante marcado irrelevante seguía contando como «por atender» para
-            # siempre: el OCR no va a leer un monto nuevo de una foto que el operador ya
-            # descartó, así que la fila no salía nunca de la bandeja (caso saliente #4691).
-            classified = or_(
-                Model.is_personal_expense.is_(True),
-                Model.is_irrelevant.is_(True),
-                exists().where(ClientLoan.outgoing_payment_id == Model.id),
+        source = (
+            FundPendingDeposit.source_outgoing_payment_id
+            if table == "outgoing"
+            else FundPendingDeposit.source_incoming_payment_id
+        )
+        return (
+            select(FundPendingDeposit.id)
+            .where(
+                source == Model.id,
+                FundPendingDeposit.origin == FundPendingDepositOrigin.RECEIPT,
+                FundPendingDeposit.status != FundPendingDepositStatus.REJECTED,
             )
-            return and_(
-                ~classified,
-                or_(
-                    Model.amount.is_(None),
-                    Model.whatsapp_operation_id.is_(None),
-                ),
-            )
+            .correlate(Model)
+            .exists()
+        )
 
+    def _incoming_coverage_signals(self, Model):
+        """
+        Subconsultas que miden hasta dónde cubre un entrante: si tiene reparto explícito, si
+        ese reparto (más el saldo acreditado) alcanza el monto, si entró como depósito de
+        fondo, y con qué operación se compara cuando el vínculo es directo (sin fila de
+        reparto).
+
+        Un solo lugar donde se define "cubierto": lo comparten `_attention_condition` y el
+        desglose de motivos del overview (`payments_attention_breakdown`) para no tener dos
+        definiciones de lo mismo que puedan desalinearse.
+        """
         # `correlate(Model)` es obligatorio: la query del listado ya trae unida la operación,
         # y sin esto SQLAlchemy correlaciona también esa tabla y deja la subconsulta sin FROM.
         allocated = (
@@ -340,11 +465,12 @@ class WhatsAppPaymentService:
             .correlate(Model)
             .exists()
         )
-        has_deposit = (
+        has_deposit = or_(
             select(FundMovement.id)
             .where(FundMovement.incoming_payment_id == Model.id)
             .correlate(Model)
-            .exists()
+            .exists(),
+            self._filed_as_fund_deposit(Model, "incoming"),
         )
 
         # Vínculo directo sin filas de reparto: el implícito de `_default_allocation_amount`.
@@ -365,29 +491,83 @@ class WhatsAppPaymentService:
             .correlate(Model)
             .scalar_subquery()
         )
+        return _IncomingCoverageSignals(
+            allocated=allocated,
+            credited=credited,
+            has_allocation=has_allocation,
+            has_deposit=has_deposit,
+            op_from_amount=op_from_amount,
+            op_from_symbol=op_from_symbol,
+        )
 
-        return or_(
-            Model.amount.is_(None),
-            and_(
-                Model.whatsapp_operation_id.is_(None),
-                ~has_deposit,
-                ~has_allocation,
-                credited <= 0,
-            ),
-            and_(
-                Model.amount.isnot(None),
-                has_allocation,
-                allocated + credited < Model.amount - AMOUNT_EPSILON,
-            ),
-            and_(
-                Model.amount.isnot(None),
-                Model.currency.isnot(None),
-                Model.whatsapp_operation_id.isnot(None),
-                ~has_allocation,
-                op_from_amount.isnot(None),
-                op_from_symbol.isnot(None),
-                _settlement_sql(op_from_symbol) == _settlement_sql(Model.currency),
-                op_from_amount + credited < Model.amount - AMOUNT_EPSILON,
+    def _incoming_unlinked_clause(self, Model, sig: "_IncomingCoverageSignals"):
+        """Un entrante sin NINGÚN destino: ni operación, ni depósito, ni reparto, ni saldo."""
+        return and_(
+            Model.whatsapp_operation_id.is_(None),
+            ~sig.has_deposit,
+            ~sig.has_allocation,
+            sig.credited <= 0,
+        )
+
+    def _attention_condition(self, Model, table: str):
+        """
+        Qué cuenta como «por atender»: comprobantes cuyo dinero todavía no respalda nada.
+
+        Es la misma pregunta que responde el listado fila por fila, pero expresada en SQL
+        para poder filtrar y contar sin traerse la tabla entera. Un entrante está por
+        atender si NO se marcó irrelevante y además el OCR no leyó el monto, si no tiene
+        destino de ningún tipo (ni operación, ni depósito a fondo —movimiento del ledger o
+        pendiente señalado desde esta misma bandeja—, ni crédito de saldo), o si tiene
+        destino pero le sobra dinero. Un saliente, si no está clasificado y además le falta
+        el monto o el vínculo con su operación.
+        """
+        if table == "outgoing":
+            # Clasificar es una decisión terminal: personal, irrelevante, préstamo o
+            # depósito al fondo ya dicen dónde acabó ese dinero — el depósito porque no se
+            # retiró, se quedó allí a nombre de quien mandó el comprobante (pago 4928).
+            # Va PRIMERO porque antes mandaba `amount IS NULL` y un
+            # comprobante marcado irrelevante seguía contando como «por atender» para
+            # siempre: el OCR no va a leer un monto nuevo de una foto que el operador ya
+            # descartó, así que la fila no salía nunca de la bandeja (caso saliente #4691).
+            classified = or_(
+                Model.is_personal_expense.is_(True),
+                Model.is_irrelevant.is_(True),
+                exists().where(ClientLoan.outgoing_payment_id == Model.id),
+                self._filed_as_fund_deposit(Model, table),
+            )
+            return and_(
+                ~classified,
+                or_(
+                    Model.amount.is_(None),
+                    Model.whatsapp_operation_id.is_(None),
+                ),
+            )
+
+        sig = self._incoming_coverage_signals(Model)
+
+        # Igual que el saliente (caso #4691): marcarlo irrelevante es terminal y va PRIMERO,
+        # o un entrante sin monto (el OCR nunca lo va a leer de una foto ya descartada)
+        # quedaría "por atender" para siempre por la primera rama de abajo.
+        return and_(
+            ~Model.is_irrelevant.is_(True),
+            or_(
+                Model.amount.is_(None),
+                self._incoming_unlinked_clause(Model, sig),
+                and_(
+                    Model.amount.isnot(None),
+                    sig.has_allocation,
+                    sig.allocated + sig.credited < Model.amount - AMOUNT_EPSILON,
+                ),
+                and_(
+                    Model.amount.isnot(None),
+                    Model.currency.isnot(None),
+                    Model.whatsapp_operation_id.isnot(None),
+                    ~sig.has_allocation,
+                    sig.op_from_amount.isnot(None),
+                    sig.op_from_symbol.isnot(None),
+                    _settlement_sql(sig.op_from_symbol) == _settlement_sql(Model.currency),
+                    sig.op_from_amount + sig.credited < Model.amount - AMOUNT_EPSILON,
+                ),
             ),
         )
 
@@ -419,8 +599,12 @@ class WhatsAppPaymentService:
         search = (search or "").strip()
         if search:
             like = f"%{search}%"
+            # El nombre del ORIGEN sigue buscándose aunque el pago se haya transferido: el
+            # que lo mandó no puede darlo por perdido sólo porque ahora es de otro. Y el del
+            # destino tiene que encontrarlo porque el dinero es suyo. Los dos, entonces.
             q = q.filter(
                 or_(
+                    _OWNER_CLIENT.display_name.ilike(like),
                     WhatsAppClient.display_name.ilike(like),
                     Model.client_phone.ilike(like),
                     Model.bank_from.ilike(like),
@@ -430,8 +614,12 @@ class WhatsAppPaymentService:
                 )
             )
 
-        # Clasificación solo aplica a salientes (las columnas existen únicamente ahí).
-        if table == "outgoing" and out_class and out_class != "ALL":
+        # Personal/préstamo/operativo/sin-vincular son conceptos exclusivos del saliente (esas
+        # columnas y esa tabla no existen del otro lado). "Irrelevante" sí es de los dos —
+        # el entrante lo estrenó después—, así que tiene su propia rama más abajo.
+        if table == "incoming" and out_class == "IRRELEVANT":
+            q = q.filter(Model.is_irrelevant.is_(True))
+        elif table == "outgoing" and out_class and out_class != "ALL":
             if out_class == "PERSONAL":
                 q = q.filter(Model.is_personal_expense.is_(True))
             elif out_class == "IRRELEVANT":
@@ -498,6 +686,9 @@ class WhatsAppPaymentService:
             self._attach_allocations(items)
         if table == "outgoing" and items:
             self._attach_loans(items)
+        if items:
+            self._attach_fund_deposits(items, table)
+            self._attach_transfers(items, table)
         return {"items": items, "total": total}
 
     def payments_stats(
@@ -530,6 +721,24 @@ class WhatsAppPaymentService:
 
         needs_attention = attention_q.count()
 
+        # Desglose de motivos, mutuamente excluyente por construcción (resta, no una cuarta
+        # rama SQL): el OCR no leyó el monto (to_review) prima sobre las demás porque
+        # `_attention_condition` la evalúa primero; "sin ningún destino" (unlinked) es la
+        # siguiente razón independiente del monto; lo que sobra son las que sí tienen algún
+        # destino pero no cubren el monto entero (partially_split). Lo consume el overview
+        # (`/admin/overview`) para no repetir esta cuenta con una query aparte.
+        to_review = attention_q.filter(Model.amount.is_(None)).count()
+        if table == "incoming":
+            sig = self._incoming_coverage_signals(Model)
+            unlinked = attention_q.filter(
+                Model.amount.isnot(None), self._incoming_unlinked_clause(Model, sig)
+            ).count()
+        else:
+            unlinked = attention_q.filter(
+                Model.amount.isnot(None), Model.whatsapp_operation_id.is_(None)
+            ).count()
+        partially_split = max(needs_attention - to_review - unlinked, 0)
+
         unassigned: list[dict] = []
         truncated = False
         if table == "incoming" and needs_attention:
@@ -537,6 +746,11 @@ class WhatsAppPaymentService:
                 attention_q.order_by(Model.created_at.desc()).limit(scan_limit).all()
             )
             truncated = needs_attention > len(rows)
+            # `payment.dict()` (llamado por `_row_to_dict` más abajo) resuelve
+            # `fund_group` leyendo `operation.fund_group` / `fund_group_by_jid` — sin
+            # precargarlos, cada fila del lote dispara sus propias consultas lazy. Se
+            # precargan aquí, en dos, para el lote entero.
+            self._preload_incoming_fund_context([r[0] for r in rows])
             items = [self._row_to_dict(*r) for r in rows]
             self._attach_allocations(items)
             by_currency: dict[str, dict] = {}
@@ -562,6 +776,9 @@ class WhatsAppPaymentService:
         return {
             "table": table,
             "needs_attention": needs_attention,
+            "to_review": to_review,
+            "unlinked": unlinked,
+            "partially_split": partially_split,
             "unassigned": unassigned,
             "unassigned_truncated": truncated,
             "received_today": received_today,
@@ -579,6 +796,45 @@ class WhatsAppPaymentService:
         by_payment = {loan.outgoing_payment_id: loan.payment_summary() for loan in loans}
         for item in items:
             item["loan"] = by_payment.get(item["id"])
+
+    def _attach_fund_deposits(self, items: list[dict], table: str) -> None:
+        """
+        Agrega el bloque `fund_deposit` al comprobante que el operador archivó como depósito.
+
+        Va aparte de `_attach_deposits`, que mira el ledger por `FundMovement.incoming_payment_id`
+        —una columna muerta, del mecanismo retirado en julio—. Este mira la afirmación, que es lo
+        que la pantalla necesita poder decir: sin él la fila desaparece de «Por atender» y nada
+        cuenta por qué.
+        """
+        ids = [it["id"] for it in items]
+        source = (
+            FundPendingDeposit.source_outgoing_payment_id
+            if table == "outgoing"
+            else FundPendingDeposit.source_incoming_payment_id
+        )
+        rows = (
+            self.db.query(FundPendingDeposit, FundGroup.name)
+            .outerjoin(FundGroup, FundGroup.id == FundPendingDeposit.group_id)
+            .filter(
+                source.in_(ids),
+                FundPendingDeposit.origin == FundPendingDepositOrigin.RECEIPT,
+                FundPendingDeposit.status != FundPendingDepositStatus.REJECTED,
+            )
+            .all()
+        )
+        by_payment = {
+            (dep.source_outgoing_payment_id if table == "outgoing" else dep.source_incoming_payment_id): {
+                "uuid": dep.uuid,
+                "status": dep.status.value if dep.status else None,
+                "amount": dep.amount,
+                "currency": dep.currency,
+                "group_name": group_name,
+                "username": dep.detected_user.username if dep.detected_user else None,
+            }
+            for dep, group_name in rows
+        }
+        for it in items:
+            it["fund_deposit"] = by_payment.get(it["id"])
 
     def _attach_deposits(self, items: list[dict]) -> None:
         """Agrega a cada pago entrante un bloque `deposit` (o None) si tiene un FundMovement asociado."""
@@ -601,6 +857,25 @@ class WhatsAppPaymentService:
         }
         for it in items:
             it["deposit"] = by_payment.get(it["id"])
+
+    def _preload_incoming_fund_context(self, payments: list) -> None:
+        """
+        Precarga `operation.fund_group` y `fund_group_by_jid` de un lote de entrantes.
+
+        Son las dos relaciones que `WhatsAppIncomingPayment.fund_group` (propiedad Python)
+        resuelve para cada fila; sin esto, `payment.dict()` dispara una consulta lazy de
+        `WhatsAppOperation` y otra de `FundGroup` POR FILA. Las mismas instancias ya están en
+        la sesión (identity map), así que esto solo rellena sus relaciones — no las duplica.
+        """
+        if not payments:
+            return
+        ids = [p.id for p in payments]
+        self.db.query(WhatsAppIncomingPayment).options(
+            selectinload(WhatsAppIncomingPayment.operation).selectinload(
+                WhatsAppOperation.fund_group
+            ),
+            selectinload(WhatsAppIncomingPayment.fund_group_by_jid),
+        ).filter(WhatsAppIncomingPayment.id.in_(ids)).all()
 
     def _attach_allocations(self, items: list[dict]) -> None:
         """
@@ -632,9 +907,9 @@ class WhatsAppPaymentService:
             payments = (
                 self.db.query(WhatsAppIncomingPayment)
                 .options(
-                    selectinload(WhatsAppIncomingPayment.operation).selectinload(
-                        WhatsAppOperation.currency_pair
-                    )
+                    selectinload(WhatsAppIncomingPayment.operation)
+                    .selectinload(WhatsAppOperation.currency_pair)
+                    .selectinload(CurrencyPair.from_currency)
                 )
                 .filter(WhatsAppIncomingPayment.id.in_(implicit_ids))
                 .all()
@@ -783,14 +1058,20 @@ class WhatsAppPaymentService:
         return float(op.from_amount or 0), from_symbol
 
     def delivered_amount(self, op: WhatsAppOperation, exclude_payment_id: Optional[int] = None) -> float:
-        """Suma de lo que cubren los comprobantes de salida de la operación."""
-        q = self.db.query(WhatsAppOutgoingPayment).filter(
-            WhatsAppOutgoingPayment.whatsapp_operation_id == op.id,
-            WhatsAppOutgoingPayment.settled_amount.isnot(None),
+        """
+        Suma de lo que cubren los comprobantes de salida de la operación.
+
+        Se lee del REPARTO y no del FK del comprobante: un saliente puede cubrir varias
+        operaciones a la vez —el cliente manda dos Zelle y se le paga en uno solo— y ahí el
+        FK apunta solo a la principal. Con un único destino el reparto tiene una fila y esto
+        da exactamente lo mismo que antes.
+        """
+        q = self.db.query(WhatsAppOutgoingSettlement).filter(
+            WhatsAppOutgoingSettlement.whatsapp_operation_id == op.id,
         )
         if exclude_payment_id is not None:
-            q = q.filter(WhatsAppOutgoingPayment.id != exclude_payment_id)
-        return round(sum(p.settled_amount for p in q.all()), 2)
+            q = q.filter(WhatsAppOutgoingSettlement.outgoing_payment_id != exclude_payment_id)
+        return round(sum(s.settled_amount for s in q.all()), 2)
 
     def _reference_rate(self, op: WhatsAppOperation, payment) -> Optional[float]:
         """
@@ -888,16 +1169,96 @@ class WhatsAppPaymentService:
         """Fija cuánto cubre este comprobante. Sin monto explícito, lo que da la tasa."""
         reference_rate = self._reference_rate(op, payment)
         value = settled_amount
+        was_explicit = settled_amount is not None
         if value is None:
-            if reference_rate and payment.amount:
+            # `is not None`, no falsy: un comprobante con monto REAL 0 (OCR que no leyó
+            # nada) sí tiene con qué comparar -da 0- y no debe caer al "asume que cubre
+            # todo lo pendiente" de abajo, que es para cuando de verdad no hay nada con qué
+            # calcular (comprobante sin monto reconocido en absoluto).
+            if reference_rate and payment.amount is not None:
                 value = round(float(payment.amount) / reference_rate, 2)
             else:
                 _, _ = self.operation_value(op)
                 value = self.operation_value(op)[0] - self.delivered_amount(op, payment.id)
         if value is not None and value <= 0:
             raise QuoteServiceError("invalid_settled_amount", "Lo cubierto debe ser > 0", 400)
-        payment.settled_amount = round(float(value), 2)
-        payment.settled_reference_rate = reference_rate
+        # Mismo tope que `set_settlements`: ningún camino para fijar cuánto cubre un
+        # comprobante puede dejar una operación cubierta por encima de su valor. Solo se
+        # exige cuando el monto vino explícito — el derivado arriba ya se calcula acotado
+        # al pendiente real de la operación.
+        if was_explicit:
+            op_value, op_currency = self.operation_value(op)
+            other = self.delivered_amount(op, exclude_payment_id=payment.id)
+            if op_value > 0 and round(other + float(value), 2) > round(op_value, 2) + 0.01:
+                raise QuoteServiceError(
+                    "settlement_exceeds_operation",
+                    f"La operación {op.uuid} vale {op_value:.2f} {op_currency} y ya tiene "
+                    f"{other:.2f} cubiertos: no puede recibir {float(value):.2f} más",
+                    400,
+                )
+        self._upsert_settlement(payment, op, round(float(value), 2), reference_rate)
+        self._sync_settlement_totals(payment)
+
+    def _upsert_settlement(
+        self,
+        payment: WhatsAppOutgoingPayment,
+        op: WhatsAppOperation,
+        settled_amount: float,
+        reference_rate: Optional[float],
+        actor: Optional[User] = None,
+    ) -> None:
+        """Crea o actualiza lo que este comprobante cubre de ESA operación."""
+        existing = (
+            self.db.query(WhatsAppOutgoingSettlement)
+            .filter(
+                WhatsAppOutgoingSettlement.outgoing_payment_id == payment.id,
+                WhatsAppOutgoingSettlement.whatsapp_operation_id == op.id,
+            )
+            .first()
+        )
+        if existing is not None:
+            existing.settled_amount = settled_amount
+            existing.settled_reference_rate = reference_rate
+            return
+        self.db.add(
+            WhatsAppOutgoingSettlement(
+                outgoing_payment_id=payment.id,
+                whatsapp_operation_id=op.id,
+                settled_amount=settled_amount,
+                settled_reference_rate=reference_rate,
+                created_by_user_id=actor.id if actor else None,
+            )
+        )
+
+    def _drop_settlement(self, payment_id: int, op_id: int) -> None:
+        self.db.query(WhatsAppOutgoingSettlement).filter(
+            WhatsAppOutgoingSettlement.outgoing_payment_id == payment_id,
+            WhatsAppOutgoingSettlement.whatsapp_operation_id == op_id,
+        ).delete(synchronize_session=False)
+
+    def _sync_settlement_totals(self, payment: WhatsAppOutgoingPayment) -> None:
+        """
+        Deja el comprobante al día con su reparto: `settled_amount` es el total cubierto y el
+        FK apunta a la operación de la parte mayor.
+
+        Los dos campos son ahora derivados, igual que en los entrantes (`_sync_primary_operation`).
+        Se conservan porque medio sistema los lee —el bot, el matcher, las listas— y porque con
+        un solo destino siguen valiendo exactamente lo mismo que antes.
+        """
+        self.db.flush()
+        rows = (
+            self.db.query(WhatsAppOutgoingSettlement)
+            .filter(WhatsAppOutgoingSettlement.outgoing_payment_id == payment.id)
+            .order_by(WhatsAppOutgoingSettlement.settled_amount.desc(), WhatsAppOutgoingSettlement.id)
+            .all()
+        )
+        if not rows:
+            payment.settled_amount = None
+            payment.settled_reference_rate = None
+            return
+        payment.settled_amount = round(sum(r.settled_amount for r in rows), 2)
+        payment.settled_reference_rate = rows[0].settled_reference_rate
+        payment.whatsapp_operation_id = rows[0].whatsapp_operation_id
 
     def _sync_status_from_delivery(self, op: WhatsAppOperation, completing_user: Optional[User]) -> bool:
         """
@@ -921,6 +1282,66 @@ class WhatsAppPaymentService:
             op.uuid, WhatsAppOperationStatus.COMPLETED.value, completing_user
         )
         return True
+
+    def _sync_status_from_incoming(
+        self,
+        op: Optional[WhatsAppOperation],
+        actor: Optional[User],
+        *,
+        had_incoming: bool,
+    ) -> None:
+        """
+        El respaldo del cliente mueve la cotización a PENDING, y quedarse sin comprobantes la
+        devuelve a QUOTED.
+
+        **El TTL no bloquea este paso**, por el mismo razonamiento que ya está escrito para el
+        saliente en `whatsapp_quote_service.complete_operation`: la expiración protege «el
+        cliente no acepta una tasa vieja», y un comprobante vinculado es dinero que YA se
+        movió. Bloquearlo dejaba la operación colgada en QUOTED y vencida, fuera de todas las
+        bandejas — que es exactamente lo que pasó con 10 operaciones.
+
+        `had_incoming` dice si la operación tenía un entrante ANTES de esta llamada, y lo
+        decide el caller (que es el único que puede saberlo: aquí el FK ya se soltó). Sin ese
+        dato, el camino de vuelta arrasaría con lo que nunca tuvo comprobante entrante: una op
+        `VIA_PARTNER` -donde el socio le cobra al cliente en su propio WhatsApp- o de un par
+        con `settles_in_cash` -donde el cliente paga con billetes- está en PENDING
+        legítimamente y para siempre sin un solo entrante (ver `backend/CLAUDE.md`).
+        Devolverlas a QUOTED sería sacarlas de las bandejas, el mismo daño al revés.
+
+        El paso a COMPLETED sigue siendo del lado saliente. Aquí no se toca.
+        """
+        if op is None or op.status not in (
+            WhatsAppOperationStatus.QUOTED,
+            WhatsAppOperationStatus.PENDING,
+        ):
+            return
+        # La sesión va sin autoflush: sin esto, el vínculo que acaba de ponerse (o soltarse)
+        # todavía no lo ve la consulta.
+        self.db.flush()
+        # Se miran las dos huellas del entrante: el FK directo -que es lo único que tienen los
+        # comprobantes anteriores a `whatsapp_payment_allocations`- y el reparto, que es donde
+        # vive la parte de un pago repartido entre varias operaciones (ahí el FK apunta a una
+        # sola de ellas).
+        tiene_entrante = (
+            self.db.query(WhatsAppIncomingPayment.id)
+            .filter(WhatsAppIncomingPayment.whatsapp_operation_id == op.id)
+            .first()
+            is not None
+        ) or (
+            self.db.query(WhatsAppPaymentAllocation.id)
+            .filter(WhatsAppPaymentAllocation.whatsapp_operation_id == op.id)
+            .first()
+            is not None
+        )
+        ahora = datetime.now(timezone.utc)
+        if tiene_entrante and op.status == WhatsAppOperationStatus.QUOTED:
+            op.status = WhatsAppOperationStatus.PENDING
+            op.approved_at = op.approved_at or ahora
+            op.updated_at = ahora
+        elif not tiene_entrante and had_incoming and op.status == WhatsAppOperationStatus.PENDING:
+            op.status = WhatsAppOperationStatus.QUOTED
+            op.approved_at = None
+            op.updated_at = ahora
 
     # ---------- Reparto de un entrante entre operaciones ----------
 
@@ -1129,6 +1550,456 @@ class WhatsAppPaymentService:
         self.db.refresh(payment)
         return self.allocation_summary(payment_id)
 
+    # ---------- Reparto de un SALIENTE entre operaciones ----------
+
+    # ---------- Cobertura: la misma tabla, anclada en la OPERACIÓN ----------
+
+    def _get_op_or_404(self, op_uuid) -> WhatsAppOperation:
+        op = (
+            self.db.query(WhatsAppOperation)
+            .filter(WhatsAppOperation.uuid == str(op_uuid))
+            .first()
+        )
+        if op is None:
+            raise QuoteServiceError("op_not_found", f"Operación {op_uuid} no encontrada", 404)
+        return op
+
+    def _payout_currency(self, op: WhatsAppOperation) -> Optional[str]:
+        """La moneda de la pata que SALE: contra ella se miden los comprobantes."""
+        cp = op.currency_pair
+        return cp.to_currency.symbol if cp and cp.to_currency else None
+
+    def _settled_in_payment_currency(self, payment: WhatsAppOutgoingPayment) -> Optional[float]:
+        """
+        Lo que YA cubre este comprobante en `whatsapp_outgoing_settlements`, pasado a SU
+        moneda sumando todas sus liquidaciones. `None` cuando alguna liquidación no tiene
+        `settled_reference_rate`: sin tasa no hay cómo convertirla, y el fallo real de los
+        candidatos de cobertura era justo tratar ese caso como CERO en vez de "no lo sé" — un
+        comprobante que ya cubría la operación B volvía a ofrecerse entero libre para la A.
+        """
+        total = 0.0
+        for s in payment.settlements:
+            if not s.settled_reference_rate:
+                return None
+            total += (s.settled_amount or 0) * s.settled_reference_rate
+        return round(total, 2)
+
+    def _free_amount(self, payment: WhatsAppOutgoingPayment) -> float:
+        """
+        Cuánto del comprobante no está repartido todavía, en su propia moneda.
+
+        Cada parte del reparto va en la moneda del VALOR de su operación, así que para saber
+        cuánto consume del comprobante hay que pasarla por su tasa — igual que hace el panel
+        que reparte un comprobante entre varias operaciones.
+
+        Sin tasa en alguna liquidación (`_settled_in_payment_currency` devuelve `None`) no se
+        puede afirmar que sobra saldo: se trata como agotado en vez de libre. Es a propósito
+        conservador — mejor esconder un candidato legítimo que ofrecer uno ya comprometido.
+
+        También cubre el rastro de ANTES de esta tabla: un comprobante con el FK directo
+        (`whatsapp_operation_id`) puesto y `settled_amount`/`settled_reference_rate` a mano,
+        sin fila en `whatsapp_outgoing_settlements` — lo que `backfill_outgoing_settlements`
+        no alcanzó a migrar. Ese vínculo cuenta igual que uno con fila propia.
+        """
+        usado = self._settled_in_payment_currency(payment)
+        if usado is None:
+            return 0.0
+
+        settled_op_ids = {s.whatsapp_operation_id for s in payment.settlements}
+        if payment.whatsapp_operation_id is not None and payment.whatsapp_operation_id not in settled_op_ids:
+            if not payment.settled_reference_rate:
+                return 0.0
+            usado += (payment.settled_amount or 0) * payment.settled_reference_rate
+
+        return round(float(payment.amount or 0) - usado, 2)
+
+    def operation_coverage(self, op_uuid) -> dict:
+        """
+        Qué cubre ya esta operación y con qué comprobantes podría terminar de cubrirse.
+
+        Es el espejo de `settlement_summary`: la misma tabla leída por la otra columna. El
+        ancla es la OPERACIÓN, que es como se trabaja cuando el trato se pagó en partes —
+        buscar de a un comprobante obliga a llevar la suma de cabeza, y fue lo que dejó la
+        operación 3898 sin poder cuadrarse.
+        """
+        op = self._get_op_or_404(op_uuid)
+        value, currency = self.operation_value(op)
+        delivered = self.delivered_amount(op)
+        uncovered = float(op.uncovered_amount or 0)
+        pending = round(value - delivered - uncovered, 2)
+
+        settlements = [
+            {
+                "payment_id": s.outgoing_payment_id,
+                "settled_amount": s.settled_amount,
+                "rate": s.settled_reference_rate,
+                "amount": s.payment.amount if s.payment else None,
+                "currency": s.payment.currency if s.payment else None,
+            }
+            for s in op.outgoing_settlements
+        ]
+        mine = {s["payment_id"] for s in settlements}
+
+        phone = op.client.phone if op.client else None
+        candidates = []
+        if phone:
+            rows = (
+                self.db.query(WhatsAppOutgoingPayment)
+                .filter(WhatsAppOutgoingPayment.client_phone == phone)
+                .order_by(WhatsAppOutgoingPayment.created_at.desc())
+                .limit(60)
+                .all()
+            )
+            for row in rows:
+                if row.id in mine:
+                    continue
+                free = self._free_amount(row)
+                if free <= 0.01:
+                    continue
+                candidates.append(
+                    {
+                        "payment_id": row.id,
+                        "amount": row.amount,
+                        "free_amount": free,
+                        "currency": row.currency,
+                        "provider": row.provider,
+                        "reference": row.reference,
+                        "created_at": row.created_at,
+                    }
+                )
+
+        reference_rate = self._reference_rate(op, _RateProbe(self._payout_currency(op)))
+        return {
+            "operation_uuid": str(op.uuid),
+            "value": value,
+            "value_currency": currency,
+            "delivered": delivered,
+            "uncovered": op.uncovered_amount,
+            "uncovered_reason": op.uncovered_reason,
+            "pending": pending,
+            "reference_rate": reference_rate,
+            "settlements": settlements,
+            "candidates": candidates,
+            "suggestion": suggest_combination(candidates, pending, reference_rate),
+        }
+
+    def set_operation_coverage(
+        self,
+        op_uuid,
+        payments: list,
+        value_amount: Optional[float] = None,
+        uncovered: Optional[dict] = None,
+        partial: bool = False,
+        actor: Optional[User] = None,
+    ) -> dict:
+        """
+        Fija con qué comprobantes se cubre la operación, y deriva su tasa de la suma.
+
+        El monto de la pata que SALE no se teclea: es lo que suman los comprobantes marcados.
+        Así el error que motivó todo esto —cotizar 900 cuando eran 920, sin dónde arreglarlo
+        después porque el margen sólo resta— deja de ser posible: no hay número tecleado que
+        pueda salir mal.
+
+        `partial` es la diferencia entre «guardo lo que llevo» y «esto ya está cuadrado». La
+        derivación ocurre sólo al cuadrar, porque a medias la suma es incompleta y una tasa
+        sacada de ahí sería absurda: un comprobante de 65.723 sobre un valor de 350 daría
+        187,78. Mientras tanto cada comprobante se valora a la tasa de referencia y la
+        cotización se queda como está.
+        """
+        op = self._get_op_or_404(op_uuid)
+        if value_amount is not None:
+            if value_amount <= 0:
+                raise QuoteServiceError("invalid_amount", "El valor debe ser > 0", 400)
+            op.amount = value_amount
+        value, _ = self.operation_value(op)
+
+        resto = 0.0
+        if uncovered is not None:
+            resto = round(float(uncovered.get("amount") or 0), 2)
+            motivo = uncovered.get("reason")
+            if resto > 0 and motivo not in UNCOVERED_REASONS:
+                raise QuoteServiceError(
+                    "uncovered_needs_reason",
+                    "Declarar un resto sin comprobante exige decir por qué: "
+                    + ", ".join(UNCOVERED_REASONS),
+                    400,
+                )
+            op.uncovered_amount = resto or None
+            op.uncovered_reason = motivo if resto else None
+        resto = float(op.uncovered_amount or 0)
+
+        rows = []
+        for item in payments:
+            pid = item["payment_id"] if isinstance(item, dict) else item.payment_id
+            row = (
+                self.db.query(WhatsAppOutgoingPayment)
+                .filter(WhatsAppOutgoingPayment.id == pid)
+                .first()
+            )
+            if row is None:
+                raise QuoteServiceError(
+                    "payment_not_found", f"Comprobante {pid} no encontrado", 404
+                )
+            explicit = (
+                item.get("settled_amount")
+                if isinstance(item, dict)
+                else getattr(item, "settled_amount", None)
+            )
+            rows.append((row, explicit))
+
+        # "Es el conjunto COMPLETO, no deltas" (ver `OperationCoverageUpdate`): un
+        # comprobante que YA cubría esta operación y no viene en `payments` deja de
+        # cubrirla. Sin este drop, una llamada posterior que sólo manda los recibos nuevos
+        # derivaba la tasa/`to_amount` de la suma de ESOS solos -descartando lo que ya
+        # habían cubierto los que faltan en la lista- mientras esos settlements viejos
+        # seguían sumando en `delivered_amount`: la cotización de la operación quedaba por
+        # debajo de lo que en realidad se le había entregado.
+        kept_ids = {row.id for row, _ in rows}
+        stale = (
+            self.db.query(WhatsAppOutgoingSettlement)
+            .filter(
+                WhatsAppOutgoingSettlement.whatsapp_operation_id == op.id,
+                WhatsAppOutgoingSettlement.outgoing_payment_id.notin_(kept_ids or [-1]),
+            )
+            .all()
+        )
+        stale_payments = {s.payment for s in stale if s.payment is not None}
+        for s in stale:
+            self.db.delete(s)
+        if stale:
+            self.db.flush()
+        for payment in stale_payments:
+            self._sync_settlement_totals(payment)
+            # Soltar la liquidación no basta: hay que soltar también el FK directo si apuntaba
+            # a ESTA operación y al comprobante no le queda ninguna otra parte. `_sync_settlement_
+            # totals` deja ese campo intacto en su rama vacía (sólo limpia `settled_amount` y
+            # `settled_reference_rate`), y desde que `_free_amount` cuenta un FK sin fila de
+            # liquidación como "ya consumido", un comprobante soltado así no volvía a estar
+            # libre: se quedaba invisible, sin cubrir nada y sin poder ofrecerse a otra
+            # operación.
+            #
+            # Se acota a este bucle a propósito, en vez de arreglarlo dentro de
+            # `_sync_settlement_totals`. Ahí sería peligroso: los comprobantes anteriores a
+            # `whatsapp_outgoing_settlements` tienen FK directo y CERO filas, así que limpiar
+            # el campo en la rama vacía les borraría el único vínculo que tienen con su
+            # operación. Acá no pueden aparecer — sin fila que soltar, nunca entran en `stale`.
+            if payment.whatsapp_operation_id == op.id and not payment.settlements:
+                payment.whatsapp_operation_id = None
+        if stale_payments:
+            self.db.flush()
+
+        cubierto_por_valor = round(value - resto, 2)
+        if rows and not partial and cubierto_por_valor > 0:
+            suma = round(sum(float(r.amount or 0) for r, _ in rows), 2)
+            if suma <= 0:
+                # Los comprobantes marcados no suman nada (monto real en 0, típico de un OCR
+                # que falló): derivar la tasa de esa suma dejaría rate_used/to_amount en 0
+                # aunque el operador haya puesto un `settled_amount` explícito distinto de
+                # cero más abajo. Una operación "cerrada" a tasa 0 es un estado imposible.
+                raise QuoteServiceError(
+                    "coverage_sums_to_zero",
+                    "Los comprobantes marcados suman 0: no se puede derivar una tasa de eso. "
+                    "Corrige el monto del comprobante o ciérralo con `partial` mientras tanto.",
+                    400,
+                )
+            nueva_tasa = suma / cubierto_por_valor
+            op.to_amount = suma
+            op.rate_used = nueva_tasa
+            op.inverse_percentage = False
+            # Contra la tasa que regía cuando SE PAGÓ, no cuando se armó la operación. El
+            # trato se pactó el día del comprobante; una op que se arma dos días después
+            # —el caso 3898— mediría contra una base que nadie usó para cotizar.
+            pactado_en = min(
+                (r.created_at for r, _ in rows if r.created_at is not None),
+                default=op.created_at,
+            )
+            op.applied_percentage = self._margin_against_base(op, nueva_tasa, at=pactado_en)
+            self.db.flush()
+
+        # Se rehace el reparto entero: cada comprobante aporta su monto completo salvo que el
+        # llamador diga otra cosa, que es el caso de uno que abarca dos tratos.
+        for row, explicit in rows:
+            tasa = self._reference_rate(op, row)
+            cubre = (
+                explicit
+                if explicit is not None
+                else (round(float(row.amount or 0) / tasa, 2) if tasa else None)
+            )
+            if cubre is None or cubre <= 0:
+                raise QuoteServiceError(
+                    "no_reference_rate",
+                    f"Sin tasa para valorar el comprobante {row.id}: indícalo a mano",
+                    400,
+                )
+            self._upsert_settlement(row, op, cubre, tasa, actor)
+            self._sync_settlement_totals(row)
+
+        # Si la op ya estaba COMPLETED (el caso normal: se completa sola al vincular el
+        # primer saliente) su Transaction y los movimientos de fondo ya existen con la tasa
+        # VIEJA. Cerrar o reabrir la cobertura después -otro comprobante que llega, un
+        # reparto que se corrige- puede cambiar rate_used/to_amount/applied_percentage, y
+        # sin este resync la contabilidad real quedaba mintiendo: la operación mostraba un
+        # margen y la transacción/el libro de fondos contabilizaba otro.
+        WhatsAppQuoteService(self.db)._sync_linked_transaction(op)
+        self._sync_fund_legs(op, actor)
+
+        self.db.commit()
+        self.db.refresh(op)
+        return self.operation_coverage(op.uuid)
+
+    def _margin_against_base(
+        self, op: WhatsAppOperation, rate: float, at=None
+    ) -> Optional[float]:
+        """
+        El margen que esta tasa lleva dentro, **con signo**.
+
+        No pasa por `implied_margin` a propósito: esa función existe para INFERIR el margen de
+        una tasa que llegó de fuera, y por eso devuelve None fuera del rango comercial — ahí
+        «la tasa no salió de este par y afirmar una ganancia sería inventarla». Acá no hay nada
+        que inferir: la tasa sale de los números de la propia operación, el valor lo puso el
+        operador y la suma la ponen sus comprobantes.
+
+        Puede dar NEGATIVO, y se guarda: es cuando se entregó por encima de la base, una
+        pérdida real contra la referencia. Esconderla en un cero sería mentir sobre el trato.
+
+        `at` es la fecha contra la que se busca la base — la del PAGO, no la de la operación.
+        Es la misma convención que `create_operation_from_payment`, para que los dos caminos
+        no midan contra bases distintas cuando la op se arma días después de cobrarse.
+        """
+        cp = op.currency_pair
+        if cp is None or not cp.from_currency or not cp.to_currency:
+            return None
+        resolver = WhatsAppQuoteService(self.db).resolver
+        entry = resolver.get_rate_entry_for_pair(
+            cp.from_currency.symbol, cp.to_currency.symbol, at=at or op.created_at
+        )
+        if entry is None or not entry.base_rate:
+            return None
+        base = resolver.apply_rate(1.0, entry.base_rate, entry.inverse_percentage)
+        if base <= 0:
+            return None
+        return round((1 - rate / base) * 100, 4)
+
+    def settlement_summary(self, payment_id: int) -> dict:
+        """
+        Qué operaciones cubre un comprobante de salida y con cuánto de cada valor.
+
+        El caso que lo pide: el cliente manda dos Zelle (80 y 35) y se le paga TODO en un
+        solo envío. Antes había que elegir a cuál de los dos tratos vincularlo y mentirle al
+        otro; ahora el comprobante se reparte, igual que ya se repartía un entrante.
+        """
+        payment = self._get_or_404("outgoing", payment_id)
+        rows = list(payment.settlements)
+        items = []
+        for row in rows:
+            item = row.dict()
+            op = row.operation
+            if op is not None:
+                value, currency = self.operation_value(op)
+                item["operation_value"] = value
+                item["operation_value_currency"] = currency
+                item["operation_delivered"] = self.delivered_amount(op)
+                item["operation_pending"] = round(value - self.delivered_amount(op), 2)
+            items.append(item)
+
+        settled = round(sum(r.settled_amount for r in rows), 2)
+        # Lo que el comprobante entrega en SU moneda contra lo que ya está repartido: la
+        # diferencia es lo que el operador todavía no ha dicho a qué trato pertenece.
+        # Mismo criterio que `_free_amount`: sin tasa en alguna fila no se puede convertir, y
+        # no se afirma que sobra saldo — se cuenta como comprometido, no como libre.
+        covered_in_payment_currency = self._settled_in_payment_currency(payment)
+        unassigned_in_payment_currency = (
+            round((payment.amount or 0) - covered_in_payment_currency, 2)
+            if covered_in_payment_currency is not None
+            else 0.0
+        )
+        return {
+            "payment_id": payment.id,
+            "amount": payment.amount,
+            "currency": payment.currency,
+            "settled_total": settled,
+            "covered_in_payment_currency": covered_in_payment_currency,
+            "unassigned_in_payment_currency": unassigned_in_payment_currency,
+            "settlements": items,
+        }
+
+    def set_settlements(
+        self,
+        payment_id: int,
+        items: list,
+        actor: Optional[User] = None,
+    ) -> dict:
+        """
+        Reemplaza el reparto completo del comprobante de salida. Cada item es
+        {operation_uuid, settled_amount}, con el monto en la moneda del VALOR de esa operación.
+
+        No se valida contra el monto del comprobante como en los entrantes: aquí cada parte va
+        en la moneda de SU operación —80 ZELLE y 35 ZELLE para un pago en bolívares—, así que
+        la suma no es comparable con el pago sin pasar por las tasas de cada una. Lo que sí se
+        exige es que ninguna operación quede cubierta de más, que es el error que importa.
+        """
+        payment = self._get_or_404("outgoing", payment_id)
+        self._assert_not_loan(payment_id)
+        if not items:
+            raise QuoteServiceError(
+                "settlements_empty",
+                "El reparto no puede quedar vacío: desvincula el comprobante si ya no cubre "
+                "ninguna operación",
+                400,
+            )
+
+        resolved = []
+        seen = set()
+        for item in items:
+            op = (
+                self.db.query(WhatsAppOperation)
+                .filter(WhatsAppOperation.uuid == str(item.operation_uuid))
+                .first()
+            )
+            if op is None:
+                raise QuoteServiceError(
+                    "op_not_found", f"Operación {item.operation_uuid} no encontrada", 404
+                )
+            if op.id in seen:
+                raise QuoteServiceError(
+                    "settlement_duplicated",
+                    f"La operación {op.uuid} aparece dos veces en el reparto",
+                    400,
+                )
+            if item.settled_amount <= 0:
+                raise QuoteServiceError(
+                    "invalid_settled_amount", "Cada parte del reparto debe ser > 0", 400
+                )
+            seen.add(op.id)
+            resolved.append((op, round(item.settled_amount, 2)))
+
+        # Ninguna operación puede quedar cubierta por encima de su valor contando lo que ya
+        # cubren OTROS comprobantes suyos.
+        for op, amount in resolved:
+            value, currency = self.operation_value(op)
+            other = self.delivered_amount(op, exclude_payment_id=payment.id)
+            if value > 0 and round(other + amount, 2) > round(value, 2) + 0.01:
+                raise QuoteServiceError(
+                    "settlement_exceeds_operation",
+                    f"La operación {op.uuid} vale {value:.2f} {currency} y ya tiene "
+                    f"{other:.2f} cubiertos: no puede recibir {amount:.2f} más",
+                    400,
+                )
+
+        payment.settlements.clear()
+        self.db.flush()
+        for op, amount in resolved:
+            self._upsert_settlement(payment, op, amount, self._reference_rate(op, payment), actor)
+        self._sync_settlement_totals(payment)
+        self.db.flush()
+        # Cada operación tocada recalcula su estado: repartir puede completar varias a la vez.
+        for op, _ in resolved:
+            self._sync_status_from_delivery(op, actor)
+            self._sync_fund_legs(op, actor)
+        self.db.commit()
+        self.db.refresh(payment)
+        return self.settlement_summary(payment_id)
+
     def _resolve_orphan(
         self,
         row,
@@ -1174,21 +2045,58 @@ class WhatsAppPaymentService:
         orphan_action: Optional[str] = None,
         orphan_note: Optional[str] = None,
         settled_amount: Optional[float] = None,
+        allow_orphan: bool = False,
     ) -> dict:
-        row = self._get_or_404(table, payment_id)
+        """
+        `allow_orphan` salta la pregunta del huérfano y deja la operación sin comprobantes SIN
+        marcarla como asumida. Lo usa la transferencia a otro cliente, donde la política ya
+        está decidida: la operación vuelve a esperar fondos, y esa alarma tiene que seguir
+        encendida para quien la mire.
+
+        El SELECT es `FOR UPDATE`: sin esto, dos vinculaciones concurrentes del MISMO
+        comprobante a DOS operaciones distintas (el operador y el bot, o dos operadores) leen
+        ambas `whatsapp_operation_id is None`, pasan el chequeo de "ya vinculado" y la segunda
+        pisa en silencio lo que dejó la primera -- la operación que perdió el pago puede
+        quedar igual COMPLETED (con su movimiento de fondo ya creado) mientras el comprobante
+        termina apuntando a la otra. Con el lock, la segunda transacción espera a que la
+        primera comitee y entonces SÍ ve el vínculo ya puesto, y responde 409
+        `payment_already_linked` en vez de una pérdida de actualización silenciosa.
+        """
+        Model = self._model(table)
+        row = self.db.query(Model).filter(Model.id == payment_id).with_for_update().first()
+        if row is None:
+            raise QuoteServiceError("not_found", f"Pago {table}/{payment_id} no encontrado", 404)
+        # La operación de la que viene este comprobante, capturada ANTES de soltar el FK: al
+        # desvincular, `op` queda en None y sin esto no habría a quién sincronizarle el estado.
+        # Que exista es además la prueba de que esa op TENÍA un entrante antes de esta llamada
+        # (ver `_sync_status_from_incoming`).
+        op_previa = None
+        if table == "incoming" and row.whatsapp_operation_id is not None:
+            op_previa = (
+                self.db.query(WhatsAppOperation)
+                .filter(WhatsAppOperation.id == row.whatsapp_operation_id)
+                .first()
+            )
         orphaned_op = (
             self._resolve_orphan(row, table, payment_id, orphan_action, orphan_note, completing_user)
-            if operation_uuid is None
+            if operation_uuid is None and not allow_orphan
             else None
         )
         if table == "outgoing" and operation_uuid is not None:
             self._assert_not_loan(payment_id)
         op = None
         if operation_uuid is not None:
+            # NOTA (ver H-8.4 en el informe de la campaña): se intentó un `.with_for_update()`
+            # acá para cerrar la carrera "cancelar vs. cubrir" y NO alcanza -- `_sync_status_
+            # from_delivery` más abajo llama a `WhatsAppQuoteService.update_status`, que hace
+            # su PROPIO `self.db.commit()` a mitad de este método. Ese commit interno libera
+            # el lock antes de que esta función termine, así que un `UPDATE` de cancelación
+            # bloqueado en otra sesión se destraba ahí y puede pisar el COMPLETED que se acaba
+            # de comitear. Un lock aislado en este SELECT no cierra la carrera; hace falta que
+            # el árbol de llamadas deje de comitear a mitad de camino (ver el hallazgo).
             op = self.db.query(WhatsAppOperation).filter(WhatsAppOperation.uuid == operation_uuid).first()
             if op is None:
                 raise QuoteServiceError("op_not_found", f"Operation {operation_uuid} no encontrada", 404)
-            Model = self._model(table)
             # Una operación puede tener varios comprobantes por lado: el trato de 220 se pagó
             # con un Pix y un pago móvil, y cada uno cubre su parte del valor (`settled_amount`).
             # Lo que antes se rechazaba como duplicado ahora se contabiliza.
@@ -1207,6 +2115,22 @@ class WhatsAppPaymentService:
             # vincular después el pago saliente real, ese número es la primera referencia
             # confiable del destinatario: adoptarlo antes de sincronizar los pagos.
             payment_client_phone = row.client_phone
+            # El vínculo principal es EXCLUSIVO: si el comprobante se va a otra operación, la
+            # anterior lo pierde —reparto incluido—, igual que si se hubiera desvinculado a
+            # mano. Sin esto la fila de reparto de la vieja sobrevivía y se quedaba con todo
+            # el dinero del pago, así que la nueva heredaba el vínculo pero cero respaldo
+            # (`_default_allocation_amount` solo reparte lo que queda libre) y las DOS
+            # terminaban en PENDING con un solo comprobante detrás.
+            #
+            # Esto no toca el reparto explícito entre varias operaciones, que se declara
+            # aparte con `PUT /incoming/{id}/allocations` y sigue valiendo: aquí solo se
+            # suelta la operación que era la principal hasta este momento.
+            if (
+                table == "incoming"
+                and row.whatsapp_operation_id is not None
+                and row.whatsapp_operation_id != op.id
+            ):
+                self._drop_allocation(row.id, row.whatsapp_operation_id)
             row.whatsapp_operation_id = op.id
             operation_client_phone = op.client.phone if op.client else None
             should_infer_client = (
@@ -1222,8 +2146,44 @@ class WhatsAppPaymentService:
                     display_name=None,
                     update_display_name=False,
                 )
-            # En el resto de los casos se conserva el criterio existente: vincular
-            # el comprobante a una operación afirma que pertenece a su cliente.
+            # Vincular un entrante sigue afirmando que el comprobante pertenece al cliente de
+            # la operación, pero eso es una OPINIÓN y va en `owner_client_id`, no en
+            # `client_phone`, que es el hecho observado de en qué chat llegó el dinero. Es el
+            # mismo criterio de `transfer_client` —que a propósito no toca `client_phone`— y
+            # por eso deja el mismo rastro: sin él, el comprobante desaparecía del chat donde
+            # el operador lo había visto, sin que nada lo explicara (caso #582, José Bogao).
+            elif table == "incoming":
+                # Si el "cliente" de la op es un marcador (JID de grupo o anónimo) no hay de
+                # quién afirmar nada: mudar el comprobante a un placeholder sería perder al
+                # dueño real a cambio de nada.
+                if op.client is not None and not is_unassigned_client_phone(
+                    operation_client_phone
+                ):
+                    origen = row.owner_client or (
+                        self.db.query(WhatsAppClient)
+                        .filter(WhatsAppClient.phone == payment_client_phone)
+                        .first()
+                    )
+                    # Mismo cliente (el caso normal, con el pool de candidatas ya acotado al
+                    # cliente): no hay mudanza, así que no se anota nada.
+                    if origen is None or origen.id != op.client.id:
+                        row.owner_client_id = op.client.id
+                        self.db.add(
+                            WhatsAppPaymentTransfer(
+                                incoming_payment_id=row.id,
+                                from_client_id=origen.id if origen else None,
+                                from_client_phone=payment_client_phone,
+                                from_client_name=origen.display_name if origen else None,
+                                to_client_id=op.client.id,
+                                reason=PaymentTransferReason.LINKED_TO_OPERATION,
+                                created_by_user_id=(
+                                    completing_user.id if completing_user else None
+                                ),
+                            )
+                        )
+            # El saliente se queda como estaba. Ahí el comprobante lo sube el operador (ver
+            # `backend/CLAUDE.md`), así que `client_phone` no es «el chat del cliente» sino la
+            # referencia que se adopta al vincular; cambiarlo es otra decisión, y no es esta.
             elif operation_client_phone:
                 row.client_phone = operation_client_phone
             # La op vuelve a tener respaldo: el aval de "sin pago asociado" ya no aplica.
@@ -1238,6 +2198,12 @@ class WhatsAppPaymentService:
                 self._drop_allocation(row.id, row.whatsapp_operation_id)
                 row.whatsapp_operation_id = None
                 self._sync_primary_operation(row)
+            elif table == "outgoing" and row.whatsapp_operation_id is not None:
+                # Simétrico al entrante: se suelta la parte de la op principal y, si el
+                # comprobante todavía cubre otras, el FK pasa a la siguiente del reparto.
+                self._drop_settlement(row.id, row.whatsapp_operation_id)
+                row.whatsapp_operation_id = None
+                self._sync_settlement_totals(row)
             else:
                 row.whatsapp_operation_id = None
 
@@ -1251,6 +2217,20 @@ class WhatsAppPaymentService:
             WhatsAppClientAccountService(self.db).learn_from_outgoing(op, row)
             if complete_outgoing:
                 self._sync_status_from_delivery(op, completing_user)
+
+        # Espejo del lado saliente: el respaldo del cliente mueve la cotización a PENDING, y
+        # quitarle el último comprobante la devuelve a QUOTED.
+        #
+        # Se sincronizan LAS DOS operaciones, porque re-vincular un comprobante toca dos: la
+        # que lo recibe y la que lo pierde. Con solo la primera, mover un pago de la op A a la
+        # B dejaba a A en PENDING sin un solo entrante — la misma operación colgada que este
+        # método viene a eliminar, nada más que en espejo. El orden importa: primero la que lo
+        # pierde, para que si A y B fueran la misma el estado final lo fije la que lo gana.
+        if table == "incoming":
+            if op_previa is not None and (op is None or op_previa.id != op.id):
+                self._sync_status_from_incoming(op_previa, completing_user, had_incoming=True)
+            if op is not None:
+                self._sync_status_from_incoming(op, completing_user, had_incoming=True)
 
         # El libro sigue a la operación: si vincular este pago la completó, las patas del
         # fondo quedan al día. `_sync_status_from_delivery` ya comitea al completar la op;
@@ -1459,6 +2439,76 @@ class WhatsAppPaymentService:
             )
             op.fund_group_out_id = group.id if group else None
 
+    def _sole_fund_partner(self, fund_group_id: Optional[int]) -> Optional[User]:
+        """
+        El socio de un fondo (Jean en Zelle/Paypal, Dionis en Cambios Colombia...): el
+        miembro con `FundGroupMember.whatsapp_phone` seteado, que es la columna que el
+        propio modelo ya documenta como "el socio" y que `resolve_fund_channel` usa para
+        reconocer sus mensajes directos (escenario VIA_PARTNER).
+
+        No sirve `is_fund_manager`: el operador (Diohandres) también queda marcado como
+        gestor de su propio fondo (ver `app/cli/seed_fund_movements.py`), así que ese campo
+        NO distingue al socio del operador — sólo `whatsapp_phone` sí, porque se llena
+        nada más que para el socio con canal propio.
+
+        Cero candidatos (fondo con un único miembro, o ninguno con teléfono propio) o más
+        de uno (varios socios posibles) es "no sé": adivinar mal le atribuye la ganancia de
+        la operación a quien no gestionó el cambio, así que no se elige nadie.
+        """
+        if fund_group_id is None:
+            return None
+        candidates = (
+            self.db.query(FundGroupMember)
+            .filter(
+                FundGroupMember.group_id == fund_group_id,
+                FundGroupMember.is_fund_manager.is_(True),
+                FundGroupMember.whatsapp_phone.isnot(None),
+            )
+            .all()
+        )
+        if len(candidates) != 1:
+            return None
+        return candidates[0].user
+
+    def _resolve_scenario_for_new_op(self, op: WhatsAppOperation, table: str) -> None:
+        """
+        Clasifica por defecto el escenario (y el receptor del entrante) de una op que nace
+        de un comprobante. Mismo patrón que `_resolve_fund_legs_for_new_op`: corre UNA vez,
+        al nacer la operación, y sólo rellena lo que el caller dejó en blanco — nunca pisa
+        un escenario o receptor que ya vinieron puestos (a mano, o heredados del payload).
+
+        El negocio (ver CLAUDE.md, "Quién manda qué al grupo de WhatsApp"): todos los
+        comprobantes al grupo los sube Diohandres, el operador — quién los sube no es
+        señal de nada. Lo que distingue es el CONTENIDO, que acá es justo lo que dice
+        `table`:
+          - Captura ENTRANTE (`table == "incoming"`): el cliente se la mandó directo a
+            Diohandres. ZELLE_DIRECT, sin receptor (NULL = operador, como documenta el
+            modelo).
+          - Comprobante SALIENTE (`table == "outgoing"`): como el socio cobra al cliente
+            en su propio WhatsApp, el entrante nunca llega al operador — la operación nace
+            directo del saliente. VIA_PARTNER, con `received_by_user_id` = el socio del
+            fondo, sólo si hay exactamente uno identificable.
+        """
+        if op.scenario != WhatsAppOperationScenario.NORMAL or op.received_by_user_id is not None:
+            return
+        cp = op.currency_pair
+        if cp is None or cp.settles_in_cash:
+            # Los pares en efectivo (USD-VES) se pagan en mano, directo con Diohandres: no
+            # hay socio de por medio aunque el par comparta fondo con Zelle/Paypal por
+            # moneda (ver CLAUDE.md, "Los pares que se cambian en efectivo").
+            return
+        if op.fund_group_id is None:
+            # Sin fondo detrás no hay grupo ni socio de qué hablar: queda NORMAL, el
+            # default histórico de "cliente <-> operador, sin grupo".
+            return
+        if table == "incoming":
+            op.scenario = WhatsAppOperationScenario.ZELLE_DIRECT
+        elif table == "outgoing":
+            partner = self._sole_fund_partner(op.fund_group_id)
+            if partner is not None:
+                op.scenario = WhatsAppOperationScenario.VIA_PARTNER
+                op.received_by_user_id = partner.id
+
     def _trim_settlements_to_value(self, op: WhatsAppOperation, value: float) -> None:
         """
         Recorta cuánto cubren los salientes cuando el valor baja por debajo de lo entregado:
@@ -1466,12 +2516,9 @@ class WhatsAppPaymentService:
         reduce a prorrata; la tasa efectiva de cada pago se recalcula sola (amount/settled).
         """
         payouts = (
-            self.db.query(WhatsAppOutgoingPayment)
-            .filter(
-                WhatsAppOutgoingPayment.whatsapp_operation_id == op.id,
-                WhatsAppOutgoingPayment.settled_amount.isnot(None),
-            )
-            .order_by(WhatsAppOutgoingPayment.id)
+            self.db.query(WhatsAppOutgoingSettlement)
+            .filter(WhatsAppOutgoingSettlement.whatsapp_operation_id == op.id)
+            .order_by(WhatsAppOutgoingSettlement.id)
             .all()
         )
         covered = round(sum(p.settled_amount for p in payouts), 2)
@@ -1486,6 +2533,10 @@ class WhatsAppPaymentService:
                 share = round(payout.settled_amount * value / covered, 2)
                 payout.settled_amount = share
                 remaining = round(remaining - share, 2)
+        # Cada comprobante tocado tiene que quedar con su total al día: el recorte pudo
+        # cambiar su parte en ESTA operación mientras conserva las de otras.
+        for payment in {p.payment for p in payouts if p.payment is not None}:
+            self._sync_settlement_totals(payment)
 
     def _trim_allocations_to_value(self, op: WhatsAppOperation, value: float) -> float:
         """
@@ -1545,6 +2596,7 @@ class WhatsAppPaymentService:
 
     def set_irrelevant(
         self,
+        table: str,
         payment_id: int,
         is_irrelevant: bool,
         description: Optional[str] = None,
@@ -1552,11 +2604,40 @@ class WhatsAppPaymentService:
         orphan_action: Optional[str] = None,
         orphan_note: Optional[str] = None,
     ) -> dict:
-        row = self._get_or_404("outgoing", payment_id)
+        """
+        Marca/desmarca un comprobante —de cualquier lado— como irrelevante para las
+        operaciones. Antes solo existía para SALIENTES; esto lo lleva a ENTRANTES.
+
+        El significado no es el mismo de los dos lados:
+        - SALIENTE irrelevante: dinero NUESTRO que salió por algo que no es un cambio (un
+          pago aparte del operador, un reenvío duplicado).
+        - ENTRANTE irrelevante: un comprobante que llegó al chat sin ser en realidad un pago
+          AL negocio — una captura reenviada por error, el duplicado del mismo Zelle, plata
+          que el cliente mandó por otra cosa. Nunca fue nuestro, así que no hay nada que
+          "sacar" de la caja; solo se declara que ese papel no cuenta.
+
+        En los dos casos la clasificación es terminal (no vuelve a pedir atención mientras
+        siga marcada, ver `_attention_condition`) y desvincula la operación primaria del
+        comprobante — igual que el saliente, no toca el reparto que tenga con OTRAS
+        operaciones (`allocations`/`settlements`), solo la relación principal.
+
+        La pregunta del huérfano (`orphan_action`) SÍ se reutiliza tal cual para entrantes,
+        pero no dispara igual de seguido: `_resolve_orphan` cuenta comprobantes de los dos
+        lados, así que una operación de socio o de un par en efectivo —que nunca tiene
+        entrante— no se considera huérfana solo por perder este; hace falta que se quede sin
+        NINGÚN comprobante, que es el mismo caso que ya era un problema para el saliente.
+
+        Un entrante ya acreditado al saldo del cliente no puede marcarse irrelevante
+        (`_assert_not_credited`): el ledger de abonos ya asume que ese dinero es del negocio.
+        """
+        row = self._get_or_404(table, payment_id)
         if is_irrelevant:
-            self._assert_not_loan(payment_id)
+            if table == "outgoing":
+                self._assert_not_loan(payment_id)
+            else:
+                self._assert_not_credited(payment_id)
         orphaned_op = (
-            self._resolve_orphan(row, "outgoing", payment_id, orphan_action, orphan_note, actor)
+            self._resolve_orphan(row, table, payment_id, orphan_action, orphan_note, actor)
             if is_irrelevant
             else None
         )
@@ -1571,6 +2652,331 @@ class WhatsAppPaymentService:
         if orphaned_op is not None:
             WhatsAppQuoteService(self.db).delete_operation(orphaned_op)
         return self._with_name(row)
+
+    # ---------- Transferir el pago a otro cliente ----------
+
+    def _transfer_summary(self, payment) -> Optional[dict]:
+        """
+        El rastro que se pinta en la cabecera y en la insignia del listado.
+
+        Se muestra el PRIMER origen, no el anterior: un pago puede haberse movido varias
+        veces, y lo que hace falta saber de un vistazo es de qué perfil salió el dinero. Los
+        saltos intermedios están en la bitácora. La fecha y el autor sí son los del ÚLTIMO
+        salto — es la respuesta a «¿quién lo movió, y cuándo?».
+        """
+        transfers = list(payment.transfers or [])
+        if not transfers:
+            return None
+        first, last = transfers[0], transfers[-1]
+        d = first.dict()
+        return {
+            "from_client_uuid": d["from_client_uuid"],
+            "from_client_name": d["from_client_name"],
+            "from_client_phone": d["from_client_phone"],
+            "reason": last.reason.value if last.reason else None,
+            "note": last.note,
+            "transferred_at": last.created_at,
+            "transferred_by": last.created_by.username if last.created_by else None,
+            "count": len(transfers),
+        }
+
+    def _attach_transfers(self, items: list[dict], table: str) -> None:
+        """El bloque `transfer` de cada fila, en una sola consulta para toda la página."""
+        ids = [it["id"] for it in items]
+        side = (
+            WhatsAppPaymentTransfer.outgoing_payment_id
+            if table == "outgoing"
+            else WhatsAppPaymentTransfer.incoming_payment_id
+        )
+        rows = (
+            self.db.query(WhatsAppPaymentTransfer)
+            .options(
+                joinedload(WhatsAppPaymentTransfer.from_client),
+                joinedload(WhatsAppPaymentTransfer.created_by),
+            )
+            .filter(side.in_(ids))
+            .order_by(WhatsAppPaymentTransfer.id)
+            .all()
+        )
+        by_payment: dict[int, list] = {}
+        for row in rows:
+            by_payment.setdefault(row.payment_id, []).append(row)
+        for it in items:
+            group = by_payment.get(it["id"])
+            if not group:
+                it["transfer"] = None
+                continue
+            first, last = group[0], group[-1]
+            d = first.dict()
+            it["transfer"] = {
+                "from_client_uuid": d["from_client_uuid"],
+                "from_client_name": d["from_client_name"],
+                "from_client_phone": d["from_client_phone"],
+                "reason": last.reason.value if last.reason else None,
+                "note": last.note,
+                "transferred_at": last.created_at,
+                "transferred_by": last.created_by.username if last.created_by else None,
+                "count": len(group),
+            }
+
+    def _assert_transferable(self, table: str, row) -> None:
+        """
+        Un pago transferible es uno que todavía no movió caja.
+
+        La regla de la que sale todo esto: el pago nunca se duplica ni se anula, sólo cambia
+        de dueño. Un comprobante que ya se contó —entregado, depositado o acreditado— tiene su
+        movimiento a nombre del cliente de origen, y mudarlo dejaría ese movimiento mintiendo.
+        Ahí la salida sigue siendo la de siempre: reversar y volver a empezar.
+        """
+        op = row.operation
+        if op is not None and op.status == WhatsAppOperationStatus.COMPLETED:
+            raise QuoteServiceError(
+                "payment_reconciled",
+                "La operación ya se entregó y se cerró: el pago está conciliado y no se puede "
+                "transferir. Reversa la operación primero.",
+                409,
+            )
+
+        source = (
+            FundPendingDeposit.source_outgoing_payment_id
+            if table == "outgoing"
+            else FundPendingDeposit.source_incoming_payment_id
+        )
+        confirmed_deposit = (
+            self.db.query(FundPendingDeposit.id)
+            .filter(
+                source == row.id,
+                FundPendingDeposit.origin == FundPendingDepositOrigin.RECEIPT,
+                FundPendingDeposit.status == FundPendingDepositStatus.CONFIRMED,
+            )
+            .first()
+        )
+        if confirmed_deposit is not None:
+            raise QuoteServiceError(
+                "payment_deposited",
+                "El comprobante ya se confirmó como depósito al fondo, a nombre de su gestor: "
+                "no se puede transferir.",
+                409,
+            )
+
+        if table == "incoming" and self._credited_to_balance(row.id) > AMOUNT_EPSILON:
+            raise QuoteServiceError(
+                "payment_credited",
+                "Parte del pago ya se acreditó al saldo a favor del cliente de origen: "
+                "no se puede transferir.",
+                409,
+            )
+
+        # Solo salientes: el préstamo es una deuda a nombre del cliente de origen, con su
+        # valuación y sus abonos. Mudar el comprobante dejaría la deuda con quien no la tiene.
+        if table == "outgoing":
+            self._assert_not_loan(row.id)
+
+    def transfer_client(
+        self,
+        table: str,
+        payment_id: int,
+        client_uuid: UUID,
+        reason: str,
+        note: Optional[str] = None,
+        actor: Optional[User] = None,
+    ) -> dict:
+        """
+        Muda el comprobante a otro cliente, dejando el rastro.
+
+        Lo que NO pasa, y es lo que hace que esto sea seguro: el pago no se duplica ni se
+        anula (mismo `id`), su fecha no se toca (los reportes del día no se reescriben hacia
+        atrás) y `client_phone` se queda como está (el origen sigue encontrándose al buscar).
+        Lo único que cambia de verdad es `owner_client_id`.
+
+        Si el pago estaba vinculado, se desengancha y su operación vuelve a esperar fondos.
+        Nunca se muda la operación de cliente por su cuenta: es un trato de otra persona, y
+        moverlo sería una segunda decisión que nadie tomó.
+        """
+        row = self._get_or_404(table, payment_id)
+        self._assert_transferable(table, row)
+
+        destination = (
+            self.db.query(WhatsAppClient).filter(WhatsAppClient.uuid == client_uuid).first()
+        )
+        if destination is None:
+            raise QuoteServiceError(
+                "client_not_found", f"Cliente {client_uuid} no encontrado", 404
+            )
+
+        current_name, current_uuid = self._owner_ref(row)
+        if current_uuid == str(destination.uuid):
+            raise QuoteServiceError(
+                "same_client", "El pago ya es de ese cliente", 422
+            )
+
+        try:
+            reason_enum = PaymentTransferReason(reason)
+        except ValueError:
+            raise QuoteServiceError(
+                "invalid_reason",
+                f"Motivo inválido: {reason}. Usa THIRD_PARTY, BOT_MISMATCH o DUPLICATE_CLIENT.",
+                422,
+            )
+
+        # De dónde sale: el dueño efectivo de AHORA, que puede ser un override anterior.
+        origin_client = row.owner_client or (
+            self.db.query(WhatsAppClient)
+            .filter(WhatsAppClient.phone == row.client_phone)
+            .first()
+        )
+        unlinked_op_id = row.whatsapp_operation_id
+
+        if unlinked_op_id is not None:
+            # Se reutiliza el desvinculado de siempre —suelta el reparto, recalcula el FK
+            # principal y sincroniza el fondo—, pero sin la pregunta del huérfano: aquí la
+            # política ya está decidida (la op queda esperando fondos) y no se marca como
+            # «asumida sin pagos», que es justo la señal que tiene que seguir encendida.
+            self.set_operation(
+                table, payment_id, None, completing_user=actor, allow_orphan=True
+            )
+            self.db.refresh(row)
+
+        row.owner_client_id = destination.id
+        self.db.add(
+            WhatsAppPaymentTransfer(
+                incoming_payment_id=row.id if table == "incoming" else None,
+                outgoing_payment_id=row.id if table == "outgoing" else None,
+                from_client_id=origin_client.id if origin_client else None,
+                from_client_phone=row.client_phone,
+                from_client_name=current_name,
+                to_client_id=destination.id,
+                reason=reason_enum,
+                note=(note or "").strip() or None,
+                unlinked_operation_id=unlinked_op_id,
+                created_by_user_id=actor.id if actor else None,
+            )
+        )
+        self.db.commit()
+        self.db.refresh(row)
+        return self._with_name(row)
+
+    def payment_timeline(self, table: str, payment_id: int) -> dict:
+        """
+        Bitácora del comprobante, de lo más reciente a lo más viejo.
+
+        Las mudanzas son historia de verdad —cada una es una fila de
+        `whatsapp_payment_transfers`— y por eso se apilan bien. El resto se DERIVA del estado
+        actual, porque el pago no lleva un log de auditoría general: hay una línea de
+        corrección si `corrected_at` está puesto, una de vínculo si hoy tiene operación, y
+        una de depósito o de saldo si acabó ahí. O sea: se ve QUÉ pasó, no cuántas veces.
+        Cuando exista un log general, esto se sustituye sin tocar el front — es él quien
+        recibe `title` y `detail` ya redactados.
+        """
+        row = self._get_or_404(table, payment_id)
+        items: list[dict] = []
+
+        for tr in row.transfers or []:
+            d = tr.dict()
+            detail = f"{d['from_client_name'] or 'Sin identificar'} → {d['to_client_name'] or ''}".strip()
+            reason_label = _TRANSFER_REASON_LABELS.get(d["reason"], d["reason"])
+            if reason_label:
+                detail = f"{detail}. Motivo: {reason_label}"
+            if d["note"]:
+                detail = f"{detail} — «{d['note']}»"
+            items.append({
+                "uuid": d["uuid"],
+                "kind": "TRANSFER",
+                "title": "Transferido a otro cliente",
+                "detail": detail,
+                "actor": d["transferred_by"],
+                "at": d["transferred_at"],
+            })
+            if d["unlinked_operation_uuid"]:
+                items.append({
+                    "uuid": f"{d['uuid']}:unlink",
+                    "kind": "UNLINK",
+                    "title": f"Desvinculado de {d['unlinked_operation_uuid']}",
+                    "detail": "Automático por la transferencia. La operación vuelve a esperar fondos.",
+                    "actor": None,
+                    "at": d["transferred_at"],
+                })
+
+        if row.corrected_at is not None:
+            items.append({
+                "uuid": f"payment:{row.id}:correction",
+                "kind": "CORRECTION",
+                "title": "Comprobante corregido a mano",
+                "detail": (
+                    f"El OCR había leído: {row.correction_original}"
+                    if row.correction_original else None
+                ),
+                "actor": None,
+                "at": row.corrected_at,
+            })
+
+        if row.operation is not None:
+            items.append({
+                "uuid": f"payment:{row.id}:operation",
+                "kind": "LINK",
+                "title": f"Vinculado a la operación {row.operation.uuid}",
+                "detail": None,
+                "actor": None,
+                "at": row.operation.created_at,
+            })
+
+        if table == "incoming":
+            for entry in (
+                self.db.query(WhatsAppBalanceEntry)
+                .filter(WhatsAppBalanceEntry.incoming_payment_id == row.id)
+                .all()
+            ):
+                items.append({
+                    "uuid": str(entry.uuid),
+                    "kind": "BALANCE",
+                    "title": f"Acreditado al saldo · {entry.amount} {entry.currency}",
+                    "detail": entry.notes,
+                    "actor": entry.created_by.username if entry.created_by else None,
+                    "at": entry.created_at,
+                })
+
+        source = (
+            FundPendingDeposit.source_outgoing_payment_id
+            if table == "outgoing"
+            else FundPendingDeposit.source_incoming_payment_id
+        )
+        for dep in (
+            self.db.query(FundPendingDeposit)
+            .filter(source == row.id, FundPendingDeposit.origin == FundPendingDepositOrigin.RECEIPT)
+            .all()
+        ):
+            items.append({
+                "uuid": str(dep.uuid),
+                "kind": "DEPOSIT",
+                "title": f"Registrado como depósito al fondo ({dep.status.value if dep.status else '—'})",
+                "detail": None,
+                "actor": None,
+                "at": dep.created_at,
+            })
+
+        # Lo más reciente arriba.
+        #
+        # No basta con ordenar por fecha. Las de las mudanzas las pone el servidor
+        # (`func.now()`, que en una transacción es el instante de su inicio) y otras vienen
+        # del proceso que las creó: dos eventos que en la vida real pasaron en orden pueden
+        # llegar con el mismo sello, o incluso invertidos por unos milisegundos. Así que el
+        # orden de emisión desempata —los eventos se generan arriba en orden— y la llegada del
+        # comprobante se ancla al final: nada pudo pasarle antes de existir.
+        for position, item in enumerate(items):
+            item["_seq"] = position
+        items.sort(key=lambda i: (i["at"] is not None, i["at"], i["_seq"]), reverse=True)
+        for item in items:
+            item.pop("_seq")
+
+        items.append({
+            "uuid": f"payment:{row.id}:created",
+            "kind": "OTHER",
+            "title": "Comprobante recibido",
+            "detail": None,
+            "actor": None,
+            "at": row.created_at,
+        })
+        return {"items": items}
 
     def unlink_preview(self, table: str, payment_id: int) -> dict:
         """
@@ -1616,11 +3022,16 @@ class WhatsAppPaymentService:
         payment_id: int,
         group_jid: Optional[str] = None,
         group_uuid: Optional[UUID] = None,
+        manager_phone: Optional[str] = None,
     ) -> dict:
         """
-        Marca un pago ENTRANTE como contabilizado en un grupo (FundGroup), al reenviarlo
-        el operador al grupo (escenario ZELLE_DIRECT). Resuelve el grupo por su JID de
-        WhatsApp (`whatsapp_group_jid`) o por uuid. No crea ningún saliente.
+        Marca un pago ENTRANTE como contabilizado en un fondo (FundGroup), al reenviarlo el
+        operador al canal de ese fondo (escenario ZELLE_DIRECT). No crea ningún saliente.
+
+        El canal es el grupo de WhatsApp o el chat directo con el gestor (`manager_phone`),
+        que es como se lleva «Cambios Colombia»; la regla de resolución es una sola, en
+        `fund_channel`. Cuando sólo se miraba el jid, el reenvío al chat de Dionis no se
+        reconocía y quedaba un saliente fantasma (pago 4951).
 
         El grupo se guarda en la OPERACIÓN del pago (el pago ya no tiene columna propia: el
         fondo se deriva de la op). Si el entrante todavía no está vinculado a una operación,
@@ -1628,15 +3039,7 @@ class WhatsAppPaymentService:
         que vuelve a fijar el grupo.
         """
         row = self._get_or_404("incoming", payment_id)
-        group = None
-        if group_uuid is not None:
-            group = self.db.query(FundGroup).filter(FundGroup.uuid == str(group_uuid)).first()
-        elif group_jid:
-            group = self.db.query(FundGroup).filter(FundGroup.whatsapp_group_jid == group_jid).first()
-        if group is None:
-            raise QuoteServiceError(
-                "fund_group_not_found", f"Fondo para grupo {group_uuid or group_jid} no encontrado", 404
-            )
+        group = resolve_fund_channel(self.db, group_jid, group_uuid, manager_phone)
         op = row.operation
         if op is not None and op.fund_group_id != group.id:
             op.fund_group_id = group.id
@@ -1793,7 +3196,21 @@ class WhatsAppPaymentService:
         el comprobante llegó reenviado al grupo, al cliente real lo atendió el operador por
         fuera del bot y todavía no sabemos quién es. La op nace con el cliente anónimo del
         grupo y se resuelve al vincular el saliente (`set_operation`) o desde su detalle.
+
+        `owner_client_id` manda sobre todo lo demás: es el dueño EXPLÍCITO del comprobante,
+        el que dejó una mudanza (`transfer_client`, o el vínculo que se llevó el pago a otra
+        operación). El teléfono del chat sigue siendo el de quien lo mandó, así que leerlo a
+        él hacía nacer la operación bajo el cliente del que acabábamos de sacar el pago —
+        justo el error que la mudanza venía a corregir.
         """
+        if getattr(row, "owner_client_id", None):
+            duenno = (
+                self.db.query(WhatsAppClient)
+                .filter(WhatsAppClient.id == row.owner_client_id)
+                .first()
+            )
+            if duenno is not None:
+                return duenno
         if (row.client_phone or "").endswith("@g.us"):
             source_group = (
                 self.db.query(FundGroup)
@@ -1812,8 +3229,27 @@ class WhatsAppPaymentService:
         exchange_user_uuid: Optional[UUID] = None,
         recorded_by_user_id: Optional[int] = None,
         fund_group_provided: bool = False,
+        notes: Optional[str] = None,
     ) -> dict:
-        row = self._get_or_404(table, payment_id)
+        """
+        El SELECT es `FOR UPDATE` y se rechaza si el comprobante ya tiene operación: sin esto,
+        un doble clic en "crear operación" (o un reintento del front tras un timeout) sobre el
+        MISMO comprobante suelto armaba DOS `WhatsAppOperation` -- cada una con su propia
+        transacción y fondo -- a partir de un solo pago real. A diferencia de `set_operation`
+        (que vincula a una operación YA EXISTENTE y sí rechazaba el duplicado), esta función
+        no comprobaba nada: el FK del pago se sobreescribía en silencio con la última que
+        terminara, dejando a la otra completada y contabilizada de más.
+        """
+        Model = self._model(table)
+        row = self.db.query(Model).filter(Model.id == payment_id).with_for_update().first()
+        if row is None:
+            raise QuoteServiceError("not_found", f"Pago {table}/{payment_id} no encontrado", 404)
+        if row.whatsapp_operation_id is not None:
+            raise QuoteServiceError(
+                "payment_already_linked",
+                "El pago ya tiene una operación creada; no se puede crear otra",
+                409,
+            )
         if table == "outgoing":
             self._assert_not_loan(payment_id)
         if from_amount <= 0 or to_amount <= 0:
@@ -1846,7 +3282,12 @@ class WhatsAppPaymentService:
         # la tasa que se terminó usando contra la base del par, así vale igual si el operador
         # cotizó a la tasa del día o a una propia.
         rate_used = to_amount / from_amount
-        entry = WhatsAppRateResolver(self.db).get_rate_entry_for_pair(from_currency, to_currency)
+        # Contra la tasa que regía CUANDO SE PAGÓ, no la de hoy: si no, un comprobante de
+        # ayer leído hoy sale con una ganancia que nadie cobró —la que inventa el movimiento
+        # de la tasa entre medias—. El front cotiza con esa misma tasa (`/rates/by-pair?at=`).
+        entry = WhatsAppRateResolver(self.db).get_rate_entry_for_pair(
+            from_currency, to_currency, at=row.created_at
+        )
         applied_percentage = WhatsAppRateResolver.implied_margin(entry, rate_used)
         op = WhatsAppOperation(
             client_id=client.id,
@@ -1865,6 +3306,7 @@ class WhatsAppPaymentService:
             applied_percentage=applied_percentage,
             default_percentage=entry.base_percentage if entry else None,
             amount_side=side,
+            notes=(notes or None),
             status=WhatsAppOperationStatus.PENDING,
             delivery_status=WhatsAppDeliveryStatus.PENDING if track_delivery else None,
             fund_group_id=group.id if group else None,
@@ -1877,6 +3319,9 @@ class WhatsAppPaymentService:
         # La op nace con los dos fondos resueltos por moneda; lo que ya vino puesto (el
         # entrante explícito o el heredado del comprobante) no se toca.
         self._resolve_fund_legs_for_new_op(op)
+        # Y con el escenario/receptor por defecto que el CONTENIDO del comprobante ya
+        # delata (entrante vs. saliente) — también sólo relleno, nunca pisa lo puesto a mano.
+        self._resolve_scenario_for_new_op(op, table)
         self.db.flush()
         row.whatsapp_operation_id = op.id
         # El entrante estrena su parte del reparto: lo que pide la op, y si el comprobante
@@ -1887,7 +3332,18 @@ class WhatsAppPaymentService:
             # Crear la operación DESDE un comprobante de salida afirma que ese pago es el que
             # la cubre: el valor se fijó mirándolo. Si el operador puso un valor distinto al
             # que da la tasa, la tasa efectiva del pago sale de ahí.
-            self._apply_settlement(row, op, from_amount)
+            #
+            # Pero eso vale sólo si el comprobante ES la pata que sale. Cuando la operación
+            # se arma desde UNO de varios pagos parciales, afirmarlo la deja saldada por un
+            # comprobante que cubre una fracción: la op 3898 (350 USD → 315.000 Bs) nació del
+            # pago 4938 (65.723 Bs, ~73 USD) marcado como los 350 enteros, y con el pendiente
+            # en cero los otros dos pagos móviles ya no la veían entre las sugeridas —el
+            # prorrateo de `expected_amount` sólo se activa con pendiente > 0—. Cuando el
+            # comprobante se queda corto se registra lo que de verdad cubre y el resto queda
+            # pendiente, que es lo que deja entrar a los que faltan.
+            self._apply_settlement(
+                row, op, from_amount if _covers_whole_payout(row, to_amount) else None
+            )
 
         # Con fondo en cualquiera de las dos patas hace falta la transacción, para que los
         # movimientos cuelguen de ella y se vayan con ella (FK ON DELETE CASCADE) si la op

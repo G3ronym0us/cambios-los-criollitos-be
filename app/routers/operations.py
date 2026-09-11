@@ -17,11 +17,12 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import get_current_user, get_moderator_user
+from app.core.dependencies import get_moderator_user
 from app.database.connection import get_db
 from app.models.user import User
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from app.schemas.whatsapp import (
+    OperationCoverageUpdate,
     ProfitAllocationList,
     ProfitAllocationResponse,
     ProfitAllocationUpdate,
@@ -35,6 +36,7 @@ from app.schemas.whatsapp import (
     WhatsAppStatsResponse,
 )
 from app.schemas.operation_match import (
+    OperationMatchItem,
     OperationRankRequest,
     OperationRankResponse,
     OperationScoreResponse,
@@ -53,28 +55,64 @@ router = APIRouter(prefix="/operations", tags=["Operations"])
 async def list_operations(
     status_filter: Optional[str] = Query(None, alias="status"),
     delivery_status: Optional[str] = Query(None),
+    scenario: Optional[str] = Query(None),
+    needs: Optional[str] = Query(
+        None,
+        description="Filtra por lo que hace falta hacer: settle | deliver | client | expiring | action",
+    ),
     phone: Optional[str] = Query(None),
+    search: Optional[str] = Query(None, description="Nombre o teléfono del cliente"),
     since: Optional[datetime] = Query(None),
+    order_by: str = Query(
+        "paid",
+        description="Fecha por la que ordenar: paid (comprobante de salida) | created",
+    ),
+    page: int = Query(1, ge=1),
     limit: int = Query(200, ge=1, le=500),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
-    """Lista operaciones del bot. Cualquier operador autenticado puede leer."""
+    """
+    Lista operaciones del bot, paginada. Cualquier operador autenticado puede leer.
+
+    `total` es el total tras los filtros, no el tamaño de la página: el listado del admin
+    lo necesita para dibujar el pie («26–50 de 312») y saber si hay página siguiente.
+    """
     service = WhatsAppQuoteService(db)
     try:
-        ops = service.list_operations(
+        ops, total = service.list_operations(
             phone=phone,
             status=status_filter,
             since=since,
             limit=limit,
             delivery_status=delivery_status,
+            offset=(page - 1) * limit,
+            search=search,
+            scenario=scenario,
+            needs=needs,
+            order_by=order_by,
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
-    # Marca qué operaciones ya tienen un pago entrante/saliente vinculado, para que el
-    # selector de "vincular pago" pueda ocultar las que ya están tomadas de ese lado.
-    op_ids = [op.id for op in ops]
+    inc_taken, out_taken = _payment_link_flags(db, [op.id for op in ops])
+    items = []
+    for op in ops:
+        d = op.dict()
+        d["has_incoming_payment"] = op.id in inc_taken
+        d["has_outgoing_payment"] = op.id in out_taken
+        items.append(WhatsAppOperationResponse.model_validate(d))
+    return WhatsAppOperationList(operations=items, total=total, page=page, limit=limit)
+
+
+def _payment_link_flags(db: Session, op_ids: list[int]) -> tuple[set[int], set[int]]:
+    """
+    Qué operaciones de este lote ya tienen un pago entrante/saliente vinculado.
+
+    Lo comparten `list_operations` (para que el listado pueda ocultarlas) y `/match` (para
+    que el cajón de "vincular pago" sepa qué candidatas ya están tomadas de ese lado) — antes
+    era el mismo bloque copiado en el primero; aquí se factoriza en vez de repetirlo.
+    """
     inc_taken: set[int] = set()
     out_taken: set[int] = set()
     if op_ids:
@@ -86,46 +124,73 @@ async def list_operations(
             r[0] for r in db.query(WhatsAppOutgoingPayment.whatsapp_operation_id)
             .filter(WhatsAppOutgoingPayment.whatsapp_operation_id.in_(op_ids)).distinct().all()
         }
-
-    items = []
-    for op in ops:
-        d = op.dict()
-        d["has_incoming_payment"] = op.id in inc_taken
-        d["has_outgoing_payment"] = op.id in out_taken
-        items.append(WhatsAppOperationResponse.model_validate(d))
-    return WhatsAppOperationList(operations=items, total=len(items))
+    return inc_taken, out_taken
 
 
 @router.post("/match", response_model=OperationRankResponse)
 async def rank_operations_for_payment(
     payload: OperationRankRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
-    Puntúa las operaciones recientes contra un comprobante, para que el selector de "vincular
-    pago" las ordene y marque la más probable. Misma implementación que usa el matcher
-    automático del bot (`app/services/operation_match_service.py`), con la política del
-    operador: aquí se sugiere y él confirma, así que es más permisiva que la del bot.
+    Filtra, puntúa contra el comprobante y ordena en un solo viaje: el cajón de "vincular
+    pago" ya no pide `GET /operations` aparte y cruza por `uuid` con lo que devolvía este
+    endpoint — los filtros (`phone`/`search`/`status`/`page`/`limit`) son los mismos que
+    `GET /operations`, y `order_by` reemplaza a los tres botones que antes ordenaban en el
+    navegador ("sugerida" / "monto" / "hora", `sortScored` en `LinkOperationPanel.tsx`).
+
+    La puntuación es la misma implementación que usa el matcher automático del bot
+    (`app/services/operation_match_service.py`), con la política del operador: aquí se
+    sugiere y él confirma, así que es más permisiva que la del bot.
     """
     service = OperationMatchService(db)
-    scored, suggestion = service.rank_for_payment(
-        payload.payment_id, payload.table, limit=payload.limit
+    result = service.rank_for_payment(
+        payload.payment_id,
+        payload.table,
+        phone=payload.phone,
+        search=payload.search,
+        status=payload.status,
+        order_by=payload.order_by,
+        page=payload.page,
+        limit=payload.limit,
+        scope=payload.scope,
     )
+
+    inc_taken, out_taken = _payment_link_flags(db, [op.id for op, _ in result.items])
+    items = []
+    for op, score in result.items:
+        d = op.dict()
+        d["has_incoming_payment"] = op.id in inc_taken
+        d["has_outgoing_payment"] = op.id in out_taken
+        items.append(
+            OperationMatchItem(
+                operation=WhatsAppOperationResponse.model_validate(d),
+                score=OperationScoreResponse(**vars(score)),
+            )
+        )
+
     return OperationRankResponse(
         suggestion=(
-            SuggestionResponse(uuid=suggestion.uuid, confident=suggestion.confident)
-            if suggestion
+            SuggestionResponse(uuid=result.suggestion.uuid, confident=result.suggestion.confident)
+            if result.suggestion
             else None
         ),
-        candidates=[OperationScoreResponse(**vars(s)) for s in scored],
+        items=items,
+        total=result.total,
+        page=result.page,
+        limit=result.limit,
+        # En desuso: el front desplegado hace `match?.candidates ?? []`. Mientras conviva con
+        # el nuevo —el backend recarga al instante y Vercel tarda minutos— sin esto perdería
+        # el sello «SUGERIDA» y el orden por monto sin dar un solo error.
+        candidates=[item.score for item in items],
     )
 
 
 @router.get("/stats", response_model=WhatsAppStatsResponse)
 async def get_operations_stats(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     service = WhatsAppQuoteService(db)
     return WhatsAppStatsResponse(**service.get_stats())
@@ -135,7 +200,7 @@ async def get_operations_stats(
 async def get_operation(
     op_uuid: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     service = WhatsAppQuoteService(db)
     op = service.get_by_uuid(op_uuid)
@@ -148,7 +213,7 @@ async def get_operation(
 async def get_operation_payments(
     op_uuid: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Pagos entrantes y salientes vinculados a la operación (para el detalle)."""
     service = WhatsAppPaymentService(db)
@@ -163,7 +228,7 @@ async def debit_balance_for_operation(
     op_uuid: UUID,
     payload: WhatsAppBalanceDebit,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Debita saldo a favor del cliente por esta operación de abono (default: from_amount USD)."""
     try:
@@ -178,7 +243,7 @@ async def debit_balance_for_operation(
 async def mark_operation_delivered(
     op_uuid: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Recibe los USD, completa la operación y asegura su transacción."""
     service = WhatsAppQuoteService(db)
@@ -194,7 +259,7 @@ async def update_operation(
     op_uuid: UUID,
     payload: WhatsAppOperationUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Edita cliente, escenario, grupo y receptor como una sola operación atómica."""
     service = WhatsAppQuoteService(db)
@@ -210,7 +275,7 @@ async def update_operation_status(
     op_uuid: UUID,
     payload: WhatsAppOperationStatusUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Cambia manualmente el estado; COMPLETED crea la transacción contable."""
     service = WhatsAppQuoteService(db)
@@ -226,7 +291,7 @@ async def update_operation_value(
     op_uuid: UUID,
     payload: WhatsAppOperationValue,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """
     Corrige cuánto vale el trato, hacia arriba o hacia abajo. Reescala la cotización, recorta
@@ -235,6 +300,51 @@ async def update_operation_value(
     service = WhatsAppPaymentService(db)
     try:
         return service.set_operation_value(op_uuid, payload.amount, actor=current_user)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.get("/{op_uuid}/coverage")
+async def get_operation_coverage(
+    op_uuid: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """
+    Qué cubre ya la operación y con qué comprobantes del cliente podría terminar de cubrirse.
+
+    Espejo de `/payments/outgoing/{id}/settlements`: la misma tabla leída por la otra columna.
+    Anclar en la operación es lo que permite cuadrar un trato pagado en partes sin llevar la
+    suma de cabeza.
+    """
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.operation_coverage(op_uuid)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.put("/{op_uuid}/coverage")
+async def set_operation_coverage(
+    op_uuid: UUID,
+    payload: OperationCoverageUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """
+    Fija con qué comprobantes se cubre la operación. Al cuadrarla la tasa se deriva de la suma;
+    el monto de la pata que sale no se teclea nunca.
+    """
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.set_operation_coverage(
+            op_uuid,
+            payments=[p.dict() for p in payload.payments],
+            value_amount=payload.value_amount,
+            uncovered=payload.uncovered.dict() if payload.uncovered else None,
+            partial=payload.partial,
+            actor=current_user,
+        )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
@@ -266,7 +376,7 @@ async def update_operation_scenario(
     op_uuid: UUID,
     payload: WhatsAppOperationScenarioUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Edición manual del escenario/grupo/receptor del entrante desde el dashboard."""
     service = WhatsAppQuoteService(db)
@@ -281,7 +391,7 @@ async def update_operation_scenario(
 async def get_profit_allocations(
     op_uuid: UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_moderator_user),
 ):
     """Quién se queda con el margen de esta operación, y cuánto quedó sin asignar."""
     service = WhatsAppQuoteService(db)

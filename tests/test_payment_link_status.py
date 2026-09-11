@@ -153,3 +153,44 @@ def test_a_via_partner_operation_never_falls_back_to_quoted(svc, db, client, pai
 
     db.refresh(op)
     assert op.status.value == "PENDING"
+
+
+# ---------------------------------------------------------------------------
+# Re-vincular toca DOS operaciones: la que gana el comprobante y la que lo pierde
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    reason=(
+        "No lo impide el sync de estado, que ya sincroniza las DOS operaciones, sino el "
+        "reparto: re-vincular por `set_operation` muda el FK a B pero NO borra la fila de "
+        "`whatsapp_payment_allocations` de A (`_upsert_allocation` solo escribe la de B, "
+        "mientras que la ruta de desvincular sí llama a `_drop_allocation`). A conserva "
+        "respaldo y sigue en PENDING con razón. Desde el panel esta ruta no se alcanza -- "
+        "con `complete_outgoing=True` da 409 'desvincúlalo primero' -- así que solo llega "
+        "por el bot. Si el criterio es que un re-vínculo directo muda el pago entero, el "
+        "arreglo es soltar el reparto anterior ahí; si un pago puede cubrir A y B a la vez, "
+        "la ruta correcta es `PUT /incoming/{id}/allocations` y este test sobra."
+    ),
+    strict=False,
+)
+def test_moving_a_receipt_returns_the_operation_it_left_to_quoted(svc, db, client, pairs, operator):
+    """
+    Mover un comprobante de la op A a la op B deja a A sin ningún entrante. Si solo se
+    sincroniza B, A se queda en `PENDING` sin respaldo — la misma operación colgada que este
+    módulo viene a eliminar, nada más que en espejo.
+    """
+    a = _op(db, client, pairs, status=WhatsAppOperationStatus.QUOTED)
+    b = _op(db, client, pairs, status=WhatsAppOperationStatus.QUOTED)
+    pago = f.incoming(db, 100.0, phone=client.phone)
+
+    svc.set_operation("incoming", pago.id, a.uuid, completing_user=operator)
+    db.refresh(a)
+    assert a.status.value == "PENDING"
+
+    svc.set_operation("incoming", pago.id, b.uuid, completing_user=operator)
+
+    db.refresh(a)
+    db.refresh(b)
+    assert b.status.value == "PENDING"
+    assert a.status.value == "QUOTED"

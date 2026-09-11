@@ -2167,10 +2167,17 @@ class WhatsAppPaymentService:
 
         # Espejo del lado saliente: el respaldo del cliente mueve la cotización a PENDING, y
         # quitarle el último comprobante la devuelve a QUOTED.
+        #
+        # Se sincronizan LAS DOS operaciones, porque re-vincular un comprobante toca dos: la
+        # que lo recibe y la que lo pierde. Con solo la primera, mover un pago de la op A a la
+        # B dejaba a A en PENDING sin un solo entrante — la misma operación colgada que este
+        # método viene a eliminar, nada más que en espejo. El orden importa: primero la que lo
+        # pierde, para que si A y B fueran la misma el estado final lo fije la que lo gana.
         if table == "incoming":
-            self._sync_status_from_incoming(
-                op or op_previa, completing_user, had_incoming=op_previa is not None
-            )
+            if op_previa is not None and (op is None or op_previa.id != op.id):
+                self._sync_status_from_incoming(op_previa, completing_user, had_incoming=True)
+            if op is not None:
+                self._sync_status_from_incoming(op, completing_user, had_incoming=True)
 
         # El libro sigue a la operación: si vincular este pago la completó, las patas del
         # fondo quedan al día. `_sync_status_from_delivery` ya comitea al completar la op;

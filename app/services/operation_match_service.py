@@ -169,22 +169,35 @@ class OutgoingCriteria:
     identification: Optional[str] = None
     phone_to: Optional[str] = None
     bank_to: Optional[str] = None
+    #: Cuenta destino de la transferencia, tal cual la leyó el OCR.
+    account_number: Optional[str] = None
     window_hours: int = DEFAULT_WINDOW_HOURS
     #: Momento del comprobante; si falta, se usa `now` al puntuar.
     created_at: Optional[datetime] = None
 
     def tokens(self) -> list[str]:
         """
-        Lo que identifica a UNA PERSONA en el comprobante: su cédula y su teléfono.
+        Lo que identifica a UN DESTINO en el comprobante: su cédula, su teléfono, su cuenta.
 
         El banco quedó fuera a propósito. Identifica a un banco entre veinte, y en Venezuela
         el 0102 es el más común de todos: cuando dos tratos del mismo monto van al mismo
         banco, ese token los empata a los dos y anula lo que la cédula ya había resuelto sola
-        (pago 5079 contra las ops 3968 y 3975, 2026-08-27). Es la misma lista que usa
-        `ForwardedCriteria`.
+        (pago 5079 contra las ops 3968 y 3975, 2026-08-27).
+
+        La CUENTA es lo contrario del banco: veinte dígitos que señalan a una sola. Entró
+        porque un comprobante de transferencia entre cuentas muchas veces no trae ni cédula
+        ni teléfono —el OCR saca la cuenta y nada más—, y sin ningún token el desempate de
+        `pick_auto_match` se abstiene entero. El 2026-09-13 eso dejó sueltos los tres
+        salientes de 14.410,54 Bs (pagos 5904/5905/5907) teniendo la cuenta escrita, letra por
+        letra, en las `notes` de sus operaciones (4921/4922/4923).
+
+        `ForwardedCriteria` se quedó con la lista corta: allí las candidatas son pagos, no
+        operaciones, y el desempate mira `identification`/`phone_to` de la otra fila.
         """
         return [
-            t for t in (self.identification, self.phone_to) if t and len(t) >= MIN_TOKEN_LENGTH
+            t
+            for t in (self.identification, self.phone_to, self.account_number)
+            if t and len(t) >= MIN_TOKEN_LENGTH
         ]
 
 
@@ -471,10 +484,12 @@ def pick_auto_match(
     """
     Política del BOT: vincula solo cuando no hay duda posible, porque nadie supervisa.
 
-    Del lado SALIENTE es la semántica histórica de `selectOperationForOutgoing`, preservada
-    sin cambios: ±1% sobre `to_amount` (sin prorratear), misma moneda, dentro de la ventana,
-    sin saliente previo — y si quedan varias, desambigua por tokens del comprobante dentro de
-    `notes`. Ambiguo ⇒ None: el comprobante queda suelto y lo vincula el operador.
+    Del lado SALIENTE arranca en la semántica histórica de `selectOperationForOutgoing`: ±1%
+    sobre `to_amount` (sin prorratear), misma moneda, dentro de la ventana, sin saliente
+    previo — y si quedan varias, desambigua por tokens del comprobante dentro de `notes`.
+    Ambiguo ⇒ None: el comprobante queda suelto y lo vincula el operador. La excepción es el
+    empate entre cotizaciones IDÉNTICAS, que se reparte en vez de abstenerse
+    (ver `_spread_over_equals`).
 
     Del lado ENTRANTE la regla es el espejo (`from_amount`, `from_currency`, sin entrante
     previo) más una condición extra: la operación tiene que seguir ABIERTA. Antes el bot no
@@ -518,18 +533,65 @@ def pick_auto_match(
         return matches[0].uuid
 
     tokens = criteria.tokens()
-    if not tokens:
+    if tokens:
+        # Gana la MEJOR coincidencia, no "la única que coincide en algo". Con `any` bastaba
+        # que un dato suelto apareciera para que una candidata sobreviviera, así que la que
+        # calzaba en todo empataba con la que calzaba de casualidad.
+        puntuadas = [(sum(1 for t in tokens if t in (c.notes or "")), c) for c in matches]
+        mejor = max(p for p, _ in puntuadas)
+        if mejor:
+            top = [c for p, c in puntuadas if p == mejor]
+            if len(top) == 1:
+                return top[0].uuid
+            # Empatadas arriba: siguen compitiendo, pero ya sin las que el token descartó.
+            matches = top
+
+    if incoming:
+        # Del lado ENTRANTE el empate se sigue dejando al operador. Un comprobante del cliente
+        # no es indivisible como el nuestro: puede repartirse entre varias operaciones
+        # (`whatsapp_payment_allocations`), y cuál salda cuál decide cuánto le queda por cobrar
+        # a cada una. Ahí elegir mal sí mueve números, así que no aplica el argumento de
+        # `_spread_over_equals`.
         return None
-    # Gana la MEJOR coincidencia, no "la única que coincide en algo". Con `any` bastaba que
-    # un dato suelto apareciera para que una candidata sobreviviera, así que la que calzaba
-    # en todo empataba con la que calzaba de casualidad. Un empate arriba sigue siendo
-    # ambiguo y se devuelve None: nadie supervisa al bot y vincular mal corrompe la data.
-    puntuadas = [(sum(1 for t in tokens if t in (c.notes or "")), c) for c in matches]
-    mejor = max(p for p, _ in puntuadas)
-    if mejor == 0:
+    return _spread_over_equals(matches)
+
+
+def _spread_over_equals(matches: Sequence[OperationCandidate]) -> Optional[str]:
+    """
+    El empate que los tokens no rompieron: o las candidatas son la MISMA cotización repetida
+    —y entonces da igual cuál se lleve el comprobante— o son distintas y no se toca ninguna.
+
+    Un cliente que encarga tres pagos pide tres cotizaciones, y si los tres son del mismo
+    monto las tres salen idénticas. Abstenerse ahí no protegía nada: los tres comprobantes
+    quedaban sueltos y el operador los repartía a mano exactamente igual, porque tampoco él
+    tiene con qué elegir. Peor, se repetía solo — el 2026-09-13 fueron 3 de 3 (ops 4921/4922/
+    4923 del socio dionis).
+
+    Elegir mal entre dos cotizaciones idénticas no mueve un bolívar de sitio: cambia qué fila
+    salda cuál, y las filas dicen lo mismo. La que se lleva un comprobante queda además con
+    `has_outgoing_payment` y sale del reparto, así que el siguiente cae en la otra, y el lote
+    entero es de un solo cliente dentro de 24 h.
+
+    Lo que el reparto SÍ asume es que cada comprobante es una transferencia distinta, y eso
+    hoy no está garantizado: `_already_received` sólo corre al crear ENTRANTES (ver
+    `create_payment`), así que la misma captura saliente subida dos veces son dos filas. No se
+    puede tapar con la referencia: en salientes el OCR la inventa —`001064681719` aparece en
+    seis pagos reales de montos distintos entre julio y septiembre de 2026, y `3123146340` es
+    el teléfono del propio cliente leído como referencia—, así que deduplicar por ella borraría
+    pagos buenos. El daño preexiste a este reparto (pagos 4970/4971, misma captura con 35 s de
+    diferencia, completaron las ops 3886 y 3887 con el matcher de una sola candidata); esto
+    sólo lo alcanza cuando además hay dos cotizaciones gemelas libres a la vez.
+
+    Se toma la MÁS ANTIGUA: con comprobantes que llegan de a uno, eso salda las cotizaciones
+    en el orden en que se pidieron.
+
+    Si las candidatas NO son idénticas la abstención se mantiene intacta — es el caso 5079
+    contra las ops 3968 y 3975, donde vincular a ojo sí manda el registro al beneficiario
+    equivocado.
+    """
+    if len({receipt_fingerprint(c.notes) for c in matches}) > 1:
         return None
-    top = [c for p, c in puntuadas if p == mejor]
-    return top[0].uuid if len(top) == 1 else None
+    return min(matches, key=lambda c: c.created_at).uuid
 
 
 #: Cuánto se puede apartar del objetivo un conjunto para seguir contando como "cuadra".

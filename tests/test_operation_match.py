@@ -77,9 +77,26 @@ def test_outside_24h_window_does_not_match():
     assert pick_auto_match(candidates, criteria(14757.0), NOW) is None
 
 
-def test_two_free_ops_same_amount_without_tokens_is_ambiguous():
-    """Sin tokens que desambigüen el bot NO vincula: decide el operador."""
+def test_two_indistinguishable_free_ops_are_shared_out_oldest_first():
+    """
+    Dos cotizaciones que dicen lo MISMO: el comprobante es de una de las dos y no hay con qué
+    saber cuál — tampoco lo tenía el operador, que las repartía a mano igual. Se toma la más
+    antigua y la otra queda libre para el siguiente comprobante.
+
+    Antes esto devolvía None (`test_two_free_ops_same_amount_without_tokens_is_ambiguous`).
+    Ver `_spread_over_equals`.
+    """
     candidates = [op("op-a", 14757.0, minutes_ago=3), op("op-b", 14757.0, minutes_ago=300)]
+    assert pick_auto_match(candidates, criteria(14757.0), NOW) == "op-b"
+
+
+def test_two_free_ops_that_say_different_things_stay_ambiguous():
+    """El reparto es solo entre IDÉNTICAS: si difieren, elegir a ojo manda el registro al
+    beneficiario equivocado, y se sigue prefiriendo dejarlo suelto."""
+    candidates = [
+        op("op-a", 14757.0, minutes_ago=3, notes="Pedro Pérez"),
+        op("op-b", 14757.0, minutes_ago=300, notes="Juana Rodríguez"),
+    ]
     assert pick_auto_match(candidates, criteria(14757.0), NOW) is None
 
 
@@ -90,6 +107,47 @@ def test_tokens_in_notes_disambiguate():
     ]
     got = pick_auto_match(candidates, criteria(14757.0, phone_to="04249999999"), NOW)
     assert got == "op-b"
+
+
+def test_account_number_disambiguates_when_there_is_no_id_or_phone():
+    """
+    Caso 2026-09-13 (pagos 5904/5905/5907 del socio dionis): tres cotizaciones del mismo monto
+    y comprobantes de transferencia sin cédula ni teléfono. La cuenta destino, que el OCR sí
+    sacó y que está escrita en las `notes`, es lo único que separa a la 4921 de las otras dos.
+    """
+    candidates = [
+        op("op-4921", 14410.54, minutes_ago=40, notes="01340251562512047589\nV31848355\nAngely"),
+        op("op-4922", 14410.54, minutes_ago=37, notes="01020123300000211200\nV24774193\nElsi"),
+    ]
+    got = pick_auto_match(
+        candidates, criteria(14410.54, account_number="01340251562512047589"), NOW
+    )
+    assert got == "op-4921"
+
+
+def test_three_identical_quotes_take_one_receipt_each():
+    """
+    El encargo de tres pagos iguales a la misma cuenta: tres cotizaciones idénticas y tres
+    comprobantes distintos (referencias distintas, ya deduplicadas aguas arriba). Cada uno se
+    lleva la suya en vez de quedarse los tres sueltos.
+    """
+    notas = "01020123300000211200\nV24774193\nElsi"
+    libres = {
+        "op-1": op("op-1", 14410.54, minutes_ago=60, notes=notas),
+        "op-2": op("op-2", 14410.54, minutes_ago=40, notes=notas),
+        "op-3": op("op-3", 14410.54, minutes_ago=20, notes=notas),
+    }
+    crit = criteria(14410.54, account_number="01020123300000211200")
+
+    asignadas = []
+    for _ in range(3):
+        got = pick_auto_match(list(libres.values()), crit, NOW)
+        assert got is not None
+        asignadas.append(got)
+        del libres[got]  # se la lleva: queda con saliente y sale del reparto
+
+    assert asignadas == ["op-1", "op-2", "op-3"]
+    assert libres == {}
 
 
 def test_token_shorter_than_four_chars_is_ignored():
@@ -179,6 +237,11 @@ def test_incoming_matches_a_pending_operation_too():
 
 
 def test_incoming_with_two_open_operations_of_the_same_amount_is_ambiguous():
+    """
+    El empate entrante NO se reparte, a diferencia del saliente: el comprobante del cliente
+    puede repartirse entre varias ops y cuál salda cuál cambia lo que le queda por cobrar a
+    cada una. Ver el corte por `incoming` en `pick_auto_match`.
+    """
     candidates = [op_in("a", 60.0, minutes_ago=3), op_in("b", 60.0, minutes_ago=40)]
     assert pick_auto_match(candidates, crit_in(60.0), NOW, "incoming") is None
 
@@ -658,11 +721,24 @@ def test_the_best_match_wins_over_a_partial_one():
     assert pick_auto_match(candidates, c, NOW) == "op-completa"
 
 
-def test_a_tie_at_the_top_is_still_ambiguous():
-    """Dos que calzan igual de bien siguen siendo dudosas: el bot no adivina."""
+def test_a_tie_at_the_top_between_equals_is_shared_out():
+    """
+    Dos que calzan igual de bien PORQUE dicen lo mismo: son la misma cotización pedida dos
+    veces y el comprobante cierra una de ellas. Antes se abstenía; ver `_spread_over_equals`.
+    """
     candidates = [
         op("op-1", 500.0, notes="V14110025"),
         op("op-2", 500.0, notes="V14110025"),
+    ]
+    c = criteria(500.0, identification="V14110025")
+    assert pick_auto_match(candidates, c, NOW) == "op-1"
+
+
+def test_a_tie_at_the_top_between_different_ops_is_still_ambiguous():
+    """El token empata pero las notas no: hay algo que las separa y el bot no adivina."""
+    candidates = [
+        op("op-1", 500.0, notes="V14110025 para Pedro"),
+        op("op-2", 500.0, notes="V14110025 para Juana"),
     ]
     c = criteria(500.0, identification="V14110025")
     assert pick_auto_match(candidates, c, NOW) is None

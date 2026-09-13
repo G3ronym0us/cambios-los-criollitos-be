@@ -402,6 +402,7 @@ def match_operation_for_payment(
         identification=payload.identification,
         phone_to=payload.phone_to,
         bank_to=payload.bank_to,
+        account_number=payload.account_number,
         window_hours=payload.window_hours,
     )
     op = OperationMatchService(db).auto_match(

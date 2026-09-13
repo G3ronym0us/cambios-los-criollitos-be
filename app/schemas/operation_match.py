@@ -21,6 +21,9 @@ class OutgoingMatchRequest(BaseModel):
     identification: Optional[str] = None
     phone_to: Optional[str] = None
     bank_to: Optional[str] = None
+    #: Cuenta destino. Desempata donde cédula y teléfono no vienen, que es lo normal en un
+    #: comprobante de transferencia entre cuentas (ver `OutgoingCriteria.tokens`).
+    account_number: Optional[str] = None
     window_hours: int = Field(DEFAULT_WINDOW_HOURS, ge=1, le=720)
     #: Alcance: el cliente que lo envió, o el grupo (escenario VIA_PARTNER).
     client_phone: Optional[str] = None

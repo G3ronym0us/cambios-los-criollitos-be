@@ -87,11 +87,47 @@ def test_ignora_correo_del_futuro():
     assert chosen is None and count == 0
 
 
-def test_con_dos_candidatos_toma_el_mas_antiguo_y_los_cuenta():
-    # El aviso tiene que poder decir "había 2 correos de $30,00 sin asignar".
+def test_con_dos_candidatos_toma_el_mas_cercano_al_comprobante_y_los_cuenta():
+    # El pago es a las 18:10; el correo de las 18:05 está a 5 min y el de las 18:20, a 10.
+    # El aviso tiene que poder decir además "había 2 correos de $30,00 sin asignar".
     chosen, count = pick([cand(2, "30.00", minutes_ago=10), cand(1, "30.00", minutes_ago=25)])
     assert chosen is not None and chosen.id == 1
     assert count == 2
+
+
+def test_el_correo_cercano_le_gana_a_uno_viejo_de_la_misma_cifra():
+    """
+    El caso de producción: el cliente paga, manda la captura dos minutos después, y en la
+    ventana de 12 h hay un correo del mismo monto de otra persona, de diez horas antes. Con
+    "gana el más antiguo" se confirmaba con ese —nombre equivocado en el aviso, y el correo
+    del otro pago consumido—: 30 de 192 confirmaciones salieron así.
+    """
+    viejo = cand(1, "30.00", minutes_ago=10 * 60)
+    cercano = cand(2, "30.00", minutes_ago=22)
+
+    chosen, count = pick([viejo, cercano])
+
+    assert chosen is not None and chosen.id == 2
+    assert count == 2
+
+
+def test_el_correo_que_llega_despues_de_la_captura_sigue_confirmando():
+    """
+    El correo del banco se demora y aterriza DESPUÉS del comprobante (de ahí el "Tardó N min
+    en aparecer" del aviso). Por eso la cercanía se mide en los dos sentidos: exigir que
+    fuera anterior dejaría estos pagos sin confirmar.
+    """
+    chosen, _ = pick([cand(1, "30.00", minutes_ago=5)])
+    assert chosen is not None and chosen.id == 1
+
+
+def test_a_igual_distancia_gana_el_mas_antiguo():
+    """Desempate fijo: la elección no puede depender del orden en que vengan las filas."""
+    antes = cand(1, "30.00", minutes_ago=25)   # 5 min antes del pago
+    despues = cand(2, "30.00", minutes_ago=15)  # 5 min después
+
+    assert pick([antes, despues])[0].id == 1
+    assert pick([despues, antes])[0].id == 1
 
 
 def test_elige_solo_entre_los_del_monto_correcto():

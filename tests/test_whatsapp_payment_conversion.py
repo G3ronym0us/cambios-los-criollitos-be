@@ -4,6 +4,7 @@ from uuid import uuid4
 
 import pytest
 
+from app.models.bank_email import BankEmailVerification
 from app.models.fund import FundMovement
 from app.models.whatsapp_operation import WhatsAppOperationStatus
 from app.models.whatsapp_balance import WhatsAppBalanceEntry
@@ -115,6 +116,9 @@ def test_convert_incoming_to_outgoing_preserves_receipt_date_and_operation():
         (FundMovement.id, "incoming_has_deposit"),
         (WhatsAppBalanceEntry.id, "incoming_has_balance_credit"),
         (WhatsAppOutgoingPayment.id, "incoming_is_payment_source"),
+        # Borrar el pago desanclaría su correo —CASCADE en la verificación, SET NULL en
+        # `consumed_by_payment_id`— y ese correo podría confirmar después a otro pago.
+        (BankEmailVerification.id, "incoming_confirmed_by_email"),
     ],
 )
 def test_convert_incoming_rejects_already_accounted_payments(model, code):

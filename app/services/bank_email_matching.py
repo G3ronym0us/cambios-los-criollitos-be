@@ -46,8 +46,20 @@ def pick_email_confirmation(
     Elige el correo que confirma un pago. Devuelve (elegido, cuántos había en ventana).
 
     `candidates` ya viene filtrado por SQL a notificaciones SIN consumir. Acá se aplican
-    monto exacto y ventana; con varios se toma el más antiguo y el contador deja que el
-    llamador avise de la ambigüedad — una confirmación equivocada haría entregar Bs de más.
+    monto exacto y ventana; con varios gana **el más cercano en el tiempo al comprobante** y
+    el contador deja que el llamador avise de la ambigüedad — una confirmación equivocada
+    haría entregar Bs de más.
+
+    Antes ganaba el más antiguo de la ventana, y la ventana mira 12 horas atrás: de 192
+    confirmaciones, 30 se llevaron un correo que no era el más cercano. El caso típico era el
+    cliente que paga, manda la captura dos minutos después y se confirma con un correo de
+    diez horas antes, de otra persona — con el nombre equivocado en el aviso y, peor, con el
+    correo de ESE otro pago ya consumido.
+
+    Se mide la distancia en los dos sentidos, no «el último antes del comprobante»: el correo
+    del banco a veces llega DESPUÉS de la captura (de ahí el «Tardó N min en aparecer» del
+    aviso), y exigir que fuera anterior dejaría esos pagos sin confirmar. A igual distancia
+    gana el más antiguo, para que la elección no dependa del orden en que vengan las filas.
     """
     floor = payment_created_at - timedelta(hours=LOOKBACK_HOURS)
     in_window = [
@@ -56,7 +68,7 @@ def pick_email_confirmation(
     ]
     if not in_window:
         return None, 0
-    in_window.sort(key=lambda c: c.received_at)
+    in_window.sort(key=lambda c: (abs(c.received_at - payment_created_at), c.received_at))
     return in_window[0], len(in_window)
 
 

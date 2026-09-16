@@ -49,6 +49,7 @@ from app.models.whatsapp_payment_transfer import (
     PaymentTransferReason,
     WhatsAppPaymentTransfer,
 )
+from app.models.bank_email import BankEmailVerification, BankEmailVerificationStatus
 from app.models.client_loan import ClientLoan
 from app.repositories.currency_pair_repository import CurrencyPairRepository
 from app.repositories.fund_repository import FundRepository
@@ -3149,6 +3150,25 @@ class WhatsAppPaymentService:
             raise QuoteServiceError(
                 "incoming_is_payment_source",
                 "Este pago está enlazado a otro comprobante saliente y no puede convertirse",
+                409,
+            )
+
+        # El correo que confirmó este pago queda anclado a él para siempre. Borrar el pago lo
+        # desancla solo: la verificación se va por CASCADE y `consumed_by_payment_id` vuelve a
+        # NULL por el SET NULL de la FK, así que ese correo podría confirmar DESPUÉS a otro
+        # pago del mismo monto — y el bueno se quedaría esperando.
+        confirmed = (
+            self.db.query(BankEmailVerification.id)
+            .filter(
+                BankEmailVerification.incoming_payment_id == payment_id,
+                BankEmailVerification.status == BankEmailVerificationStatus.CONFIRMED,
+            )
+            .first()
+        )
+        if confirmed is not None:
+            raise QuoteServiceError(
+                "incoming_confirmed_by_email",
+                "Este pago ya fue confirmado por correo y no puede convertirse en saliente",
                 409,
             )
 

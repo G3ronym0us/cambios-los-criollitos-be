@@ -20,6 +20,12 @@ class CurrencyPairBase(BaseModel):
     #: «Por entregar» deja de exigirlo en este par —si no, el par entero sale vacío— y lo
     #: que quede sin cuadrar se lee al revés: no es lo que debemos, es lo que nos deben.
     settles_in_cash: bool = False
+    #: Fondo por defecto de cada pata y los puntos del margen que se queda. Un porcentaje
+    #: sin su fondo no significa nada: lo rechaza el repositorio, que ve también lo guardado.
+    default_fund_in_uuid: Optional[UUID] = None
+    default_fund_in_profit_pct: Optional[float] = Field(None, gt=0, le=100)
+    default_fund_out_uuid: Optional[UUID] = None
+    default_fund_out_profit_pct: Optional[float] = Field(None, gt=0, le=100)
     binance_tracked: bool = False
     banks_to_track: Optional[List[str]] = None
     amount_to_track: Optional[Decimal] = None
@@ -110,6 +116,11 @@ class CurrencyPairUpdate(BaseModel):
     is_active: Optional[bool] = None
     is_monitored: Optional[bool] = None
     settles_in_cash: Optional[bool] = None
+    # `null` explícito quita el fondo; ausente lo deja como está (`exclude_unset`).
+    default_fund_in_uuid: Optional[UUID] = None
+    default_fund_in_profit_pct: Optional[float] = Field(None, gt=0, le=100)
+    default_fund_out_uuid: Optional[UUID] = None
+    default_fund_out_profit_pct: Optional[float] = Field(None, gt=0, le=100)
     binance_tracked: Optional[bool] = None
     banks_to_track: Optional[List[str]] = None
     amount_to_track: Optional[Decimal] = None
@@ -200,6 +211,12 @@ class CurrencyPairResponse(BaseModel):
     is_active: bool
     is_monitored: bool
     settles_in_cash: bool = False
+    default_fund_in_uuid: Optional[UUID] = None
+    default_fund_in_name: Optional[str] = None
+    default_fund_in_profit_pct: Optional[float] = None
+    default_fund_out_uuid: Optional[UUID] = None
+    default_fund_out_name: Optional[str] = None
+    default_fund_out_profit_pct: Optional[float] = None
     binance_tracked: bool
     banks_to_track: Optional[List[str]] = None
     amount_to_track: Optional[Decimal] = None

@@ -26,6 +26,9 @@ from app.models.user import User
 from app.models.whatsapp_client import WhatsAppClient
 from app.models.whatsapp_operation import WhatsAppOperation
 
+#: Marca las filas que puso el par, para distinguirlas de un reparto hecho a mano.
+PAIR_DEFAULT_NOTE = "Reparto por defecto del par"
+
 
 class ProfitAllocationService:
     def __init__(self, db: Session):
@@ -57,9 +60,16 @@ class ProfitAllocationService:
 
     def ensure_defaults(self, op: WhatsAppOperation) -> list[OperationProfitAllocation]:
         """
-        Reparto por defecto de una operación que aún no lo tiene: todo al fondo que **pagó**;
-        si esa pata no tiene fondo, al que recibió. Por el porcentaje configurado en ese fondo.
-        Nunca más de lo cobrado —dar más que el margen es una decisión explícita, no un default.
+        Reparto por defecto de una operación que aún no lo tiene.
+
+        Si el PAR declara porcentajes (ZELLE-BRL: 7 Zelle + 3 Brasil), una fila por cada pata
+        que tenga fondo y porcentaje, con ese porcentaje exacto **aunque la suma pase lo
+        cobrado**: son la meta del negocio, y la diferencia corre por cuenta del operador (o
+        se reescala con `scale_to_charged`). La fila va al fondo que la pata tiene de verdad:
+        si el comprobante cambió la entrada, el 7% va a ese fondo.
+
+        Si no, como siempre: todo al fondo que **pagó**; si esa pata no tiene fondo, al que
+        recibió. Por el porcentaje configurado en ese fondo y nunca más de lo cobrado.
 
         Una operación sin fondo no reparte: su ganancia sigue siendo el margen cobrado, sin
         atribuir a nadie (es como se contabilizaba hasta ahora).
@@ -67,6 +77,31 @@ class ProfitAllocationService:
         existing = self.allocations(op)
         if existing:
             return existing
+
+        pair = op.currency_pair
+        if pair is not None and (
+            pair.default_fund_in_profit_pct is not None
+            or pair.default_fund_out_profit_pct is not None
+        ):
+            legs = [
+                (op.fund_group_id, pair.default_fund_in_profit_pct),
+                (op.fund_group_out_id, pair.default_fund_out_profit_pct),
+            ]
+            for group_id, percentage in legs:
+                if group_id is None or not percentage or percentage <= 0:
+                    continue
+                self.db.add(
+                    OperationProfitAllocation(
+                        whatsapp_operation_id=op.id,
+                        destination_type=ProfitAllocationDestination.FUND,
+                        fund_group_id=group_id,
+                        percentage=float(percentage),
+                        notes=PAIR_DEFAULT_NOTE,
+                    )
+                )
+            self.db.flush()
+            self.db.refresh(op)
+            return self.allocations(op)
 
         # Gana el fondo que puso la plata. Si esa pata no tiene fondo (las operaciones que
         # pagan en bolívares, que son la mayoría), sigue ganando el de entrada, que es como
@@ -166,6 +201,49 @@ class ProfitAllocationService:
         self.db.flush()
         self.db.refresh(op)
         return self.allocations(op)
+
+    def scale_to_charged(
+        self, op: WhatsAppOperation, actor: Optional[User] = None
+    ) -> list[OperationProfitAllocation]:
+        """
+        Reescala el reparto en proporción para que sume lo cobrado: 7/3 cobrado al 8% queda
+        en 5,6/2,4. Conserva destinos y notas, y queda firmado por quien lo hizo.
+        """
+        allocations = self.allocations(op)
+        if not allocations:
+            raise ValueError("La operación no tiene reparto que ajustar")
+        charged = float(op.applied_percentage or 0)
+        if charged <= 0:
+            raise ValueError("La operación no tiene margen cobrado al que ajustar el reparto")
+        total = sum(float(a.percentage or 0) for a in allocations)
+        if total <= 0:
+            raise ValueError("El reparto no tiene porcentajes que escalar")
+
+        scaled = [round(float(a.percentage or 0) * charged / total, 4) for a in allocations]
+        # El redondeo no puede dejar un 0,0001 fuera: la última fila absorbe la diferencia.
+        scaled[-1] = round(charged - sum(scaled[:-1]), 4)
+
+        specs = [
+            {
+                "destination_type": a.destination_type.value,
+                "percentage": percentage,
+                "fund_group_uuid": a.fund_group.uuid if a.fund_group else None,
+                "client_uuid": a.client.uuid if a.client else None,
+                "notes": a.notes,
+            }
+            for a, percentage in zip(allocations, scaled)
+        ]
+        rows = self.set_allocations(op, specs, actor=actor)
+
+        # `set_allocations` sólo firma lo que se pasa de lo cobrado; esto cuadra justo, pero
+        # es igual una decisión del operador sobre la meta del par y tiene que verse quién.
+        if actor is not None:
+            now = datetime.now(timezone.utc)
+            for row in rows:
+                row.approved_by_user_id = actor.id
+                row.approved_at = now
+            self.db.flush()
+        return rows
 
     def sync_amounts(self, op: WhatsAppOperation, value_usdt: Optional[float]) -> None:
         """Pone en cada destino cuánto le toca en USDT, según el valor actual de la operación."""

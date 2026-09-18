@@ -5,6 +5,7 @@ from datetime import datetime
 from uuid import UUID
 from app.models.currency_pair import CurrencyPair
 from app.models.currency import Currency
+from app.models.fund import FundGroup
 from app.schemas.currency_pair import CurrencyPairCreate, CurrencyPairUpdate
 
 class CurrencyPairRepository:
@@ -113,6 +114,8 @@ class CurrencyPairRepository:
                 raise ValueError("USDT conversion pair not found")
             usdt_pair_id = usdt_pair.id
 
+        default_funds = self._resolve_default_funds(pair_data.dict())
+
         db_pair = CurrencyPair(
             from_currency_id=from_currency.id,
             to_currency_id=to_currency.id,
@@ -139,8 +142,10 @@ class CurrencyPairRepository:
             rounding_amount_side=pair_data.rounding_amount_side,
             negotiation_step=pair_data.negotiation_step,
             negotiation_step_side=pair_data.negotiation_step_side,
+            **default_funds,
         )
-        
+        self._check_default_funds(db_pair)
+
         # Validate base pair configuration
         valid_base, base_error = db_pair.validate_base_pair()
         if not valid_base:
@@ -270,6 +275,33 @@ class CurrencyPairRepository:
                 (CurrencyPair.to_currency_id == currency_id)
             ).all()
 
+    def _resolve_default_funds(self, data: dict) -> dict:
+        """
+        Traduce `default_fund_{in,out}_uuid` a ids. Sólo toca las patas que vienen en `data`:
+        un uuid en `None` quita el fondo, uno ausente lo deja como está.
+        """
+        resolved = {}
+        for side in ('in', 'out'):
+            key = f'default_fund_{side}_uuid'
+            if key not in data:
+                continue
+            if data[key] is None:
+                resolved[f'default_fund_{side}_id'] = None
+                continue
+            group = self.db.query(FundGroup).filter(FundGroup.uuid == str(data[key])).first()
+            if group is None:
+                raise ValueError(f"Fondo {data[key]} no encontrado")
+            resolved[f'default_fund_{side}_id'] = group.id
+        return resolved
+
+    @staticmethod
+    def _check_default_funds(pair: CurrencyPair) -> None:
+        """Un porcentaje del margen sin su fondo no se lo lleva nadie: se rechaza."""
+        if pair.default_fund_in_profit_pct is not None and pair.default_fund_in_id is None:
+            raise ValueError("El porcentaje del fondo de entrada necesita un fondo de entrada")
+        if pair.default_fund_out_profit_pct is not None and pair.default_fund_out_id is None:
+            raise ValueError("El porcentaje del fondo de salida necesita un fondo de salida")
+
     async def update_currency_pair(self, pair_id: int, pair_data: CurrencyPairUpdate) -> Optional[CurrencyPair]:
         """Update currency pair"""
         pair = self.get_by_id(pair_id)
@@ -299,8 +331,15 @@ class CurrencyPairRepository:
             update_data['usdt_pair_id'] = None
             del update_data['usdt_pair_uuid']
 
+        update_data.update(self._resolve_default_funds(update_data))
+        for key in ('default_fund_in_uuid', 'default_fund_out_uuid'):
+            update_data.pop(key, None)
+
         for field, value in update_data.items():
             setattr(pair, field, value)
+
+        # Después de aplicar: el porcentaje puede venir solo y apoyarse en el fondo guardado.
+        self._check_default_funds(pair)
         
         # Validate binance tracking requirements if it's being enabled
         if pair.binance_tracked:

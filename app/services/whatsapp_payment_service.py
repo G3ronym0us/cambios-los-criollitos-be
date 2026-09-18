@@ -51,7 +51,6 @@ from app.models.whatsapp_payment_transfer import (
 )
 from app.models.client_loan import ClientLoan
 from app.repositories.currency_pair_repository import CurrencyPairRepository
-from app.repositories.fund_repository import FundRepository
 from app.services import valuation
 from app.schemas.whatsapp import WhatsAppOperationComplete
 from app.services.operation_match_service import receipt_fingerprint, suggest_combination
@@ -2419,25 +2418,26 @@ class WhatsAppPaymentService:
 
     def _resolve_fund_legs_for_new_op(self, op: WhatsAppOperation) -> None:
         """
-        Completa los fondos que la operación no trae, por la moneda de cada pata.
+        Completa los fondos que la operación no trae, con el fondo por defecto del PAR.
 
-        Corre UNA vez, al nacer la operación. Lo que el caller ya puso (el fondo elegido a
-        mano, o el heredado del comprobante) no se pisa: solo se rellena lo que está en NULL.
+        Corre UNA vez, al nacer la operación. Orden por pata: elegido a mano > heredado del
+        comprobante > defecto del par > sin fondo. Lo que el caller ya puso no se pisa: solo
+        se rellena lo que está en NULL.
+
+        Antes se resolvía por la moneda de cada pata, y la moneda no dice nada del negocio:
+        664 operaciones USD-VES —efectivo— cayeron en `Zelle/Paypal` sólo por ser el fondo
+        en dólares. Un par sin fondo configurado da una operación sin fondo, y eso es normal.
+        Un fondo por defecto desactivado tampoco se asigna.
         """
         cp = op.currency_pair
         if cp is None:
             return
-        repo = FundRepository(self.db)
-        if op.fund_group_id is None and cp.from_currency:
-            group = repo.get_active_group_by_currency(
-                settlement_currency(cp.from_currency.symbol)
-            )
-            op.fund_group_id = group.id if group else None
-        if op.fund_group_out_id is None and cp.to_currency:
-            group = repo.get_active_group_by_currency(
-                settlement_currency(cp.to_currency.symbol)
-            )
-            op.fund_group_out_id = group.id if group else None
+        if op.fund_group_id is None:
+            group = cp.default_fund_in
+            op.fund_group_id = group.id if group is not None and group.is_active else None
+        if op.fund_group_out_id is None:
+            group = cp.default_fund_out
+            op.fund_group_out_id = group.id if group is not None and group.is_active else None
 
     def _sole_fund_partner(self, fund_group_id: Optional[int]) -> Optional[User]:
         """
@@ -3316,7 +3316,7 @@ class WhatsAppPaymentService:
         )
         self.db.add(op)
         self.db.flush()
-        # La op nace con los dos fondos resueltos por moneda; lo que ya vino puesto (el
+        # La op nace con los dos fondos por defecto del par; lo que ya vino puesto (el
         # entrante explícito o el heredado del comprobante) no se toca.
         self._resolve_fund_legs_for_new_op(op)
         # Y con el escenario/receptor por defecto que el CONTENIDO del comprobante ya

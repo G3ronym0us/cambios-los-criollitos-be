@@ -243,12 +243,15 @@ def test_cambiar_el_valor_reajusta_las_dos_patas(db, pairs, client, fund, operat
 
 
 def test_una_operacion_nueva_resuelve_sus_fondos_sola(db, fund, pairs, client, operator):
-    """Nace con los fondos puestos según la moneda de cada pata."""
+    """Nace con los fondos por defecto del par en cada pata."""
     from app.services.whatsapp_payment_service import WhatsAppPaymentService
     from tests import factories as f
 
     brasil = FundGroup(name="Brasil", currency="BRL", is_active=True)
     db.add(brasil)
+    db.flush()
+    pairs["ZELLE-BRL"].default_fund_in_id = fund.id
+    pairs["ZELLE-BRL"].default_fund_out_id = brasil.id
     db.flush()
 
     svc = WhatsAppPaymentService(db)
@@ -316,6 +319,8 @@ def test_solo_la_pata_saliente_resuelve_fondo_igual_crea_transaccion_y_movimient
 
     brasil = FundGroup(name="Brasil", currency="BRL", is_active=True)
     db.add(brasil)
+    db.flush()
+    pairs["USDT-BRL"].default_fund_out_id = brasil.id
     db.flush()
 
     svc = WhatsAppPaymentService(db)

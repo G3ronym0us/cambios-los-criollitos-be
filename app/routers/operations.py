@@ -438,6 +438,37 @@ async def set_profit_allocations(
     return _profit_allocation_list(db, op)
 
 
+@router.post(
+    "/{op_uuid}/profit-allocations/scale-to-charged", response_model=ProfitAllocationList
+)
+async def scale_profit_allocations_to_charged(
+    op_uuid: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """
+    Reescala el reparto en proporción para que sume lo cobrado: un 7/3 cobrado al 8% queda
+    en 5,6/2,4. Queda firmado por quien lo hizo y resincroniza la transacción. Con reparto
+    vacío o sin margen cobrado → 400. Requiere moderador.
+    """
+    service = WhatsAppQuoteService(db)
+    op = service.get_by_uuid(op_uuid)
+    if op is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Operación no encontrada")
+
+    try:
+        ProfitAllocationService(db).scale_to_charged(op, actor=current_user)
+        service.resync_transaction(op)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+    db.commit()
+    db.refresh(op)
+    return _profit_allocation_list(db, op)
+
+
 def _profit_allocation_list(db: Session, op) -> ProfitAllocationList:
     allocation_svc = ProfitAllocationService(db)
     allocations = allocation_svc.allocations(op)

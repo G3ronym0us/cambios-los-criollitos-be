@@ -289,7 +289,10 @@ async def update_currency_pair(
             detail="Currency pair not found"
         )
 
-    updated_pair = await pair_repo.update_currency_pair(existing_pair.id, pair_data)
+    try:
+        updated_pair = await pair_repo.update_currency_pair(existing_pair.id, pair_data)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     if not updated_pair:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

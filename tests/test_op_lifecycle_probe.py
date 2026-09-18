@@ -214,9 +214,10 @@ def test_reassigning_the_fund_group_of_a_completed_op_via_update_operation_keeps
         from_currency="ZELLE", to_currency="VES", amount=100, amount_side="SEND",
         notes="datos de pago",
     )
-    # "fund" es el ÚNICO fondo USD activo al nacer -con dos, `get_active_group_by_currency`
-    # no adivina y la deja sin fondo (ver el propio repositorio); por eso `fund_b` se crea
-    # DESPUÉS, cuando ya no puede interferir con la resolución automática.
+    # La op nace con el fondo por defecto del par; `fund_b` se crea DESPUÉS para que sólo
+    # pueda llegar a la op por la corrección a mano que se está probando.
+    pairs["ZELLE-VES"].default_fund_in_id = fund.id
+    db.flush()
     op = quote_svc.create_quote(payload)
     db.refresh(op)
     assert op.fund_group_id == fund.id

@@ -184,9 +184,14 @@ Tres, y cada uno con una moneda: `Zelle/Paypal` (USD), `Cambios Colombia` (COP),
 `Cambios Brasil` (BRL). **No hay fondo en bolívares y es deliberado**: los bolívares se
 manejan en efectivo, fuera del libro de fondos, y esa pata no deja movimiento.
 
-Por eso una operación ZELLE-VES cae sola en `Zelle/Paypal`: `_resolve_fund_legs_for_new_op`
-traduce ZELLE y PAYPAL a USD y busca el único fondo activo de esa moneda. Si hubiera dos de
-la misma moneda **no adivina** a propósito, y la pata queda sin fondo.
+El fondo de una operación nueva lo dice **el par**, no la moneda: `CurrencyPair` lleva
+`default_fund_in_id` / `default_fund_out_id` y los puntos del margen de cada uno, y
+`_resolve_fund_legs_for_new_op` sólo rellena lo que nadie eligió a mano ni heredó del
+comprobante. **Un par sin fondo da una operación sin fondo**, y es normal: USD-VES es efectivo
+y no va a ningún fondo, aunque sea en dólares. Resolverlo por moneda metió 664 de esas en
+`Zelle/Paypal`. Con porcentajes en el par (ZELLE-BRL: 7 Zelle + 3 Brasil) el reparto por
+defecto los aplica tal cual, aunque se haya cobrado distinto; «Ajustar a lo cobrado» los
+reescala.
 
 Cada fondo tiene a Diohandres más un socio (`Zelle/Paypal`→jean, `Cambios Colombia`→dionis,
 `Cambios Brasil`→Diodimar). Diohandres es siempre quien paga.

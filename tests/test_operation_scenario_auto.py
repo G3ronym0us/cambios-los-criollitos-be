@@ -70,6 +70,9 @@ def test_outgoing_bs_receipt_defaults_to_via_partner_with_the_fund_partner(
     receptor del entrante que nunca llegó.
     """
     jean = _add_partner(db, fund.id, "16204195618")
+    # El socio sale del fondo de la op, y el fondo, del par (como lo deja la migración).
+    pairs["ZELLE-VES"].default_fund_in_id = fund.id
+    db.flush()
 
     pago = f.outgoing(db, 78292, "VES")
     op = _op(db, service.create_operation_from_payment(
@@ -83,6 +86,8 @@ def test_outgoing_bs_receipt_defaults_to_via_partner_with_the_fund_partner(
 
 def test_incoming_zelle_capture_defaults_to_zelle_direct(service, db, fund, pairs, client, operator):
     """Una captura de Zelle ENTRANTE es del cliente de Diohandres: ZELLE_DIRECT, sin receptor."""
+    pairs["ZELLE-VES"].default_fund_in_id = fund.id
+    db.flush()
     inc = f.incoming(db, 100, "ZELLE")
     op = _op(db, service.create_operation_from_payment(
         "incoming", inc.id, "ZELLE", "VES", 100, 78292,

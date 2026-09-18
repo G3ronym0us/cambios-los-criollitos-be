@@ -62,6 +62,16 @@ class CurrencyPair(UUIDMixin, Base):
     # sin esto, un par como USD-VES desaparece entero de «por entregar».
     settles_in_cash = Column(Boolean, default=False, nullable=False, server_default="false")
 
+    # Fondo por defecto de cada pata. Es la ÚNICA fuente del fondo de una operación nueva
+    # cuando nadie lo eligió a mano ni lo trae el comprobante: la moneda no dice nada del
+    # negocio (USD-VES es efectivo, no Zelle). Un par sin fondo da una operación sin fondo.
+    #   *_profit_pct: puntos del margen que se queda ese fondo. Son la meta y se aplican tal
+    #                 cual aunque se haya cobrado distinto (ZELLE-BRL: 7 Zelle + 3 Brasil).
+    default_fund_in_id = Column(Integer, ForeignKey("fund_groups.id", ondelete="SET NULL"), nullable=True)
+    default_fund_in_profit_pct = Column(Float, nullable=True)
+    default_fund_out_id = Column(Integer, ForeignKey("fund_groups.id", ondelete="SET NULL"), nullable=True)
+    default_fund_out_profit_pct = Column(Float, nullable=True)
+
     # Configuration
     is_active = Column(Boolean, default=True, nullable=False)
     is_monitored = Column(Boolean, default=True, nullable=False)  # Para scraping automático
@@ -84,6 +94,8 @@ class CurrencyPair(UUIDMixin, Base):
     base_pair = relationship("CurrencyPair", foreign_keys=[base_pair_id], remote_side="CurrencyPair.id", back_populates="derived_pairs")
     derived_pairs = relationship("CurrencyPair", foreign_keys=[base_pair_id], back_populates="base_pair")
     usdt_pair = relationship("CurrencyPair", foreign_keys=[usdt_pair_id], remote_side="CurrencyPair.id")
+    default_fund_in = relationship("FundGroup", foreign_keys=[default_fund_in_id])
+    default_fund_out = relationship("FundGroup", foreign_keys=[default_fund_out_id])
     
     # Ensure unique pair combination
     __table_args__ = (
@@ -121,6 +133,12 @@ class CurrencyPair(UUIDMixin, Base):
             "is_active": self.is_active,
             "is_monitored": self.is_monitored,
             "settles_in_cash": self.settles_in_cash,
+            "default_fund_in_uuid": self.default_fund_in.uuid if self.default_fund_in else None,
+            "default_fund_in_name": self.default_fund_in.name if self.default_fund_in else None,
+            "default_fund_in_profit_pct": self.default_fund_in_profit_pct,
+            "default_fund_out_uuid": self.default_fund_out.uuid if self.default_fund_out else None,
+            "default_fund_out_name": self.default_fund_out.name if self.default_fund_out else None,
+            "default_fund_out_profit_pct": self.default_fund_out_profit_pct,
             "binance_tracked": self.binance_tracked,
             "banks_to_track": self.banks_to_track,
             "amount_to_track": float(self.amount_to_track) if self.amount_to_track else None,

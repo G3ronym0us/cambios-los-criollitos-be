@@ -268,7 +268,7 @@ class WhatsAppQuoteService:
         self.db.flush()
 
         # Las operaciones que nacen de una cotización del bot —la mayoría— también traen sus
-        # fondos resueltos por moneda, igual que las que nacen de un comprobante. El import va
+        # fondos por defecto del par, igual que las que nacen de un comprobante. El import va
         # adentro de la función: a nivel de módulo sería circular (whatsapp_payment_service ya
         # importa whatsapp_quote_service).
         from app.services.whatsapp_payment_service import WhatsAppPaymentService

@@ -345,3 +345,23 @@ def test_an_operation_born_from_a_moved_receipt_belongs_to_its_new_owner(
     # Y el comprobante conserva el teléfono de quien lo mandó: la mudanza es una opinión
     # sobre el dueño, no un borrado del origen.
     assert pay.client_phone == client.phone
+
+
+def test_client_filter_follows_the_owner(service, db, client, destination, operator):
+    """
+    El filtro por cliente (el aviso de «pagos sin vincular» de la ficha) cuenta por DUEÑO:
+    un pago transferido es de quien lo recibió, no de quien lo mandó. Si no, la ficha del
+    origen seguiría avisando de un pago que ya no es suyo.
+    """
+    pay = f.incoming(db, 220.0)
+    _transfer(service, pay, destination, operator)
+    other = f.incoming(db, 50.0)
+
+    def ids(client_uuid):
+        page = service.list_payments_page("incoming", client_uuid=client_uuid)
+        return {item["id"] for item in page["items"]}
+
+    assert ids(destination.uuid) == {pay.id}
+    assert ids(client.uuid) == {other.id}
+    assert service.payments_stats("incoming", client_uuid=destination.uuid)["unlinked"] == 1
+    assert service.payments_stats("incoming", client_uuid=client.uuid)["unlinked"] == 1

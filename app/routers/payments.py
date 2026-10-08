@@ -134,6 +134,7 @@ async def get_payments_stats(
     # rechaza esa forma si el tipo es datetime.
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
+    client_uuid: UUID | None = Query(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_moderator_user),
 ):
@@ -153,6 +154,7 @@ async def get_payments_stats(
             out_class=out_class,
             date_from=start,
             date_to=end,
+            client_uuid=client_uuid,
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
@@ -186,6 +188,7 @@ async def list_payments(
     # rechaza esa forma si el tipo es datetime.
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
+    client_uuid: UUID | None = Query(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_moderator_user),
 ):
@@ -203,6 +206,7 @@ async def list_payments(
             attention=attention,
             date_from=start,
             date_to=end,
+            client_uuid=client_uuid,
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)

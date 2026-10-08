@@ -581,10 +581,18 @@ class WhatsAppPaymentService:
         attention: str = "ALL",
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None,
+        client_uuid: Optional[UUID] = None,
     ):
         """Query base + todos los filtros de la bandeja. La comparten listado y stats."""
         Model = self._model(table)
         q = self._payments_base_query(Model)
+
+        # El cliente es el DUEÑO del pago, el mismo `coalesce` que pinta la fila: si se
+        # transfirió, cuenta para el destino y deja de contar para el que lo mandó.
+        if client_uuid:
+            q = q.filter(
+                func.coalesce(_OWNER_CLIENT.uuid, WhatsAppClient.uuid) == client_uuid
+            )
 
         # Los selectores de una operación solo deben recibir pagos disponibles.
         # Aplicarlo en la consulta evita exponer pagos pertenecientes a otra
@@ -665,6 +673,7 @@ class WhatsAppPaymentService:
         attention: str = "ALL",
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None,
+        client_uuid: Optional[UUID] = None,
     ) -> dict:
         """Página de pagos para el front: búsqueda + clasificación server-side. Devuelve {items, total}."""
         Model = self._model(table)
@@ -676,6 +685,7 @@ class WhatsAppPaymentService:
             attention=attention,
             date_from=date_from,
             date_to=date_to,
+            client_uuid=client_uuid,
         )
 
         total = q.count()
@@ -699,6 +709,7 @@ class WhatsAppPaymentService:
         out_class: str = "ALL",
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None,
+        client_uuid: Optional[UUID] = None,
         scan_limit: int = 1000,
     ) -> dict:
         """
@@ -714,7 +725,12 @@ class WhatsAppPaymentService:
         """
         Model = self._model(table)
         base = self._filtered_payments_query(
-            table, search=search, out_class=out_class, date_from=date_from, date_to=date_to
+            table,
+            search=search,
+            out_class=out_class,
+            date_from=date_from,
+            date_to=date_to,
+            client_uuid=client_uuid,
         )
         attention_clause = self._attention_condition(Model, table)
         attention_q = base.filter(attention_clause)

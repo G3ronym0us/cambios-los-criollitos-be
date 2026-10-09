@@ -105,3 +105,57 @@ def test_the_picker_rates_are_the_ones_the_requote_applies(db, pairs, client, op
     preview = svc.requote_with_pair(op.uuid, pairs["ZELLE-COP"].uuid, operator, dry_run=True)
 
     assert listed[str(pairs["ZELLE-COP"].uuid)] == pytest.approx(preview["rate"])
+
+
+def _cop_quote(db, phone, amount=6000, side="SEND"):
+    return WhatsAppQuoteService(db).create_quote(WhatsAppOperationCreate(
+        client_phone=phone, from_currency="COP", to_currency="VES",
+        amount=amount, amount_side=side,
+    ))
+
+
+def test_flipping_the_side_keeps_the_quoted_rate(db, pairs, client, operator):
+    """
+    Op 5178 (vía Dionis): «6000» eran los Bs a entregar y el bot los tomó como COP enviados
+    (6000 COP → 1656 Bs). Corregido: recibe 6000 Bs, a la MISMA tasa con que se cotizó.
+    """
+    op = _cop_quote(db, client.phone)
+    rate, inverse = op.rate_used, op.inverse_percentage
+
+    WhatsAppQuoteService(db).requote_with_pair(
+        op.uuid, None, operator, amount=6000, amount_side="RECEIVE"
+    )
+
+    db.refresh(op)
+    assert op.amount_side.value == "RECEIVE"
+    assert op.to_amount == pytest.approx(6000)
+    assert op.from_amount == pytest.approx(6000 / 0.2455)
+    assert (op.rate_used, op.inverse_percentage) == (rate, inverse)
+    assert op.amount == pytest.approx(op.from_amount)
+
+
+def test_correcting_only_the_amount_keeps_side_and_rate(db, pairs, client, operator):
+    op = _quote(db, client.phone)
+    preview = WhatsAppQuoteService(db).requote_with_pair(
+        op.uuid, None, operator, amount=250, dry_run=True
+    )
+    assert preview["from_amount"] == 250
+    assert preview["to_amount"] == pytest.approx(250 * 782.92)
+    assert preview["previous"]["amount_side"] == "SEND"
+
+
+def test_nothing_to_correct_is_refused(db, pairs, client, operator):
+    op = _quote(db, client.phone)
+    with pytest.raises(QuoteServiceError) as exc:
+        WhatsAppQuoteService(db).requote_with_pair(op.uuid, None, operator, amount_side="SEND")
+    assert exc.value.code == "requote_same_pair"
+
+
+def test_the_amount_cannot_change_under_a_linked_receipt(db, pairs, client, operator):
+    op = _quote(db, client.phone)
+    out = f.outgoing(db, 78292, "VES", phone=client.phone)
+    WhatsAppPaymentService(db).set_operation("outgoing", out.id, op.uuid, completing_user=None)
+
+    with pytest.raises(QuoteServiceError) as exc:
+        WhatsAppQuoteService(db).requote_with_pair(op.uuid, None, operator, amount=200)
+    assert exc.value.code == "requote_side_has_payments"

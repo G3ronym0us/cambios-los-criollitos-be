@@ -300,7 +300,12 @@ async def requote_operation_with_pair(
     service = WhatsAppQuoteService(db)
     try:
         return service.requote_with_pair(
-            op_uuid, payload.currency_pair_uuid, current_user, dry_run=payload.dry_run
+            op_uuid,
+            payload.currency_pair_uuid,
+            current_user,
+            amount=payload.amount,
+            amount_side=payload.amount_side,
+            dry_run=payload.dry_run,
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)

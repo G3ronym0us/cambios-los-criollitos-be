@@ -42,6 +42,7 @@ from app.models.fund import (
     FundPendingDepositOrigin,
     FundPendingDepositStatus,
 )
+from app.models.transaction import Transaction
 from app.models.user import User
 from app.models.whatsapp_balance import WhatsAppBalanceEntry, WhatsAppBalanceEntryType
 from app.models.whatsapp_payment import (
@@ -3344,9 +3345,15 @@ class WhatsAppPaymentService:
         client = self._resolve_operation_client(quote_svc, row, group)
 
         now = datetime.utcnow()
+        # La operación pasó cuando se movió el dinero, no cuando alguien la registró: se crea
+        # a mano días después (la del entrante 628 del 12-09, registrada el 09-10, salía con
+        # fecha de hoy y se iba al final de todo listado). Fecha, cotización y valoración van
+        # a la hora del comprobante; el vencimiento cuenta desde ahora, que no se cotizó con
+        # nadie y no debe nacer vencida.
+        at = row.created_at or now
         track_delivery = table == "outgoing" and from_currency == "USD"
         # El valor del trato es lo que entrega el cliente; el par y el `to` son la cotización.
-        value = valuation.equivalents(self.db, from_amount, from_currency, now)
+        value = valuation.equivalents(self.db, from_amount, from_currency, at)
         # Una op que nace de un comprobante no trae margen cotizado: sin esto la operación
         # queda sin ganancia (la transacción la calcula desde `applied_percentage`). Se lee de
         # la tasa que se terminó usando contra la base del par, así vale igual si el operador
@@ -3368,7 +3375,7 @@ class WhatsAppPaymentService:
             usdt_rate=value["usdt_rate"],
             bcv_amount=value["bcv_amount"],
             bcv_rate=value["bcv_rate"],
-            valuation_at=now,
+            valuation_at=at,
             from_amount=from_amount,
             to_amount=to_amount,
             rate_used=rate_used,
@@ -3380,9 +3387,10 @@ class WhatsAppPaymentService:
             status=WhatsAppOperationStatus.PENDING,
             delivery_status=WhatsAppDeliveryStatus.PENDING if track_delivery else None,
             fund_group_id=group.id if group else None,
-            quoted_at=now,
+            created_at=at,
+            quoted_at=at,
             expires_at=now + timedelta(minutes=QUOTE_TTL_MINUTES),
-            approved_at=now,
+            approved_at=at,
             origin=ORIGIN_INCOMING_RECEIPT if table == "incoming" else ORIGIN_OUTGOING_RECEIPT,
         )
         self.db.add(op)
@@ -3463,10 +3471,19 @@ class WhatsAppPaymentService:
                     "complete_user_required", "Falta el usuario que completa la operación", 400
                 )
             op.status = WhatsAppOperationStatus.COMPLETED
-            op.completed_at = now
+            # El comprobante saliente ES la entrega: se completó cuando se pagó.
+            op.completed_at = at
             tx = quote_svc._create_transaction_for_op(op, WhatsAppOperationComplete(), completing_user)
             op.transaction_id = tx.id
             transaction_user = transaction_user or completing_user
+
+        # La transacción también es del día del comprobante: los reportes la buscan por fecha.
+        if op.transaction_id is not None:
+            tx = self.db.query(Transaction).filter(Transaction.id == op.transaction_id).first()
+            if tx is not None:
+                tx.created_at = at
+                if tx.completed_at is not None:
+                    tx.completed_at = op.completed_at or at
 
         # El libro sigue a la operación: si terminó COMPLETED, deja hasta dos movimientos.
         self._sync_fund_legs(op, transaction_user)

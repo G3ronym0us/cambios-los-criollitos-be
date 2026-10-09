@@ -74,3 +74,43 @@ def test_operations_created_from_a_receipt_say_which_side(db, pairs, client, ope
     assert origin(from_inc) == "INCOMING_RECEIPT"
     assert origin(from_out) == "OUTGOING_RECEIPT"
     assert from_inc["origin"] == "INCOMING_RECEIPT"
+
+
+def test_an_operation_from_an_old_receipt_is_dated_when_the_money_moved(
+    db, pairs, client, operator, fund
+):
+    """
+    Entrante 628 de Nelson (2026-09-12 18:03) convertido en operación el 09-10: salía con la
+    fecha de hoy y se iba al final de todo listado.
+    """
+    from app.models.transaction import Transaction
+
+    when = datetime.now(timezone.utc) - timedelta(days=27)
+    svc = WhatsAppPaymentService(db)
+    inc = f.incoming(db, 100, "ZELLE", phone=client.phone, created_at=when)
+    created = f.create_op_from_payment(
+        svc, "incoming", inc, frm="ZELLE", to="VES", from_amount=100, to_amount=88596,
+        fund_uuid=fund.uuid, user_uuid=operator.uuid, recorded_by=operator.id)
+    op = db.query(WhatsAppOperation).filter(WhatsAppOperation.uuid == str(created["uuid"])).one()
+
+    assert op.created_at == when
+    assert op.quoted_at == when
+    assert op.valuation_at == when
+    # No nace vencida: nadie le cotizó con un TTL.
+    assert op.expires_at > datetime.now(timezone.utc)
+    if op.transaction_id:
+        assert db.query(Transaction).get(op.transaction_id).created_at == when
+
+
+def test_an_operation_from_an_old_payout_is_completed_when_it_was_paid(db, pairs, client, operator):
+    when = datetime.now(timezone.utc) - timedelta(days=5)
+    svc = WhatsAppPaymentService(db)
+    out = f.outgoing(db, 78292, "VES", phone=client.phone, created_at=when)
+    created = f.create_op_from_payment(
+        svc, "outgoing", out, frm="ZELLE", to="VES", from_amount=100, to_amount=78292,
+        recorded_by=operator.id)
+    op = db.query(WhatsAppOperation).filter(WhatsAppOperation.uuid == str(created["uuid"])).one()
+
+    assert op.status.value == "COMPLETED"
+    assert op.created_at == when
+    assert op.completed_at == when

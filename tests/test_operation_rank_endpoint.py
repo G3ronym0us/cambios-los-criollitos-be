@@ -139,9 +139,9 @@ def test_suggested_order_puts_the_confident_suggestion_first(db, fund, pairs, op
     """
     svc = WhatsAppPaymentService(db)
     phone = "584140000012"
-    # Dentro de tolerancia (0,9% de diferencia) pero muy vieja.
+    # Dentro de tolerancia (0,9% de diferencia) pero vieja (48 h, dentro de la ventana de 72 h).
     la_sugerida = _make_op(
-        svc, db, phone=phone, to_amount=991.0, created_at=NOW - timedelta(hours=100), operator=operator,
+        svc, db, phone=phone, to_amount=991.0, created_at=NOW - timedelta(hours=48), operator=operator,
     )
     # Fuera de tolerancia (1,5%) pero recien nacida: gana en puntaje crudo, no en elegibilidad.
     la_mas_reciente = _make_op(

@@ -65,6 +65,12 @@ OPEN_STATUSES = ("QUOTED", "PENDING")
 #: `DEFAULT_WINDOW_HOURS`.
 INCOMING_WINDOW_HOURS = 72
 
+#: Lo mismo del lado SALIENTE, que tampoco tenía ventana: el 106.988,80 Bs de Nelson del
+#: 2026-09-19 13:52 (pago 6205) ponía primero una op suya del 09-08 por parecerse en monto
+#: (106.315,20, a 0,6%), y la correcta —la de las 13:38, pagada en dos partes— ni salía. De
+#: 1.560 salientes vinculados el p90 op→pago es 42 min y solo uno pasa de 72 h.
+OUTGOING_WINDOW_HOURS = 72
+
 #: El comprobante reenviado es el MISMO, no uno parecido: tolerancia mucho más dura.
 FORWARDED_TOLERANCE = 0.001
 #: El reenvío al grupo es un asiento contable, y el operador lo hace cuando puede — no en la
@@ -396,6 +402,13 @@ def score_candidate(
             coverage=coverage,
         )
 
+    # Fuera de la ventana el monto deja de competir, pero `delta`/`relative` se conservan:
+    # el orden "monto" del cajón los sigue leyendo.
+    if cand.created_at is None or (
+        abs((reference - cand.created_at).total_seconds()) > OUTGOING_WINDOW_HOURS * 3600
+    ):
+        return MatchScore(cand.uuid, delta, relative, True, 0.0, time_score, 0.0, False)
+
     amount_score = max(0.0, 1.0 - relative / AMOUNT_CUTOFF)
     score = (
         AMOUNT_WEIGHT * amount_score + (1 - AMOUNT_WEIGHT) * time_score
@@ -439,20 +452,52 @@ def rank_candidates(
 
     Del lado ENTRANTE la clase manda sobre el puntaje: primero todo lo que CIERRA, después
     todo lo que ABONA, y al final lo que este comprobante no puede cubrir. Un cierre exacto
-    es una afirmación mucho más fuerte que una coincidencia horaria. Del lado saliente
-    `coverage` es siempre None y el orden queda exactamente como estaba. Desempate, en
-    ambos: la más reciente primero.
+    es una afirmación mucho más fuerte que una coincidencia horaria. Desempate: la más
+    reciente primero.
+
+    Del lado SALIENTE, dentro de la ventana, manda primero el DESTINO: la op cuyas `notes`
+    llevan la cédula/teléfono/cuenta del comprobante es la suya aunque el monto no cuadre
+    (un pago partido en dos). Luego lo que cuadra en monto, por puntaje. El resto se ordena
+    por FECHA respecto al comprobante: primero las operaciones anteriores a él, la más
+    cercana delante, y después las posteriores, también por cercanía. El pago se hace
+    después de cotizar, así que la op que salda casi siempre es la inmediatamente anterior.
     """
     scores: list[tuple[MatchScore, Optional[datetime]]] = [
         (score_candidate(cand, criteria, table, now), cand.created_at) for cand in candidates
     ]
-    scores.sort(
-        key=lambda pair: (
-            _coverage_rank(pair[0], table),
-            -pair[0].score,
-            -(pair[1].timestamp() if pair[1] else 0),
+    if table == "incoming":
+        scores.sort(
+            key=lambda pair: (
+                _coverage_rank(pair[0], table),
+                -pair[0].score,
+                -(pair[1].timestamp() if pair[1] else 0),
+            )
         )
-    )
+        return [s for s, _ in scores]
+
+    reference = criteria.created_at or now
+    tokens = criteria.tokens()
+    notes_by_uuid = {cand.uuid: cand.notes or "" for cand in candidates}
+
+    def destination_hits(score: MatchScore, created: Optional[datetime]) -> int:
+        if not tokens or created is None:
+            return 0
+        if abs((reference - created).total_seconds()) > OUTGOING_WINDOW_HOURS * 3600:
+            return 0
+        notes = notes_by_uuid.get(score.uuid, "")
+        return sum(1 for t in tokens if t in notes)
+
+    def outgoing_key(pair: tuple[MatchScore, Optional[datetime]]):
+        score, created = pair
+        hits = -destination_hits(score, created)
+        if score.score > 0:
+            return (hits, 0, -score.score, 0, -(created.timestamp() if created else 0))
+        if created is None:
+            return (hits, 1, 0.0, 2, 0.0)
+        gap = (reference - created).total_seconds()
+        return (hits, 1, 0.0, 0 if gap >= 0 else 1, abs(gap))
+
+    scores.sort(key=outgoing_key)
     return [s for s, _ in scores]
 
 
@@ -1004,6 +1049,7 @@ class OperationMatchService:
             identification=payment.identification,
             phone_to=payment.phone_to,
             bank_to=payment.bank_to,
+            account_number=payment.account_number,
             created_at=_aware(payment.created_at),
         )
         # Por defecto el cajón enseña las operaciones DEL CLIENTE del comprobante (con sus
@@ -1225,7 +1271,8 @@ class OperationMatchService:
                 currency=payment.currency,
                 identification=payment.identification,
                 phone_to=payment.phone_to,
-                bank_to=payment.bank_to,
+            bank_to=payment.bank_to,
+                account_number=payment.account_number,
                 created_at=_aware(payment.created_at),
             )
             if table == "incoming":

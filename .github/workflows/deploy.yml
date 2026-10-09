@@ -38,19 +38,32 @@ jobs:
             docker system prune -f
             docker volume prune -f
 
-            echo "--- Building and restarting containers ---"
-            docker compose build
-            docker compose up -d
-
-            echo "--- Waiting for services to be ready ---"
-            sleep 8
+            echo "--- Installing backend dependencies ---"
+            venv/bin/pip install -q -r requirements.txt
 
             echo "--- Running database migrations ---"
-            docker compose exec -T backend alembic upgrade head
+            venv/bin/alembic upgrade head
+
+            # The API runs from the venv as the systemd unit criollitos-backend,
+            # which owns port 8000; only Celery lives in Docker.
+            echo "--- Restarting backend ---"
+            sudo systemctl restart criollitos-backend
+
+            echo "--- Rebuilding and recreating Celery ---"
+            docker compose build celery_worker celery_beat
+            docker compose up -d --no-deps celery_worker celery_beat
 
             echo "--- Health check ---"
-            curl -sf http://localhost:8000/api/health \
-              && echo "Health check passed" \
-              || echo "WARNING: Health check returned non-200"
+            for i in $(seq 1 20); do
+              curl -sf http://localhost:8000/api/health > /dev/null && break
+              sleep 2
+            done
+            if curl -sf http://localhost:8000/api/health > /dev/null; then
+              echo "Health check passed"
+            else
+              echo "Health check failed"
+              sudo journalctl -u criollitos-backend -n 50 --no-pager
+              exit 1
+            fi
 
             echo "--- Deploy complete. Commit: $(git rev-parse --short HEAD) ---"

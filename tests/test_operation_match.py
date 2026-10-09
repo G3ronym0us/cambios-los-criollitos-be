@@ -348,6 +348,47 @@ def test_ranking_is_more_permissive_than_the_bot_never_the_reverse():
     assert sug is not None and sug.uuid == auto and sug.confident
 
 
+def test_outgoing_ranking_ignores_an_old_amount_match():
+    """
+    Pago 6205 (Nelson, 2026-09-19 13:52): 106.988,80 Bs, la primera mitad de los 156.988,80
+    de la op de las 13:38. Antes ganaba una op suya de 11 días atrás por parecerse en monto.
+    """
+    vieja = op("vieja", 106315.20, minutes_ago=11 * 24 * 60)
+    correcta = op("correcta", 156988.80, minutes_ago=14, notes="0102 V19077527 04249189153")
+    crit = criteria(106988.80, identification="V19077527", phone_to="04249189153")
+    ranked = rank_candidates([vieja, correcta], crit, "outgoing", NOW)
+    assert [s.uuid for s in ranked] == ["correcta", "vieja"]
+    assert pick_suggestion(ranked) is None
+
+
+def test_outgoing_destination_in_notes_beats_a_closer_op_of_someone_else():
+    otra = op("otra", 93000.0, minutes_ago=7, notes="0102 V26374121 04149987301")
+    suya = op("suya", 156988.80, minutes_ago=14, notes="0102 V19077527 04249189153")
+    crit = criteria(106988.80, identification="V19077527", phone_to="04249189153")
+    ranked = rank_candidates([otra, suya], crit, "outgoing", NOW)
+    assert ranked[0].uuid == "suya"
+
+
+def test_outgoing_without_a_match_orders_by_date_previous_ops_first():
+    """Sin monto ni destino que cuadren: primero la anterior más cercana, las posteriores al final."""
+    candidates = [
+        op("antes-lejos", 50.0, minutes_ago=300),
+        op("despues", 50.0, minutes_ago=-5),
+        op("antes-cerca", 50.0, minutes_ago=14),
+    ]
+    ranked = rank_candidates(candidates, criteria(9999.0), "outgoing", NOW)
+    assert [s.uuid for s in ranked] == ["antes-cerca", "antes-lejos", "despues"]
+
+
+def test_outgoing_amount_match_outside_the_window_is_not_suggested():
+    ranked = rank_candidates(
+        [op("vieja", 14757.0, minutes_ago=73 * 60)], criteria(14757.0), "outgoing", NOW
+    )
+    assert ranked[0].score == 0.0 and not ranked[0].within_tolerance
+    assert ranked[0].delta == 0.0
+    assert pick_suggestion(ranked) is None
+
+
 def test_score_candidate_reports_signed_delta():
     s = score_candidate(op("a", 14800.0), criteria(14757.0), "outgoing", NOW)
     assert s.delta == 43.0

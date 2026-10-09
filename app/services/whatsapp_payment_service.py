@@ -1280,8 +1280,18 @@ class WhatsAppPaymentService:
         """
         ¿El trato quedó cubierto? Si sí y la operación estaba abierta, se completa. Devuelve
         True cuando la completó, para que el caller no la complete otra vez.
+
+        **En un par de efectivo los bolívares no cierran el trato**: falta que el cliente
+        traiga sus billetes, y eso lo marca `ClientPendingService` (`collected_amount`), que
+        es quien la completa al recoger el último dólar. Completarla aquí la sacaba de «por
+        entregar», que en esos pares sólo lista PENDING: le pasó a la op 5239 (Gabriela
+        Tejera, USD-VES, 2026-10-08) al vincularle el segundo de sus dos salientes. Crearla
+        desde el comprobante ya respetaba la excepción; vincular no.
         """
         if op.status not in (WhatsAppOperationStatus.QUOTED, WhatsAppOperationStatus.PENDING):
+            return False
+        pair = op.currency_pair
+        if pair is not None and pair.settles_in_cash and op.to_collect > AMOUNT_EPSILON:
             return False
         value, _ = self.operation_value(op)
         if value <= 0:

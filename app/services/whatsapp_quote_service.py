@@ -1227,6 +1227,57 @@ class WhatsAppQuoteService:
         self.db.refresh(op)
         return op
 
+    @staticmethod
+    def _requote_at(op: WhatsAppOperation) -> datetime:
+        """La hora cuya tasa se usa al recotizar: la de la cotización, no la de hoy."""
+        return op.quoted_at or op.created_at or datetime.now(timezone.utc)
+
+    def _requote_figures(self, op: WhatsAppOperation, pair: CurrencyPair, at: datetime):
+        """
+        Cómo quedaría `op` cotizada con `pair` a la hora `at`: `(entry, from_amount,
+        to_amount, rate, inverse)` con el redondeo del par ya aplicado, o None si ese par no
+        tenía tasa entonces. Lo comparten la recotización y la lista de tasas del selector,
+        para que el número del selector sea exactamente el que se va a aplicar.
+        """
+        frm, to = pair.from_currency.symbol, pair.to_currency.symbol
+        entry = self.resolver.get_rate_entry_for_pair(frm, to, at=at)
+        if entry is None:
+            return None
+        side = op.amount_side or WhatsAppAmountSide.SEND
+        if side == WhatsAppAmountSide.SEND:
+            from_amount = op.from_amount
+            to_amount = self.resolver.apply_rate(from_amount, entry.rate, entry.inverse_percentage)
+        else:
+            to_amount = op.to_amount
+            from_amount = self.resolver.apply_rate(to_amount, entry.rate, not entry.inverse_percentage)
+        from_amount, to_amount, rate, inverse = self._apply_pair_rounding(
+            pair, frm, to, side.value, from_amount, to_amount, entry.rate, entry.inverse_percentage
+        )
+        return entry, from_amount, to_amount, rate, inverse
+
+    def requote_rates(self, op_uuid: UUID) -> dict:
+        """
+        La tasa con la que se recotizaría la operación en cada par activo, a la hora de su
+        cotización. Es lo que enseña el selector de «Cambiar par»: con las tasas de hoy no
+        coincidía con la vista previa (USD-VES 935 hoy contra 945 el día que se cotizó).
+        Un par sin tasa en esa fecha no aparece.
+        """
+        op = self._get_op_or_404(op_uuid)
+        at = self._requote_at(op)
+        pairs = self.db.query(CurrencyPair).filter(CurrencyPair.is_active.is_(True)).all()
+        rates = []
+        for pair in pairs:
+            if pair.from_currency is None or pair.to_currency is None:
+                continue
+            figures = self._requote_figures(op, pair, at)
+            if figures is None:
+                continue
+            _, _, _, rate, inverse = figures
+            rates.append(
+                {"pair_uuid": str(pair.uuid), "rate": rate, "inverse_percentage": inverse}
+            )
+        return {"rate_at": at.isoformat(), "rates": rates}
+
     def requote_with_pair(
         self,
         op_uuid: UUID,
@@ -1298,22 +1349,14 @@ class WhatsAppQuoteService:
                 )
 
         frm, to = pair.from_currency.symbol, pair.to_currency.symbol
-        at = op.quoted_at or op.created_at or datetime.now(timezone.utc)
-        entry = self.resolver.get_rate_entry_for_pair(frm, to, at=at)
-        if entry is None:
+        at = self._requote_at(op)
+        figures = self._requote_figures(op, pair, at)
+        if figures is None:
             raise QuoteServiceError(
                 "rate_not_available", f"No hay tasa de {frm}/{to} para esa fecha", 422
             )
+        entry, from_amount, to_amount, rate, inverse = figures
         side = op.amount_side or WhatsAppAmountSide.SEND
-        if side == WhatsAppAmountSide.SEND:
-            from_amount = op.from_amount
-            to_amount = self.resolver.apply_rate(from_amount, entry.rate, entry.inverse_percentage)
-        else:
-            to_amount = op.to_amount
-            from_amount = self.resolver.apply_rate(to_amount, entry.rate, not entry.inverse_percentage)
-        from_amount, to_amount, rate, inverse = self._apply_pair_rounding(
-            pair, frm, to, side.value, from_amount, to_amount, entry.rate, entry.inverse_percentage
-        )
 
         preview = {
             "pair_uuid": str(pair.uuid),

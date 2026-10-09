@@ -271,6 +271,20 @@ async def update_operation(
     return WhatsAppOperationResponse.model_validate(op.dict())
 
 
+@router.get("/{op_uuid}/requote-rates")
+async def requote_rates(
+    op_uuid: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """La tasa de cada par activo a la hora de la cotización: la que aplicaría recotizar."""
+    service = WhatsAppQuoteService(db)
+    try:
+        return service.requote_rates(op_uuid)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
 @router.post("/{op_uuid}/requote-pair")
 async def requote_operation_with_pair(
     op_uuid: UUID,

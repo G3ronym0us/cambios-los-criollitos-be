@@ -10,7 +10,7 @@ No confundir con `transactions` (registro contable con profit splits): una
 operación COMPLETED genera una Transaction, pero son etapas distintas.
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 from uuid import UUID
 
@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_moderator_user
+from app.core.timezones import day_bounds
 from app.database.connection import get_db
 from app.models.user import User
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
@@ -64,6 +65,10 @@ async def list_operations(
     phone: Optional[str] = Query(None),
     search: Optional[str] = Query(None, description="Nombre o teléfono del cliente"),
     since: Optional[datetime] = Query(None),
+    # `date`, no `datetime`: el front manda días de calendario (yyyy-mm-dd), en hora de
+    # Caracas y con el día final completo (ver `day_bounds`).
+    date_from: Optional[date] = Query(None),
+    date_to: Optional[date] = Query(None),
     order_by: str = Query(
         "paid",
         description="Fecha por la que ordenar: paid (comprobante de salida) | created",
@@ -80,6 +85,7 @@ async def list_operations(
     lo necesita para dibujar el pie («26–50 de 312») y saber si hay página siguiente.
     """
     service = WhatsAppQuoteService(db)
+    start, end = day_bounds(date_from, date_to)
     try:
         ops, total = service.list_operations(
             phone=phone,
@@ -92,6 +98,8 @@ async def list_operations(
             scenario=scenario,
             needs=needs,
             order_by=order_by,
+            date_from=start,
+            date_to=end,
         )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)

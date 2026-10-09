@@ -769,6 +769,8 @@ class WhatsAppQuoteService:
         scenario: Optional[str] = None,
         needs: Optional[str] = None,
         order_by: str = "created",
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None,
     ) -> tuple[list[WhatsAppOperation], int]:
         """
         Una página de operaciones y el total que hay tras los filtros.
@@ -788,6 +790,10 @@ class WhatsAppQuoteService:
 
         El orden tiene que resolverse ACÁ y no en el navegador: la lista viene paginada, y
         reordenar una página ya recortada sólo reordena esas 25 filas, no la lista.
+
+        `date_from`/`date_to` (rango semiabierto `[desde, hasta)`, ver `day_bounds`) filtran
+        por LA MISMA fecha por la que se ordena: con `paid`, la del pago; si no, la de la
+        operación. Así el rango coincide con la fecha que el listado enseña en cada fila.
         """
         # `delivered_amount` recorre los comprobantes de salida de cada operación, y
         # `first_incoming_payment_at` los de entrada: sin precargarlos, listar una página
@@ -842,13 +848,18 @@ class WhatsAppQuoteService:
             q = q.outerjoin(paid, paid.c.op_id == WhatsAppOperation.id)
             # Coalesce y no `paid_at` a secas: si no, las que aún no se han pagado —que son
             # justo las que hay que atender— se irían todas al fondo con fecha nula.
-            ordering = safunc.coalesce(paid.c.paid_at, WhatsAppOperation.created_at).desc()
+            fecha = safunc.coalesce(paid.c.paid_at, WhatsAppOperation.created_at)
         elif order_by != "created":
             raise QuoteServiceError(
                 "invalid_order_by", f"order_by inválido: {order_by}. Use created | paid", 400
             )
         else:
-            ordering = WhatsAppOperation.created_at.desc()
+            fecha = WhatsAppOperation.created_at
+        ordering = fecha.desc()
+        if date_from:
+            q = q.filter(fecha >= date_from)
+        if date_to:
+            q = q.filter(fecha < date_to)
 
         # El conteo va sobre los mismos filtros pero sin cargar relaciones ni ordenar. El
         # outerjoin de arriba agrega por operación, así que no multiplica filas.

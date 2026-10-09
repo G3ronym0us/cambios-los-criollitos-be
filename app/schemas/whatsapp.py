@@ -261,9 +261,14 @@ class WhatsAppOperationUpdate(WhatsAppOperationScenarioUpdate):
 
 
 class OperationRequotePair(BaseModel):
-    """Recotizar una operación con otro par (`WhatsAppQuoteService.requote_with_pair`)."""
+    """
+    Corregir la cotización de una operación (`WhatsAppQuoteService.requote_with_pair`): otro
+    par, y/o otro monto o lado. Sin par se conserva el de la operación y su tasa.
+    """
 
-    currency_pair_uuid: UUID
+    currency_pair_uuid: Optional[UUID] = None
+    amount: Optional[float] = Field(None, gt=0)
+    amount_side: Optional[Literal["SEND", "RECEIVE"]] = None
     #: True: sólo calcula el antes/después, sin guardar.
     dry_run: bool = False
 

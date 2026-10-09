@@ -149,6 +149,52 @@ def test_create_hint_falls_back_to_the_pair_the_client_uses_most(db, fund, pairs
     assert hint["reason"] == "most_used"
 
 
+def _usd_ves(db):
+    from app.models.currency import Currency
+    from app.models.currency_pair import CurrencyPair
+
+    usd = Currency(symbol="USD", name="USD")
+    db.add(usd)
+    db.flush()
+    ves = db.query(Currency).filter(Currency.symbol == "VES").first()
+    pair = CurrencyPair(
+        from_currency_id=usd.id, to_currency_id=ves.id, pair_symbol="USD-VES",
+        is_active=True, settles_in_cash=True,
+    )
+    db.add(pair)
+    db.flush()
+    return pair
+
+
+def test_create_hint_ignores_a_preferred_pair_of_another_currency(db, fund, pairs, operator):
+    """
+    Bobi Pintor (2026-09-06): Zelle de 2000, par preferido USD-VES (efectivo) y operaciones
+    ZELLE-VES. Se proponía USD-VES; tiene que ser ZELLE-VES, el que usa con Zelle.
+    """
+    cliente = _client(db, "584128746419", "Bobi Pintor", preferred_pair_id=_usd_ves(db).id)
+    _op(
+        db, client_id=cliente.id, pair=pairs["ZELLE-VES"], from_amount=50.0, to_amount=39146.0,
+        status="COMPLETED",
+    )
+    pago = f.incoming(db, 2000.0, "ZELLE", phone=cliente.phone)
+    db.flush()
+
+    hint = OperationMatchService(db).suggest_for_payments([pago.id], "incoming")[0]["create_hint"]
+    assert hint["pair_symbol"] == "ZELLE/VES"
+    assert hint["reason"] == "most_used"
+
+
+def test_create_hint_without_history_follows_the_preferred_destination(db, fund, pairs, operator):
+    """Sin historial en Zelle: de los pares ZELLE-*, el que va adonde va su preferido (VES)."""
+    cliente = _client(db, "584128746419", "Bobi Pintor", preferred_pair_id=_usd_ves(db).id)
+    pago = f.incoming(db, 2000.0, "ZELLE", phone=cliente.phone)
+    db.flush()
+
+    hint = OperationMatchService(db).suggest_for_payments([pago.id], "incoming")[0]["create_hint"]
+    assert hint["pair_symbol"] == "ZELLE/VES"
+    assert hint["reason"] == "currency"
+
+
 def test_link_item_now_carries_its_kind(db, fund, pairs, operator):
     """El item que sí sugiere vincular gana `kind: LINK` (antes no llevaba ninguno)."""
     cliente = _client(db, "584124640125", "Nelson")

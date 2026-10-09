@@ -1178,6 +1178,11 @@ class OperationMatchService:
         el que se deduce de la moneda del comprobante. Si ninguno resuelve se devuelve `None`
         y la tarjeta abre el formulario vacío; adivinar un par es peor que no proponerlo.
 
+        Si el comprobante trae moneda, sólo valen pares que salen de ella: el Zelle de 2000 de
+        Bobi Pintor (2026-09-06) se proponía como USD-VES, su par preferido —efectivo—,
+        teniendo él operaciones ZELLE-VES. El preferido y el historial se miran dentro de esa
+        moneda, y a falta de ambos se elige el par de esa moneda que va adonde va su preferido.
+
         La tasa se pide A LA FECHA DEL COMPROBANTE, no la de hoy: la bandeja se procesa días
         después y cotizar con la tasa de hoy un cambio del lunes reescribe el margen.
         """
@@ -1191,35 +1196,48 @@ class OperationMatchService:
             .filter(WhatsAppClient.phone.in_(list(alias_phones)))
             .first()
         )
+        moneda = payment.currency
+
+        def de_la_moneda(p) -> bool:
+            return not moneda or (p.from_currency is not None and p.from_currency.symbol == moneda)
+
         par, motivo = None, None
-        if cliente is not None and cliente.preferred_pair_id:
-            par = (
-                self.db.query(CurrencyPair)
-                .filter(CurrencyPair.id == cliente.preferred_pair_id)
-                .first()
-            )
-            motivo = "preferred"
+        preferido = (
+            self.db.query(CurrencyPair).filter(CurrencyPair.id == cliente.preferred_pair_id).first()
+            if cliente is not None and cliente.preferred_pair_id
+            else None
+        )
+        if preferido is not None and de_la_moneda(preferido):
+            par, motivo = preferido, "preferred"
         if par is None and cliente is not None:
-            fila = (
-                self.db.query(
-                    WhatsAppOperation.currency_pair_id,
-                    func.count(WhatsAppOperation.id).label("n"),
+            q = self.db.query(
+                WhatsAppOperation.currency_pair_id,
+                func.count(WhatsAppOperation.id).label("n"),
+            ).filter(WhatsAppOperation.client_id == cliente.id)
+            if moneda:
+                q = q.join(CurrencyPair, CurrencyPair.id == WhatsAppOperation.currency_pair_id).filter(
+                    CurrencyPair.from_currency.has(symbol=moneda)
                 )
-                .filter(WhatsAppOperation.client_id == cliente.id)
-                .group_by(WhatsAppOperation.currency_pair_id)
+            fila = (
+                q.group_by(WhatsAppOperation.currency_pair_id)
                 .order_by(func.count(WhatsAppOperation.id).desc())
                 .first()
             )
             if fila is not None:
                 par = self.db.query(CurrencyPair).filter(CurrencyPair.id == fila[0]).first()
                 motivo = "most_used"
-        if par is None and payment.currency:
-            par = (
+        if par is None and moneda:
+            de_moneda = (
                 self.db.query(CurrencyPair)
-                .join(CurrencyPair.from_currency)
                 .filter(CurrencyPair.is_active.is_(True))
-                .filter(CurrencyPair.from_currency.has(symbol=payment.currency))
-                .first()
+                .filter(CurrencyPair.from_currency.has(symbol=moneda))
+                .order_by(CurrencyPair.id)
+                .all()
+            )
+            # Adonde va su preferido (USD-VES → ZELLE-VES), si existe; si no, el primero.
+            destino = preferido.to_currency_id if preferido is not None else None
+            par = next((p for p in de_moneda if p.to_currency_id == destino), None) or (
+                de_moneda[0] if de_moneda else None
             )
             motivo = "currency" if par is not None else None
         if par is None:

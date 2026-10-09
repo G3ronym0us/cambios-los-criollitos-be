@@ -23,6 +23,7 @@ from app.models.user import User
 from app.models.whatsapp_payment import WhatsAppIncomingPayment, WhatsAppOutgoingPayment
 from app.schemas.whatsapp import (
     OperationCoverageUpdate,
+    OperationRequotePair,
     ProfitAllocationList,
     ProfitAllocationResponse,
     ProfitAllocationUpdate,
@@ -268,6 +269,27 @@ async def update_operation(
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
     return WhatsAppOperationResponse.model_validate(op.dict())
+
+
+@router.post("/{op_uuid}/requote-pair")
+async def requote_operation_with_pair(
+    op_uuid: UUID,
+    payload: OperationRequotePair,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """
+    Recotiza la operación con otro par (el bot le puso el por defecto y no era): conserva el
+    monto que fijó el cliente y recalcula el otro con la tasa de ese par al cotizar. Con
+    `dry_run` sólo devuelve el antes/después.
+    """
+    service = WhatsAppQuoteService(db)
+    try:
+        return service.requote_with_pair(
+            op_uuid, payload.currency_pair_uuid, current_user, dry_run=payload.dry_run
+        )
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
 
 @router.patch("/{op_uuid}/status", response_model=WhatsAppOperationResponse)

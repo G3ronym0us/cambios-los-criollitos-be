@@ -39,6 +39,27 @@ class WhatsAppOperationScenario(enum.Enum):
     VIA_PARTNER = "VIA_PARTNER"
 
 
+#: De dónde nació la cotización (`WhatsAppOperation.origin`). NULL = no se sabe.
+#:
+#: - TEXT:             el bot la sacó de un mensaje de texto del cliente.
+#: - TEXT_RECEIPT:     también de texto, pero con un comprobante entrante del mismo cliente
+#:                     a su lado: el cliente manda la captura + datos en Bs y el monto se
+#:                     cotiza de ahí. Nelson y Helimer cotizan casi siempre así.
+#: - INCOMING_RECEIPT: creada en el panel (o por el bot) desde un comprobante entrante.
+#: - OUTGOING_RECEIPT: creada desde un comprobante saliente nuestro.
+ORIGIN_TEXT = "TEXT"
+ORIGIN_TEXT_RECEIPT = "TEXT_RECEIPT"
+ORIGIN_INCOMING_RECEIPT = "INCOMING_RECEIPT"
+ORIGIN_OUTGOING_RECEIPT = "OUTGOING_RECEIPT"
+OPERATION_ORIGINS = (
+    ORIGIN_TEXT, ORIGIN_TEXT_RECEIPT, ORIGIN_INCOMING_RECEIPT, ORIGIN_OUTGOING_RECEIPT,
+)
+#: Ventana alrededor de una cotización de texto en la que un comprobante entrante del mismo
+#: cliente la marca como TEXT_RECEIPT: la captura suele llegar antes que el monto.
+RECEIPT_BEFORE_QUOTE_MINUTES = 10
+RECEIPT_AFTER_QUOTE_MINUTES = 2
+
+
 class WhatsAppOperation(UUIDMixin, Base):
     """
     Operación originada en WhatsApp. Ciclo: QUOTED -> PENDING -> COMPLETED.
@@ -88,8 +109,11 @@ class WhatsAppOperation(UUIDMixin, Base):
         server_default=WhatsAppOperationScenario.NORMAL.value,
         index=True,
     )
+    # De dónde salió la cotización. Al vincular el operador necesita saberlo: una que nació
+    # de un comprobante ya trae su respaldo, una de texto lo espera. Ver `OPERATION_ORIGINS`.
+    origin = Column(String(24), nullable=True, index=True)
     # Grupo contable (FundGroup, ej. "cambios d&j") al que pertenece el cambio
-    fund_group_id = Column(Integer, ForeignKey("fund_groups.id", ondelete="SET NULL"), nullable=True, index=True)
+    fund_group_id =Column(Integer, ForeignKey("fund_groups.id", ondelete="SET NULL"), nullable=True, index=True)
     # El fondo de la pata que ENTRA (lo que el cliente entrega) es `fund_group_id`; este es
     # el de la pata que SALE (lo que le pagamos). Una operación mueve la caja de los dos.
     fund_group_out_id = Column(
@@ -389,7 +413,8 @@ class WhatsAppOperation(UUIDMixin, Base):
             "bcv_usd": self.bcv_usd,
             "status": self.status.value if self.status else None,
             "scenario": self.scenario.value if self.scenario else None,
-            "fund_group_uuid": self.fund_group.uuid if self.fund_group else None,
+            "origin": self.origin,
+            "fund_group_uuid":self.fund_group.uuid if self.fund_group else None,
             "fund_group_name": self.fund_group.name if self.fund_group else None,
             "fund_group_out_uuid": self.fund_group_out.uuid if self.fund_group_out else None,
             "fund_group_out_name": self.fund_group_out.name if self.fund_group_out else None,

@@ -94,3 +94,14 @@ def test_refuses_a_completed_operation(db, pairs, client, operator):
         WhatsAppQuoteService(db).requote_with_pair(op.uuid, pairs["ZELLE-COP"].uuid, operator)
     assert exc.value.code == "requote_closed_operation"
     assert db.query(WhatsAppOperation).get(op.id).currency_pair_id == pairs["ZELLE-VES"].id
+
+
+def test_the_picker_rates_are_the_ones_the_requote_applies(db, pairs, client, operator):
+    """El selector enseña la tasa de cada par a la hora de la cotización, no la de hoy."""
+    op = _quote(db, client.phone)
+    svc = WhatsAppQuoteService(db)
+
+    listed = {r["pair_uuid"]: r["rate"] for r in svc.requote_rates(op.uuid)["rates"]}
+    preview = svc.requote_with_pair(op.uuid, pairs["ZELLE-COP"].uuid, operator, dry_run=True)
+
+    assert listed[str(pairs["ZELLE-COP"].uuid)] == pytest.approx(preview["rate"])

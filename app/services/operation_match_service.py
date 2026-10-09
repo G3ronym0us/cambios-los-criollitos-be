@@ -128,6 +128,8 @@ class OperationCandidate:
     # son cosas distintas y no se mezclan.
     collected_incoming: float = 0.0
     missing_incoming: float = 0.0
+    #: Teléfono del cliente de la op, para preferir las del cliente del comprobante.
+    client_phone: Optional[str] = None
 
     def __post_init__(self) -> None:
         # `from_model` ya lo calcula; esto cubre la construcción directa (tests y el helper
@@ -163,6 +165,7 @@ class OperationCandidate:
             pending_amount=round((value or 0) - delivered, 2),
             collected_incoming=collected_incoming,
             missing_incoming=round((op.from_amount or 0.0) - collected_incoming, 2),
+            client_phone=op.client.phone if op.client else None,
         )
 
 
@@ -180,6 +183,8 @@ class OutgoingCriteria:
     window_hours: int = DEFAULT_WINDOW_HOURS
     #: Momento del comprobante; si falta, se usa `now` al puntuar.
     created_at: Optional[datetime] = None
+    #: Teléfonos del cliente del comprobante (con sus alias). Vacío = no se sabe.
+    client_phones: Sequence[str] = ()
 
     def tokens(self) -> list[str]:
         """
@@ -266,6 +271,10 @@ class MatchScore:
     within_tolerance: bool
     #: Solo del lado entrante: "CLOSES" | "PARTIAL". `None` en salientes, que no tienen clases.
     coverage: Optional[str] = None
+    #: Solo saliente: la op es del cliente del comprobante.
+    same_client: bool = False
+    #: Solo saliente: la op ya está cubierta entera por otros comprobantes.
+    covered: bool = False
 
 
 @dataclass
@@ -402,12 +411,25 @@ def score_candidate(
             coverage=coverage,
         )
 
+    same_client = bool(cand.client_phone and cand.client_phone in criteria.client_phones)
+    # Ya cubierta entera por otros comprobantes: este pago no es suyo. Sin esto una op
+    # COMPLETED y pagada competía por el `to_amount` completo (op 4837 contra el pago 5798).
+    # Lo entregado sale de los repartos (`settlements`), y hay salientes viejos vinculados
+    # sólo por FK, sin reparto: si no hay reparto que diga cuánto falta, una COMPLETED con
+    # saliente cuenta como cubierta. Con reparto manda lo que falta (pagada a medias, sigue).
+    delivered = cand.delivered_amount or 0
+    covered = (delivered > 0.01 and (cand.pending_amount or 0) <= 0.01) or (
+        delivered <= 0.01 and cand.status == "COMPLETED" and cand.has_outgoing_payment
+    )
     # Fuera de la ventana el monto deja de competir, pero `delta`/`relative` se conservan:
     # el orden "monto" del cajón los sigue leyendo.
-    if cand.created_at is None or (
+    if covered or cand.created_at is None or (
         abs((reference - cand.created_at).total_seconds()) > OUTGOING_WINDOW_HOURS * 3600
     ):
-        return MatchScore(cand.uuid, delta, relative, True, 0.0, time_score, 0.0, False)
+        return MatchScore(
+            cand.uuid, delta, relative, True, 0.0, time_score, 0.0, False,
+            same_client=same_client, covered=covered,
+        )
 
     amount_score = max(0.0, 1.0 - relative / AMOUNT_CUTOFF)
     score = (
@@ -424,6 +446,7 @@ def score_candidate(
         time_score=time_score,
         score=score,
         within_tolerance=relative <= AMOUNT_TOLERANCE,
+        same_client=same_client,
     )
 
 
@@ -455,12 +478,16 @@ def rank_candidates(
     es una afirmación mucho más fuerte que una coincidencia horaria. Desempate: la más
     reciente primero.
 
-    Del lado SALIENTE, dentro de la ventana, manda primero el DESTINO: la op cuyas `notes`
-    llevan la cédula/teléfono/cuenta del comprobante es la suya aunque el monto no cuadre
-    (un pago partido en dos). Luego lo que cuadra en monto, por puntaje. El resto se ordena
-    por FECHA respecto al comprobante: primero las operaciones anteriores a él, la más
-    cercana delante, y después las posteriores, también por cercanía. El pago se hace
-    después de cotizar, así que la op que salda casi siempre es la inmediatamente anterior.
+    Del lado SALIENTE las ya cubiertas van al fondo. Entre las demás, primero las del CLIENTE
+    del comprobante: el saliente no se filtra por cliente y, con montos tan repetidos como
+    100 ZELLE, una de otro cliente unas horas más cerca le ganaba a la buena (pago 5873 de
+    Nelson contra la op 4868 de Arianna). Dentro de eso, lo que cuadra en monto, por
+    puntaje. Entre lo que no cuadra manda el DESTINO dentro de la ventana: la op cuyas
+    `notes` llevan la cédula/teléfono/cuenta del comprobante es la suya aunque el monto no
+    cuadre (un pago partido en dos, op 5196). No va antes que el monto porque un cliente le
+    paga casi siempre al mismo beneficiario y esos datos están en muchas de sus ops. El resto
+    se ordena por FECHA respecto al comprobante: primero las anteriores, la más cercana
+    delante, y después las posteriores.
     """
     scores: list[tuple[MatchScore, Optional[datetime]]] = [
         (score_candidate(cand, criteria, table, now), cand.created_at) for cand in candidates
@@ -480,7 +507,7 @@ def rank_candidates(
     notes_by_uuid = {cand.uuid: cand.notes or "" for cand in candidates}
 
     def destination_hits(score: MatchScore, created: Optional[datetime]) -> int:
-        if not tokens or created is None:
+        if not tokens or created is None or score.covered:
             return 0
         if abs((reference - created).total_seconds()) > OUTGOING_WINDOW_HOURS * 3600:
             return 0
@@ -489,13 +516,14 @@ def rank_candidates(
 
     def outgoing_key(pair: tuple[MatchScore, Optional[datetime]]):
         score, created = pair
-        hits = -destination_hits(score, created)
+        head = (int(score.covered), int(not score.same_client))
         if score.score > 0:
-            return (hits, 0, -score.score, 0, -(created.timestamp() if created else 0))
+            return head + (0, 0, -score.score, 0, -(created.timestamp() if created else 0))
+        hits = -destination_hits(score, created)
         if created is None:
-            return (hits, 1, 0.0, 2, 0.0)
+            return head + (1, hits, 0.0, 2, 0.0)
         gap = (reference - created).total_seconds()
-        return (hits, 1, 0.0, 0 if gap >= 0 else 1, abs(gap))
+        return head + (1, hits, 0.0, 0 if gap >= 0 else 1, abs(gap))
 
     scores.sort(key=outgoing_key)
     return [s for s, _ in scores]
@@ -510,6 +538,9 @@ def pick_suggestion(scored: Sequence[MatchScore]) -> Optional[Suggestion]:
     partial = [s for s in scored if s.coverage == "PARTIAL"]
     # Salientes: no hay clases, se mantiene el criterio de siempre.
     plain = [s for s in scored if s.coverage is None and s.within_tolerance]
+    # Si alguna del cliente del comprobante cuadra, solo compiten esas: una de otro cliente
+    # con el mismo monto no es una alternativa, es una coincidencia.
+    plain = [s for s in plain if s.same_client] or plain
 
     eligible = sorted(closing or plain or partial, key=lambda s: s.score, reverse=True)
     if not eligible:
@@ -843,7 +874,9 @@ class OperationMatchService:
         from app.models.whatsapp_operation import WhatsAppOperationStatus
 
         q = self.db.query(WhatsAppOperation).options(
-            selectinload(WhatsAppOperation.outgoing_payments)
+            selectinload(WhatsAppOperation.outgoing_payments),
+            # `OperationCandidate.client_phone`: sin esto, una consulta por cada candidata.
+            selectinload(WhatsAppOperation.client),
         )
         # El buscador cruza cliente (nombre o teléfono), así que el join tiene que existir
         # aunque no haya `phone` — mismo criterio que `list_operations`.
@@ -1051,6 +1084,11 @@ class OperationMatchService:
             bank_to=payment.bank_to,
             account_number=payment.account_number,
             created_at=_aware(payment.created_at),
+            client_phones=tuple(
+                self._client_phones_for_many([payment.client_phone]).get(payment.client_phone, [])
+            )
+            if payment.client_phone
+            else (),
         )
         # Por defecto el cajón enseña las operaciones DEL CLIENTE del comprobante (con sus
         # alias de socio) y solo las abiertas: ese es el universo real de lo que ese pago
@@ -1257,7 +1295,8 @@ class OperationMatchService:
             candidates = self._load_operations(limit=limit)
             if not candidates:
                 return []
-            alias = {}
+            # Sin filtrar por cliente, pero sus teléfonos sirven para preferir sus operaciones.
+            alias = self._client_phones_for_many([p.client_phone for p in payments if p.client_phone])
             por_telefono = {}
         by_uuid = {c.uuid: c for c in candidates}
         # Modelo real de la op, para lo que la candidata plana no trae (nombre del cliente,
@@ -1274,6 +1313,7 @@ class OperationMatchService:
             bank_to=payment.bank_to,
                 account_number=payment.account_number,
                 created_at=_aware(payment.created_at),
+                client_phones=tuple(alias.get(payment.client_phone, [])),
             )
             if table == "incoming":
                 propias = [

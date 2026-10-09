@@ -389,6 +389,43 @@ def test_outgoing_amount_match_outside_the_window_is_not_suggested():
     assert pick_suggestion(ranked) is None
 
 
+def test_outgoing_prefers_the_receipts_client_over_a_closer_op_of_someone_else():
+    """
+    Pago 5873 de Nelson (88.596 Bs): la 4868 de Arianna, del mismo monto y unas horas más
+    cerca, le ganaba la sugerencia a la 4850 de Nelson.
+    """
+    arianna = op("arianna", 88596.0, minutes_ago=20 * 60, client_phone="584128580852")
+    nelson = op("nelson", 88596.0, minutes_ago=26 * 60, client_phone="584124640125")
+    crit = criteria(88596.0, client_phones=("584124640125",))
+    ranked = rank_candidates([arianna, nelson], crit, "outgoing", NOW)
+    assert ranked[0].uuid == "nelson"
+    sug = pick_suggestion(ranked)
+    assert sug is not None and sug.uuid == "nelson" and sug.confident
+
+
+def test_outgoing_covered_ops_sink_even_with_the_destination_in_notes():
+    """Nelson paga siempre al mismo beneficiario: sus ops viejas ya pagadas no son candidatas."""
+    pagada = op(
+        "pagada", 159472.8, minutes_ago=50 * 60, notes="0102 V19077527 04249189153",
+        value_amount=180.0, delivered_amount=180.0, pending_amount=0.0,
+        client_phone="584124640125",
+    )
+    misma_cifra_pagada = op(
+        "misma-cifra-pagada", 88596.0, minutes_ago=30 * 60,
+        value_amount=100.0, delivered_amount=100.0, pending_amount=0.0,
+        client_phone="584124640125",
+    )
+    abierta = op("abierta", 88596.0, minutes_ago=26 * 60, client_phone="584124640125")
+    crit = criteria(
+        88596.0, identification="V19077527", phone_to="04249189153",
+        client_phones=("584124640125",),
+    )
+    ranked = rank_candidates([pagada, misma_cifra_pagada, abierta], crit, "outgoing", NOW)
+    assert ranked[0].uuid == "abierta"
+    assert {s.uuid for s in ranked[1:]} == {"pagada", "misma-cifra-pagada"}
+    assert pick_suggestion(ranked).uuid == "abierta"
+
+
 def test_score_candidate_reports_signed_delta():
     s = score_candidate(op("a", 14800.0), criteria(14757.0), "outgoing", NOW)
     assert s.delta == 43.0

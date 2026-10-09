@@ -22,6 +22,11 @@ from app.models.currency import Currency
 from app.models.currency_pair import CurrencyPair
 from app.models.whatsapp_client import WhatsAppClient
 from app.models.whatsapp_operation import (
+    ORIGIN_INCOMING_RECEIPT,
+    ORIGIN_OUTGOING_RECEIPT,
+    ORIGIN_TEXT,
+    ORIGIN_TEXT_RECEIPT,
+    RECEIPT_AFTER_QUOTE_MINUTES,
     WhatsAppAmountSide,
     WhatsAppDeliveryStatus,
     WhatsAppOperation,
@@ -290,6 +295,8 @@ class WhatsAppPaymentService:
         # muestra como el propio número hasta que el operador le ponga nombre.
         if not payload.client_phone.endswith("@g.us"):
             WhatsAppQuoteService(self.db).upsert_client(payload.client_phone)
+        if table == "incoming":
+            self.mark_text_quote_with_receipt(payload.client_phone)
         self.db.commit()
         self.db.refresh(row)
         # El intermediario nunca mandó los datos, pero el pago ya se hizo: el comprobante
@@ -309,6 +316,23 @@ class WhatsAppPaymentService:
             out["duplicate_of_id"] = None
             out["duplicate_side"] = None
         return out
+
+    def mark_text_quote_with_receipt(self, phone: str) -> None:
+        """
+        El comprobante llegó DESPUÉS del texto que cotizó (el bot tarda en leer la imagen, o
+        el cliente manda primero el monto): las cotizaciones de texto de ese cliente de los
+        últimos minutos pasan a TEXT_RECEIPT. El orden inverso lo resuelve `create_quote`.
+        """
+        since = datetime.now(timezone.utc) - timedelta(minutes=RECEIPT_AFTER_QUOTE_MINUTES)
+        (
+            self.db.query(WhatsAppOperation)
+            .filter(
+                WhatsAppOperation.client.has(phone=phone),
+                WhatsAppOperation.origin == ORIGIN_TEXT,
+                WhatsAppOperation.created_at >= since,
+            )
+            .update({WhatsAppOperation.origin: ORIGIN_TEXT_RECEIPT}, synchronize_session=False)
+        )
 
     # Ventana en la que dos capturas iguales del mismo cliente se consideran la misma. Es
     # generosa porque el parecido no es de monto: es el texto exacto de una misma imagen.
@@ -3359,6 +3383,7 @@ class WhatsAppPaymentService:
             quoted_at=now,
             expires_at=now + timedelta(minutes=QUOTE_TTL_MINUTES),
             approved_at=now,
+            origin=ORIGIN_INCOMING_RECEIPT if table == "incoming" else ORIGIN_OUTGOING_RECEIPT,
         )
         self.db.add(op)
         self.db.flush()

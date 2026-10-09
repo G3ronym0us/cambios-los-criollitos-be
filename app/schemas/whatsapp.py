@@ -138,6 +138,9 @@ class WhatsAppOperationResponse(BaseModel):
     # (entregado ÷ valor). `rate_used` es la que se cotizó; esta es la que salió.
     payments_count: int = 0
     real_rate: Optional[float] = None
+    #: De dónde nació la cotización (TEXT | TEXT_RECEIPT | INCOMING_RECEIPT |
+    #: OUTGOING_RECEIPT); None si no se sabe. Ver `WhatsAppOperation.origin`.
+    origin: Optional[str] = None
     amount_usdt: Optional[float] = None
     usdt_rate: Optional[float] = None
     bcv_amount: Optional[float] = None
@@ -255,6 +258,14 @@ class WhatsAppOperationUpdate(WhatsAppOperationScenarioUpdate):
         if v is None:
             return None
         return v.strip() or None
+
+
+class OperationRequotePair(BaseModel):
+    """Recotizar una operación con otro par (`WhatsAppQuoteService.requote_with_pair`)."""
+
+    currency_pair_uuid: UUID
+    #: True: sólo calcula el antes/después, sin guardar.
+    dry_run: bool = False
 
 
 class WhatsAppPartnerResponse(BaseModel):

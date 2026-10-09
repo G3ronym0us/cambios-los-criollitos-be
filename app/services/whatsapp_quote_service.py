@@ -32,6 +32,9 @@ from app.models.whatsapp_payment import (
 )
 from app.models.whatsapp_operation_message import WhatsAppOperationMessage
 from app.models.whatsapp_operation import (
+    ORIGIN_TEXT,
+    ORIGIN_TEXT_RECEIPT,
+    RECEIPT_BEFORE_QUOTE_MINUTES,
     WhatsAppAmountSide,
     WhatsAppDeliveryStatus,
     WhatsAppOperation,
@@ -52,7 +55,7 @@ from app.schemas.whatsapp import (
 )
 from app.services import valuation
 from app.services.bcv_service import get_cached_bcv_rate
-from app.services.profit_allocation_service import ProfitAllocationService
+from app.services.profit_allocation_service import PAIR_DEFAULT_NOTE, ProfitAllocationService
 from app.services.whatsapp_client_account_service import WhatsAppClientAccountService
 from app.services.whatsapp_rate_resolver import WhatsAppRateResolver, apply_rounding
 
@@ -120,6 +123,24 @@ class WhatsAppQuoteService:
         return self.upsert_client(f"anon:group:{group.id}", f"Anónimo (vía {group.name})")
 
     # ---------- Crear cotización ----------
+
+    def _text_quote_origin(self, phone: str, now: datetime) -> str:
+        """
+        `create_quote` sólo lo llama el bot, con lo que el cliente escribió: es TEXT. Pasa a
+        TEXT_RECEIPT si el cliente mandó un comprobante justo antes, que es cuando el monto
+        se cotizó desde la captura. El caso inverso —el comprobante llega después— lo marca
+        `WhatsAppPaymentService.mark_text_quote_with_receipt` al guardarlo.
+        """
+        since = now - timedelta(minutes=RECEIPT_BEFORE_QUOTE_MINUTES)
+        receipt = (
+            self.db.query(WhatsAppIncomingPayment.id)
+            .filter(
+                WhatsAppIncomingPayment.client_phone == phone,
+                WhatsAppIncomingPayment.created_at >= since,
+            )
+            .first()
+        )
+        return ORIGIN_TEXT_RECEIPT if receipt is not None else ORIGIN_TEXT
 
     def create_quote(self, payload: WhatsAppOperationCreate) -> WhatsAppOperation:
         client = self.upsert_client(payload.client_phone, payload.client_display_name)
@@ -255,6 +276,7 @@ class WhatsAppQuoteService:
             quoted_at=now,
             approved_at=now if has_payment_data else None,
             expires_at=now + timedelta(minutes=QUOTE_TTL_MINUTES),
+            origin=self._text_quote_origin(payload.client_phone, now),
         )
         # Si las notas vinieron de una cuenta de la libreta, dejar la operación apuntando a
         # ella; si son datos nuevos para un nombre nuevo, aprenderla acá mismo (no habrá
@@ -1204,6 +1226,161 @@ class WhatsAppQuoteService:
         self.db.commit()
         self.db.refresh(op)
         return op
+
+    def requote_with_pair(
+        self,
+        op_uuid: UUID,
+        pair_uuid: UUID,
+        operator: User,
+        *,
+        dry_run: bool = False,
+    ) -> dict:
+        """
+        Recotiza una operación con otro par: el bot le puso el por defecto del cliente y era
+        otro (ZELLE-VES cuando pagó por PayPal, o USD-VES en efectivo).
+
+        A diferencia de `update_operation`, que cambia sólo la etiqueta, aquí la operación
+        queda como si el bot la hubiera cotizado con el par correcto: se conserva el monto
+        que fijó el cliente (`amount_side`) y el otro se recalcula con la tasa que ese par
+        tenía AL COTIZAR, con su margen por defecto y su redondeo. Los fondos y el reparto que
+        eran los por defecto del par viejo pasan a los del nuevo; lo puesto a mano no se toca.
+
+        Sólo en operaciones abiertas, y nunca si cambia la moneda de un lado que ya tiene
+        comprobantes: esos montos están en la moneda vieja.
+
+        `dry_run` devuelve el antes/después sin tocar nada, para mostrarlo antes de guardar.
+        """
+        op = self._get_op_or_404(op_uuid)
+        if op.status not in (WhatsAppOperationStatus.QUOTED, WhatsAppOperationStatus.PENDING):
+            raise QuoteServiceError(
+                "requote_closed_operation",
+                "Sólo se puede recotizar una operación cotizada o pendiente",
+                409,
+            )
+        pair = self.db.query(CurrencyPair).filter(CurrencyPair.uuid == pair_uuid).first()
+        if pair is None:
+            raise QuoteServiceError("currency_pair_not_found", "Par de monedas no encontrado", 404)
+        old = op.currency_pair
+        if old is not None and pair.id == old.id:
+            raise QuoteServiceError("requote_same_pair", "La operación ya está en ese par", 400)
+
+        if old is None or old.from_currency_id != pair.from_currency_id:
+            has_incoming = (
+                self.db.query(WhatsAppPaymentAllocation.id)
+                .filter(WhatsAppPaymentAllocation.whatsapp_operation_id == op.id)
+                .first()
+                or self.db.query(WhatsAppIncomingPayment.id)
+                .filter(WhatsAppIncomingPayment.whatsapp_operation_id == op.id)
+                .first()
+            )
+            if has_incoming:
+                raise QuoteServiceError(
+                    "requote_side_has_payments",
+                    "La operación ya tiene comprobantes del cliente en la otra moneda: "
+                    "desvincúlalos antes de cambiar el par",
+                    409,
+                )
+        if old is None or old.to_currency_id != pair.to_currency_id:
+            has_outgoing = (
+                self.db.query(WhatsAppOutgoingSettlement.id)
+                .filter(WhatsAppOutgoingSettlement.whatsapp_operation_id == op.id)
+                .first()
+                or self.db.query(WhatsAppOutgoingPayment.id)
+                .filter(WhatsAppOutgoingPayment.whatsapp_operation_id == op.id)
+                .first()
+            )
+            if has_outgoing:
+                raise QuoteServiceError(
+                    "requote_side_has_payments",
+                    "La operación ya tiene pagos nuestros en la otra moneda: "
+                    "desvincúlalos antes de cambiar el par",
+                    409,
+                )
+
+        frm, to = pair.from_currency.symbol, pair.to_currency.symbol
+        at = op.quoted_at or op.created_at or datetime.now(timezone.utc)
+        entry = self.resolver.get_rate_entry_for_pair(frm, to, at=at)
+        if entry is None:
+            raise QuoteServiceError(
+                "rate_not_available", f"No hay tasa de {frm}/{to} para esa fecha", 422
+            )
+        side = op.amount_side or WhatsAppAmountSide.SEND
+        if side == WhatsAppAmountSide.SEND:
+            from_amount = op.from_amount
+            to_amount = self.resolver.apply_rate(from_amount, entry.rate, entry.inverse_percentage)
+        else:
+            to_amount = op.to_amount
+            from_amount = self.resolver.apply_rate(to_amount, entry.rate, not entry.inverse_percentage)
+        from_amount, to_amount, rate, inverse = self._apply_pair_rounding(
+            pair, frm, to, side.value, from_amount, to_amount, entry.rate, entry.inverse_percentage
+        )
+
+        preview = {
+            "pair_uuid": str(pair.uuid),
+            "pair_symbol": pair.pair_symbol,
+            "from_currency": frm,
+            "to_currency": to,
+            "from_amount": round(from_amount, 2),
+            "to_amount": round(to_amount, 2),
+            "rate": rate,
+            "inverse_percentage": inverse,
+            "rate_at": at.isoformat(),
+            "amount_side": side.value,
+            "previous": {
+                "pair_symbol": old.pair_symbol if old else None,
+                "from_amount": op.from_amount,
+                "to_amount": op.to_amount,
+                "rate": op.rate_used,
+            },
+        }
+        if dry_run:
+            return preview
+
+        from app.services.whatsapp_payment_service import WhatsAppPaymentService
+
+        old_in = old.default_fund_in_id if old else None
+        old_out = old.default_fund_out_id if old else None
+        legs_before = (op.fund_group_id, op.fund_group_out_id)
+
+        op.currency_pair_id = pair.id
+        op.currency_pair = pair
+        op.from_amount = from_amount
+        op.to_amount = to_amount
+        op.rate_used = rate
+        op.inverse_percentage = inverse
+        op.applied_percentage = entry.base_percentage
+        op.default_percentage = entry.base_percentage
+        value = valuation.equivalents(self.db, from_amount, frm, at)
+        op.amount = from_amount
+        op.currency = frm
+        op.amount_usdt = value["usdt_amount"]
+        op.usdt_rate = value["usdt_rate"]
+        op.bcv_amount = value["bcv_amount"]
+        op.bcv_rate = value["bcv_rate"]
+
+        # Un fondo que estaba porque era el por defecto del par viejo se va con él.
+        if op.fund_group_id is not None and op.fund_group_id == old_in:
+            op.fund_group_id = None
+        if op.fund_group_out_id is not None and op.fund_group_out_id == old_out:
+            op.fund_group_out_id = None
+        payments = WhatsAppPaymentService(self.db)
+        payments._resolve_fund_legs_for_new_op(op)
+        if (op.fund_group_id, op.fund_group_out_id) != legs_before:
+            # El reparto automático apuntaba a los fondos viejos; uno puesto a mano lleva
+            # otra nota y se respeta.
+            allocations = ProfitAllocationService(self.db).allocations(op)
+            if allocations and all(a.notes in (None, PAIR_DEFAULT_NOTE) for a in allocations):
+                for a in allocations:
+                    self.db.delete(a)
+                self.db.flush()
+                self.db.refresh(op)
+            ProfitAllocationService(self.db).ensure_defaults(op)
+
+        self._sync_linked_transaction(op)
+        payments._sync_fund_legs(op, operator)
+        self.db.commit()
+        self.db.refresh(op)
+        return preview
 
     def update_status(
         self,

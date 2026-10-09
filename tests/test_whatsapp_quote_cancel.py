@@ -61,6 +61,8 @@ def test_quote_initial_status_depends_on_payment_data(notes, expected_status):
             rate,
             inverse,
         ),
+        # El origen se cubre en test_operation_origin.py.
+        _text_quote_origin=lambda _phone, _now: "TEXT",
     )
 
     op = WhatsAppQuoteService.create_quote(

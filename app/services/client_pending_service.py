@@ -590,7 +590,13 @@ class ClientPendingService:
         self.db.refresh(delivery)
         return delivery.dict()
 
-    def undo(self, client_uuid: UUID, delivery_uuid: UUID, actor: Optional[User]) -> dict:
+    def undo(
+        self,
+        client_uuid: UUID,
+        delivery_uuid: UUID,
+        actor: Optional[User],
+        operation_uuids: Optional[list] = None,
+    ) -> dict:
         """
         Devuelve las operaciones del lote a como estaban, sin borrar el rastro.
 
@@ -612,19 +618,35 @@ class ClientPendingService:
         if delivery.undone_at is not None:
             raise QuoteServiceError("already_undone", "Esa entrega ya se deshizo", 409)
 
-        for item in delivery.items:
-            op = item.operation
-            if op is None:
-                continue
-            if item.kind == COLLECTION_KIND:
-                op.collected_amount = item.previous_collected
-                self._reopen_collected(op, item)
-            else:
-                op.uncovered_amount = item.previous_uncovered
-                op.uncovered_reason = item.previous_uncovered_reason
+        # Con `operation_uuids` sólo esas: un lote puede tener unas bien y otras mal (el de
+        # Neurys del 2026-10-09 tomó 38 operaciones de dos páginas; 10 no estaban cobradas).
+        wanted = {str(self._as_uuid(u)) for u in operation_uuids} if operation_uuids else None
+        items = [
+            item
+            for item in delivery.active_items
+            if wanted is None or (item.operation is not None and str(item.operation.uuid) in wanted)
+        ]
+        if not items:
+            raise QuoteServiceError(
+                "nothing_to_undo", "Ninguna de esas operaciones sigue marcada en este lote", 409
+            )
 
-        delivery.undone_at = datetime.now(timezone.utc)
-        delivery.undone_by_user_id = actor.id if actor else None
+        now = datetime.now(timezone.utc)
+        for item in items:
+            op = item.operation
+            if op is not None:
+                if item.kind == COLLECTION_KIND:
+                    op.collected_amount = item.previous_collected
+                    self._reopen_collected(op, item)
+                else:
+                    op.uncovered_amount = item.previous_uncovered
+                    op.uncovered_reason = item.previous_uncovered_reason
+            item.undone_at = now
+            item.undone_by_user_id = actor.id if actor else None
+
+        if not delivery.active_items:
+            delivery.undone_at = now
+            delivery.undone_by_user_id = actor.id if actor else None
         self.db.commit()
         self.db.refresh(delivery)
         return delivery.dict()

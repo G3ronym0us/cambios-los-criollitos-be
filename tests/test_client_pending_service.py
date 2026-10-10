@@ -404,6 +404,63 @@ class TestUndo:
         ] == 100
 
 
+class TestUndoParcial:
+    """
+    Deshacer sólo algunas operaciones de un lote. El de Neurys del 2026-10-09 marcó 38 (la
+    selección tomaba las de otra página) y sólo 10 estaban mal: deshacerlo entero obligaba a
+    volver a marcar las 28 buenas.
+    """
+
+    def _lote(self, db, world):
+        ops = [make_op(db, world["client"], world["usd_ves"], amount=a) for a in (100, 50, 20)]
+        db.commit()
+        service = ClientPendingService(db)
+        batch = service.deliver(
+            world["client"].uuid, [{"operation_uuid": str(op.uuid)} for op in ops], None,
+            world["actor"],
+        )
+        return service, batch, ops
+
+    def test_deshace_solo_las_pedidas_y_el_lote_sigue_en_pie(self, db, world):
+        service, batch, (a, b, c) = self._lote(db, world)
+
+        out = service.undo(
+            world["client"].uuid, batch["uuid"], world["actor"], operation_uuids=[str(b.uuid)]
+        )
+
+        for op in (a, b, c):
+            db.refresh(op)
+        assert b.uncovered_amount is None
+        assert a.uncovered_amount == 100 and c.uncovered_amount == 20
+        assert out["undone_at"] is None
+        assert out["operations"] == 2
+        assert out["amount"] == 120
+        deshecho = next(i for i in out["items"] if i["operation_uuid"] == b.uuid)
+        assert deshecho["undone_at"] is not None
+
+    def test_al_deshacer_la_ultima_el_lote_queda_deshecho(self, db, world):
+        service, batch, (a, b, c) = self._lote(db, world)
+        service.undo(world["client"].uuid, batch["uuid"], world["actor"], operation_uuids=[str(a.uuid)])
+
+        out = service.undo(world["client"].uuid, batch["uuid"], world["actor"])
+
+        assert out["undone_at"] is not None
+        assert out["operations"] == 0
+        for op in (b, c):
+            db.refresh(op)
+            assert op.uncovered_amount is None
+
+    def test_una_ya_deshecha_no_se_deshace_otra_vez(self, db, world):
+        service, batch, (a, _, _) = self._lote(db, world)
+        service.undo(world["client"].uuid, batch["uuid"], world["actor"], operation_uuids=[str(a.uuid)])
+
+        with pytest.raises(QuoteServiceError) as exc:
+            service.undo(
+                world["client"].uuid, batch["uuid"], world["actor"], operation_uuids=[str(a.uuid)]
+            )
+        assert exc.value.code == "nothing_to_undo"
+
+
 class TestLastOutgoingPaymentAt:
     """La fecha que el listado de Operaciones enseña: cuándo salió la plata."""
 

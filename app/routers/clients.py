@@ -24,6 +24,7 @@ from app.schemas.client import (
     ClientResponse,
     ClientUpdate,
     PendingDeliveryCreate,
+    PendingDeliveryUndo,
 )
 from app.schemas.whatsapp import ClientLoanManualCreate, ClientLoanRepaymentCreate, WhatsAppBalanceAdjust
 from app.services.client_entity_service import ClientEntityService
@@ -305,15 +306,22 @@ async def deliver_pending(
 async def undo_pending_delivery(
     client_uuid: UUID,
     delivery_uuid: UUID,
+    payload: Optional[PendingDeliveryUndo] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_moderator_user),  # mutación: moderador+
 ):
     """
-    Devuelve las operaciones del lote a como estaban, sin borrar el rastro.
+    Devuelve las operaciones del lote a como estaban, sin borrar el rastro. Con
+    `operation_uuids`, sólo esas; sin cuerpo, todas las que sigan marcadas.
 
     Sin límite de tiempo: si el error se descubre mañana, se deshace mañana.
     """
     try:
-        return ClientPendingService(db).undo(client_uuid, delivery_uuid, actor=current_user)
+        return ClientPendingService(db).undo(
+            client_uuid,
+            delivery_uuid,
+            actor=current_user,
+            operation_uuids=payload.operation_uuids if payload else None,
+        )
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)

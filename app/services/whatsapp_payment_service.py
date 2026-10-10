@@ -339,11 +339,43 @@ class WhatsAppPaymentService:
             )
             if target_op is not None:
                 WhatsAppClientAccountService(self.db).learn_from_outgoing(target_op, row)
+                # Y el reparto: sin su fila el saliente no cubría nada —«Entregado 0,00 de
+                # 15» y «sin comprobante» en la cuenta (op 5091), 876 salientes así—, porque
+                # lo entregado se lee del reparto, no del FK.
+                self._settle_linked_payout(row, target_op)
+                self.db.commit()
+                self.db.refresh(row)
         out = self._with_name(row)
         if table == "incoming":
             out["duplicate_of_id"] = None
             out["duplicate_side"] = None
         return out
+
+    def _settle_linked_payout(self, payment, op: WhatsAppOperation) -> Optional[str]:
+        """
+        Crea la fila de reparto de un saliente que llegó vinculado sólo por FK. Devuelve por
+        qué no la creó, o None si la creó (o ya existía).
+
+        Sólo cuando el comprobante va en la moneda de destino de la operación —ahí la tasa
+        cotizada dice cuánto cubre— y la operación todavía tiene pendiente: medirlo con otra
+        tasa, o sobre una operación ya cubierta por otro, inventaría una entrega.
+        """
+        if any(s.whatsapp_operation_id == op.id for s in payment.settlements):
+            return None
+        cp = op.currency_pair
+        quoted_to = cp.to_currency.symbol if cp and cp.to_currency else None
+        if not quoted_to or (payment.currency or "").upper() != quoted_to.upper():
+            return f"moneda {payment.currency or '—'} ≠ destino {quoted_to or '—'}"
+        if not payment.amount:
+            return "comprobante sin monto"
+        if not op.rate_used:
+            return "operación sin tasa cotizada"
+        value, _ = self.operation_value(op)
+        if round(value - self.delivered_amount(op, exclude_payment_id=payment.id), 2) <= 0.01:
+            return "operación ya cubierta por otro comprobante"
+        # Lo que da la tasa, con tope en el pendiente (`_apply_settlement`).
+        self._apply_settlement(payment, op, None)
+        return None
 
     def mark_text_quote_with_receipt(self, phone: str) -> None:
         """

@@ -8,6 +8,7 @@ resolvemos sus vínculos con las operaciones.
 """
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
@@ -46,6 +47,7 @@ from app.models.transaction import Transaction
 from app.models.user import User
 from app.models.whatsapp_balance import WhatsAppBalanceEntry, WhatsAppBalanceEntryType
 from app.models.whatsapp_payment import (
+    WhatsAppOutgoingRefund,
     WhatsAppIncomingPayment,
     WhatsAppOutgoingPayment,
     WhatsAppPaymentAllocation,
@@ -233,6 +235,9 @@ class WhatsAppPaymentService:
         d["client_name"] = name
         d["client_uuid"] = client_uuid
         d["transfer"] = self._transfer_summary(payment)
+        if isinstance(payment, WhatsAppIncomingPayment):
+            refund = self._refund_for_incoming(payment.id)
+            d["refund_of_outgoing_id"] = refund.outgoing_payment_id if refund else None
         return d
 
     def _assert_not_loan(self, payment_id: int) -> None:
@@ -258,6 +263,28 @@ class WhatsAppPaymentService:
                 "payment_is_credited",
                 "Este pago ya se acreditó como saldo a favor del cliente y no puede marcarse "
                 "irrelevante; resuelve el saldo primero",
+                409,
+            )
+
+    def _refund_for_incoming(self, payment_id: int) -> Optional[WhatsAppOutgoingRefund]:
+        return (
+            self.db.query(WhatsAppOutgoingRefund)
+            .filter(WhatsAppOutgoingRefund.incoming_payment_id == payment_id)
+            .first()
+        )
+
+    def _assert_not_refund(self, payment_id: int) -> None:
+        """
+        Solo entrantes: si ya es la devolución de un saliente pagado de más, su dinero tiene
+        destino —descuenta de ese saliente— y no puede además vincularse a una operación,
+        acreditarse, transferirse ni marcarse irrelevante. Se suelta desde el saliente.
+        """
+        refund = self._refund_for_incoming(payment_id)
+        if refund is not None:
+            raise QuoteServiceError(
+                "payment_is_refund",
+                f"Este pago es la devolución del saliente #{refund.outgoing_payment_id}; "
+                "quítala desde ese pago primero",
                 409,
             )
 
@@ -575,6 +602,8 @@ class WhatsAppPaymentService:
         # quedaría "por atender" para siempre por la primera rama de abajo.
         return and_(
             ~Model.is_irrelevant.is_(True),
+            # La devolución de un saliente pagado de más ya tiene destino.
+            ~exists().where(WhatsAppOutgoingRefund.incoming_payment_id == Model.id),
             or_(
                 Model.amount.is_(None),
                 self._incoming_unlinked_clause(Model, sig),
@@ -1169,25 +1198,30 @@ class WhatsAppPaymentService:
         pending = round(value - delivered, 2)
         reference_rate = self._reference_rate(op, payment)
 
+        # Lo que el pago entregó de verdad: si el cliente devolvió parte, cuenta el neto.
+        paid = payment.net_amount
         suggested = None
-        if reference_rate and payment.amount:
-            suggested = round(float(payment.amount) / reference_rate, 2)
+        if reference_rate and paid:
+            suggested = round(float(paid) / reference_rate, 2)
 
         full_effective_rate = None
         full_rate_difference = None
         full_amount_difference = None
-        if pending > 0 and payment.amount:
-            full_effective_rate = round(float(payment.amount) / pending, 6)
+        if pending > 0 and paid:
+            full_effective_rate = round(float(paid) / pending, 6)
             if reference_rate:
                 full_rate_difference = round(full_effective_rate - reference_rate, 6)
                 # Lo que habría tocado pagar por ese pendiente a la tasa de referencia.
-                full_amount_difference = round(float(payment.amount) - pending * reference_rate, 2)
+                # Positivo = se pagó de más (pérdida); negativo = de menos.
+                full_amount_difference = round(float(paid) - pending * reference_rate, 2)
 
         return {
             "payment": {
                 "id": payment.id,
                 "amount": payment.amount,
                 "currency": payment.currency,
+                "refunded_amount": payment.refunded_amount,
+                "net_amount": paid,
             },
             "operation_uuid": str(op.uuid),
             "value": value,
@@ -1216,8 +1250,15 @@ class WhatsAppPaymentService:
             # nada) sí tiene con qué comparar -da 0- y no debe caer al "asume que cubre
             # todo lo pendiente" de abajo, que es para cuando de verdad no hay nada con qué
             # calcular (comprobante sin monto reconocido en absoluto).
-            if reference_rate and payment.amount is not None:
-                value = round(float(payment.amount) / reference_rate, 2)
+            if reference_rate and payment.net_amount is not None:
+                value = round(float(payment.net_amount) / reference_rate, 2)
+                # Tope en el pendiente: un pago hecho de más (28.900 Bs tecleados en vez de
+                # 8.324,88, saliente 5917) dejaba la operación «entregada» 3,47 veces. Lo
+                # que sobra queda libre en el pago, a la vista, en vez de inflar la operación.
+                op_value, _ = self.operation_value(op)
+                pending = round(op_value - self.delivered_amount(op, exclude_payment_id=payment.id), 2)
+                if pending > 0:
+                    value = min(value, pending)
             else:
                 _, _ = self.operation_value(op)
                 value = self.operation_value(op)[0] - self.delivered_amount(op, payment.id)
@@ -1662,7 +1703,7 @@ class WhatsAppPaymentService:
                 return 0.0
             usado += (payment.settled_amount or 0) * payment.settled_reference_rate
 
-        return round(float(payment.amount or 0) - usado, 2)
+        return round(float(payment.net_amount or 0) - usado, 2)
 
     def operation_coverage(self, op_uuid) -> dict:
         """
@@ -1841,7 +1882,8 @@ class WhatsAppPaymentService:
 
         cubierto_por_valor = round(value - resto, 2)
         if rows and not partial and cubierto_por_valor > 0:
-            suma = round(sum(float(r.amount or 0) for r, _ in rows), 2)
+            # Netos: lo devuelto por el cliente no se entregó.
+            suma = round(sum(float(r.net_amount or 0) for r, _ in rows), 2)
             if suma <= 0:
                 # Los comprobantes marcados no suman nada (monto real en 0, típico de un OCR
                 # que falló): derivar la tasa de esa suma dejaría rate_used/to_amount en 0
@@ -1874,7 +1916,7 @@ class WhatsAppPaymentService:
             cubre = (
                 explicit
                 if explicit is not None
-                else (round(float(row.amount or 0) / tasa, 2) if tasa else None)
+                else (round(float(row.net_amount or 0) / tasa, 2) if tasa else None)
             )
             if cubre is None or cubre <= 0:
                 raise QuoteServiceError(
@@ -1960,19 +2002,188 @@ class WhatsAppPaymentService:
         # no se afirma que sobra saldo — se cuenta como comprometido, no como libre.
         covered_in_payment_currency = self._settled_in_payment_currency(payment)
         unassigned_in_payment_currency = (
-            round((payment.amount or 0) - covered_in_payment_currency, 2)
+            round((payment.net_amount or 0) - covered_in_payment_currency, 2)
             if covered_in_payment_currency is not None
             else 0.0
         )
         return {
             "payment_id": payment.id,
             "amount": payment.amount,
+            "refunded_amount": payment.refunded_amount,
+            "net_amount": payment.net_amount,
             "currency": payment.currency,
             "settled_total": settled,
             "covered_in_payment_currency": covered_in_payment_currency,
             "unassigned_in_payment_currency": unassigned_in_payment_currency,
             "settlements": items,
         }
+
+    #: Hasta cuántos días después del pago se buscan devoluciones candidatas.
+    REFUND_WINDOW = timedelta(days=7)
+
+    def _refund_candidates(self, payment: WhatsAppOutgoingPayment) -> list[dict]:
+        """
+        Entrantes que pueden ser la devolución de este saliente: misma moneda, desde un poco
+        antes hasta 7 días después, sin destino todavía, y del mismo teléfono o con la cédula
+        del beneficiario del saliente en el comprobante (el 636 venía de V-9426135, la misma
+        C.I. a la que se pagó el 5917).
+        """
+        if payment.created_at is None:
+            return []
+        q = self.db.query(WhatsAppIncomingPayment).filter(
+            WhatsAppIncomingPayment.created_at >= payment.created_at - timedelta(hours=1),
+            WhatsAppIncomingPayment.created_at <= payment.created_at + self.REFUND_WINDOW,
+            WhatsAppIncomingPayment.whatsapp_operation_id.is_(None),
+            ~WhatsAppIncomingPayment.is_irrelevant.is_(True),
+            ~exists().where(
+                WhatsAppOutgoingRefund.incoming_payment_id == WhatsAppIncomingPayment.id
+            ),
+            ~exists().where(
+                WhatsAppPaymentAllocation.incoming_payment_id == WhatsAppIncomingPayment.id
+            ),
+        )
+        if payment.currency:
+            q = q.filter(func.upper(WhatsAppIncomingPayment.currency) == payment.currency.upper())
+        cedula = re.sub(r"\D", "", payment.identification or "")
+        senales = [WhatsAppIncomingPayment.client_phone == payment.client_phone]
+        if len(cedula) >= 6:
+            senales.append(WhatsAppIncomingPayment.raw_text.ilike(f"%{cedula}%"))
+            senales.append(WhatsAppIncomingPayment.identification.ilike(f"%{cedula}%"))
+        rows = q.filter(or_(*senales)).order_by(WhatsAppIncomingPayment.created_at).limit(20).all()
+        return [
+            {
+                "incoming_payment_id": r.id,
+                "amount": r.amount,
+                "currency": r.currency,
+                "reference": r.reference,
+                "identification": r.identification,
+                "created_at": r.created_at,
+            }
+            for r in rows
+            if self._credited_to_balance(r.id) <= 0
+        ]
+
+    def refunds_summary(self, payment_id: int) -> dict:
+        """Lo devuelto de un saliente, su neto y los entrantes que podrían ser la devolución."""
+        payment = self._get_or_404("outgoing", payment_id)
+        return {
+            "payment_id": payment.id,
+            "amount": payment.amount,
+            "currency": payment.currency,
+            "refunded_amount": payment.refunded_amount,
+            "net_amount": payment.net_amount,
+            "refunds": [r.dict() for r in payment.refunds],
+            "candidates": self._refund_candidates(payment),
+        }
+
+    def set_refunds(self, payment_id: int, items: list, actor: Optional[User] = None) -> dict:
+        """
+        Reemplaza lo devuelto de un saliente pagado de más. Cada item es
+        {incoming_payment_id?, amount?, note?}: con entrante, el monto por defecto es el suyo;
+        sin entrante (devolución en efectivo o no registrada) la nota es obligatoria.
+
+        Lo devuelto no puede pasar del pago, ni dejar el neto por debajo de lo que el pago ya
+        cubre en sus operaciones: primero se corrige el reparto.
+        """
+        payment = self._get_or_404("outgoing", payment_id)
+        self._assert_not_loan(payment_id)
+        if payment.amount is None:
+            raise QuoteServiceError(
+                "payment_without_amount", "El pago no tiene monto: corrígelo primero", 400
+            )
+
+        nuevas = []
+        vistos = set()
+        for item in items:
+            get = item.get if isinstance(item, dict) else (lambda k, o=item: getattr(o, k, None))
+            inc_id = get("incoming_payment_id")
+            amount = get("amount")
+            note = (get("note") or "").strip() or None
+            if inc_id is not None:
+                if inc_id in vistos:
+                    raise QuoteServiceError(
+                        "refund_duplicated", f"El entrante #{inc_id} está dos veces", 400
+                    )
+                vistos.add(inc_id)
+                inc = self._get_or_404("incoming", inc_id)
+                if (
+                    payment.currency
+                    and inc.currency
+                    and inc.currency.upper() != payment.currency.upper()
+                ):
+                    raise QuoteServiceError(
+                        "refund_currency_mismatch",
+                        f"El entrante #{inc_id} es en {inc.currency} y el pago en "
+                        f"{payment.currency}",
+                        400,
+                    )
+                otro = self._refund_for_incoming(inc_id)
+                if otro is not None and otro.outgoing_payment_id != payment.id:
+                    raise QuoteServiceError(
+                        "payment_is_refund",
+                        f"El entrante #{inc_id} ya es la devolución del saliente "
+                        f"#{otro.outgoing_payment_id}",
+                        409,
+                    )
+                tiene_destino = (
+                    inc.whatsapp_operation_id is not None
+                    or inc.is_irrelevant
+                    or self.db.query(WhatsAppPaymentAllocation.id)
+                    .filter(WhatsAppPaymentAllocation.incoming_payment_id == inc_id)
+                    .first()
+                    is not None
+                    or self._credited_to_balance(inc_id) > 0
+                )
+                if tiene_destino:
+                    raise QuoteServiceError(
+                        "refund_incoming_taken",
+                        f"El entrante #{inc_id} ya tiene destino (operación, saldo o "
+                        "irrelevante): suéltalo antes de usarlo como devolución",
+                        409,
+                    )
+                if amount is None:
+                    amount = inc.amount
+            elif not note:
+                raise QuoteServiceError(
+                    "refund_needs_note",
+                    "Una devolución sin comprobante necesita una nota que diga cómo se devolvió",
+                    400,
+                )
+            if amount is None or float(amount) <= 0:
+                raise QuoteServiceError("invalid_amount", "Lo devuelto debe ser > 0", 400)
+            nuevas.append((inc_id, round(float(amount), 2), note))
+
+        total = round(sum(a for _, a, _ in nuevas), 2)
+        if total > float(payment.amount) + 0.01:
+            raise QuoteServiceError(
+                "refund_exceeds_payment",
+                f"Lo devuelto ({total:.2f}) no puede pasar del pago ({payment.amount:.2f})",
+                400,
+            )
+        usado = self._settled_in_payment_currency(payment)
+        if usado is not None and usado > float(payment.amount) - total + 0.01:
+            raise QuoteServiceError(
+                "refund_below_settled",
+                f"El pago ya cubre {usado:.2f} {payment.currency or ''} en sus operaciones: "
+                f"con {total:.2f} devueltos no le alcanza. Ajusta primero lo que cubre.",
+                409,
+            )
+
+        payment.refunds.clear()
+        self.db.flush()
+        for inc_id, amount, note in nuevas:
+            payment.refunds.append(
+                WhatsAppOutgoingRefund(
+                    incoming_payment_id=inc_id,
+                    amount=amount,
+                    currency=payment.currency,
+                    note=note,
+                    created_by_user_id=actor.id if actor else None,
+                )
+            )
+        self.db.commit()
+        self.db.refresh(payment)
+        return self.refunds_summary(payment.id)
 
     def set_settlements(
         self,
@@ -2135,6 +2346,8 @@ class WhatsAppPaymentService:
         )
         if table == "outgoing" and operation_uuid is not None:
             self._assert_not_loan(payment_id)
+        if table == "incoming" and operation_uuid is not None:
+            self._assert_not_refund(payment_id)
         op = None
         if operation_uuid is not None:
             # NOTA (ver H-8.4 en el informe de la campaña): se intentó un `.with_for_update()`
@@ -2688,6 +2901,7 @@ class WhatsAppPaymentService:
                 self._assert_not_loan(payment_id)
             else:
                 self._assert_not_credited(payment_id)
+                self._assert_not_refund(payment_id)
         orphaned_op = (
             self._resolve_orphan(row, table, payment_id, orphan_action, orphan_note, actor)
             if is_irrelevant
@@ -2823,6 +3037,8 @@ class WhatsAppPaymentService:
         # valuación y sus abonos. Mudar el comprobante dejaría la deuda con quien no la tiene.
         if table == "outgoing":
             self._assert_not_loan(row.id)
+        else:
+            self._assert_not_refund(row.id)
 
     def transfer_client(
         self,

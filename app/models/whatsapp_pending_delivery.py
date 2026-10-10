@@ -69,7 +69,12 @@ class WhatsAppPendingDelivery(UUIDMixin, Base):
 
     @property
     def total_amount(self) -> float:
-        return round(sum(item.amount or 0 for item in (self.items or [])), 2)
+        return round(sum(item.amount or 0 for item in self.active_items), 2)
+
+    @property
+    def active_items(self):
+        """Las operaciones del lote que siguen marcadas (no deshechas una a una)."""
+        return [item for item in (self.items or []) if item.undone_at is None]
 
     def dict(self):
         return {
@@ -77,7 +82,7 @@ class WhatsAppPendingDelivery(UUIDMixin, Base):
             "client_uuid": self.client.uuid if self.client else None,
             "note": self.note,
             "amount": self.total_amount,
-            "operations": len(self.items or []),
+            "operations": len(self.active_items),
             "created_by_username": self.created_by.username if self.created_by else None,
             "created_at": self.created_at,
             "undone_at": self.undone_at,
@@ -124,6 +129,10 @@ class WhatsAppPendingDeliveryItem(UUIDMixin, Base):
     #: que la fila siga siendo legible aunque el enum cambie.
     previous_status = Column(String(12), nullable=True)
     previous_delivery_status = Column(String(12), nullable=True)
+    #: Deshecha sola, sin el resto del lote (el lote de Neurys del 2026-10-09 marcó 38 y sólo
+    #: 10 estaban mal). El lote cuenta como deshecho cuando ya no le queda ninguna en pie.
+    undone_at = Column(DateTime(timezone=True), nullable=True)
+    undone_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
 
     delivery = relationship("WhatsAppPendingDelivery", back_populates="items")
     operation = relationship("WhatsAppOperation", foreign_keys=[whatsapp_operation_id])
@@ -143,4 +152,8 @@ class WhatsAppPendingDeliveryItem(UUIDMixin, Base):
             "previous_uncovered": self.previous_uncovered,
             "previous_uncovered_reason": self.previous_uncovered_reason,
             "previous_collected": self.previous_collected,
+            "operation_created_at": op.created_at if op else None,
+            "operation_from_amount": op.from_amount if op else None,
+            "operation_to_amount": op.to_amount if op else None,
+            "undone_at": self.undone_at,
         }

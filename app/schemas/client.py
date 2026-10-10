@@ -103,3 +103,8 @@ class PendingDeliveryItem(BaseModel):
 class PendingDeliveryCreate(BaseModel):
     operations: List[PendingDeliveryItem]
     note: Optional[str] = None
+
+
+class PendingDeliveryUndo(BaseModel):
+    """Qué operaciones del lote deshacer; vacío o ausente = todas las que siguen marcadas."""
+    operation_uuids: Optional[List[UUID]] = None

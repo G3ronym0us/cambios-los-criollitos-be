@@ -520,6 +520,18 @@ class WhatsAppQuoteService:
                 raise QuoteServiceError("quote_expired", "La cotización expiró", 409)
             op.approved_at = datetime.now(timezone.utc)
 
+        # En un par de efectivo nuestros bolívares no cierran el trato: falta que el cliente
+        # traiga los billetes, y eso lo marca la cola «por cobrar» (`collected_amount`). El
+        # bot pide completar al registrar el saliente, y así nacía COMPLETED con el efectivo
+        # sin cobrar (op 5091 de Neurys: completada en el mismo segundo de su pago). Se queda
+        # PENDING, que es lo que la lleva a «por cobrar».
+        cp = op.currency_pair
+        if cp is not None and cp.settles_in_cash and op.to_collect > 0.01:
+            op.status = WhatsAppOperationStatus.PENDING
+            self.db.commit()
+            self.db.refresh(op)
+            return op
+
         op.status = WhatsAppOperationStatus.COMPLETED
         op.completed_at = datetime.now(timezone.utc)
         # Crea la transacción si aún no existe o actualiza la que nació con el fondo.

@@ -29,6 +29,7 @@ from app.schemas.whatsapp import (
     WhatsAppIrrelevant,
     PaymentAllocationsUpdate,
     OutgoingSettlementsUpdate,
+    OutgoingRefundsUpdate,
     WhatsAppPaymentLink,
     WhatsAppPaymentUpdate,
     WhatsAppPersonalExpense,
@@ -351,6 +352,41 @@ async def set_outgoing_settlements(
     service = WhatsAppPaymentService(db)
     try:
         return service.set_settlements(payment_id, payload.settlements, actor=current_user)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.get("/outgoing/{payment_id}/refunds")
+async def get_outgoing_refunds(
+    payment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """
+    Lo que el cliente devolvió de un saliente pagado de más, su neto, y los entrantes que
+    podrían ser esa devolución. Operador JWT.
+    """
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.refunds_summary(payment_id)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+
+
+@router.put("/outgoing/{payment_id}/refunds")
+async def set_outgoing_refunds(
+    payment_id: int,
+    payload: OutgoingRefundsUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """
+    Registra lo devuelto de un saliente pagado de más (reemplaza la lista). El pago pasa a
+    contar por su neto y el entrante de la devolución queda con destino. Operador JWT.
+    """
+    service = WhatsAppPaymentService(db)
+    try:
+        return service.set_refunds(payment_id, payload.refunds, actor=current_user)
     except QuoteServiceError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message)
 

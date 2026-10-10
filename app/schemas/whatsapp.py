@@ -454,6 +454,22 @@ class OutgoingSettlementsUpdate(BaseModel):
     settlements: List[OutgoingSettlementItem]
 
 
+class OutgoingRefundItem(BaseModel):
+    """
+    Lo que el cliente devolvió de un saliente pagado de más. Con `incoming_payment_id` el
+    monto por defecto es el de ese entrante; sin él, `note` es obligatoria (lo valida el
+    servicio). Va en la moneda del saliente.
+    """
+    incoming_payment_id: Optional[int] = None
+    amount: Optional[float] = Field(None, gt=0)
+    note: Optional[str] = Field(None, max_length=500)
+
+
+class OutgoingRefundsUpdate(BaseModel):
+    """Lista completa de devoluciones del saliente: reemplaza la anterior (vacía = ninguna)."""
+    refunds: List[OutgoingRefundItem]
+
+
 class OrphanDecision(BaseModel):
     """
     Qué hacer con la operación si al desvincular este pago se queda sin ningún comprobante.

@@ -235,8 +235,30 @@ class WhatsAppOutgoingPayment(UUIDMixin, Base):
         back_populates="payment",
         cascade="all, delete-orphan",
     )
+    refunds = relationship(
+        "WhatsAppOutgoingRefund",
+        back_populates="payment",
+        cascade="all, delete-orphan",
+        order_by="WhatsAppOutgoingRefund.id",
+    )
+
+    @property
+    def refunded_amount(self) -> float:
+        """Lo que el cliente devolvió de este pago (se pagó de más), en su moneda."""
+        return round(sum(float(r.amount or 0) for r in self.refunds), 2)
+
+    @property
+    def net_amount(self):
+        """
+        Lo que este pago entregó DE VERDAD: el monto menos lo devuelto. Es el que cuenta
+        para cubrir operaciones; `amount` sigue siendo lo que dice el comprobante.
+        """
+        if self.amount is None:
+            return None
+        return round(float(self.amount) - self.refunded_amount, 2)
 
     def dict(self):
+        net = self.net_amount
         return {
             "id": self.id,
             "uuid": self.uuid,
@@ -254,10 +276,12 @@ class WhatsAppOutgoingPayment(UUIDMixin, Base):
             "operation_uuid": self.operation.uuid if self.operation else None,
             "settled_amount": self.settled_amount,
             "settled_reference_rate": self.settled_reference_rate,
-            # Tasa a la que realmente se pagó esta parte del trato.
+            "refunded_amount": self.refunded_amount,
+            "net_amount": net,
+            # Tasa a la que realmente se pagó esta parte del trato (con lo devuelto descontado).
             "settled_rate": (
-                round(self.amount / self.settled_amount, 6)
-                if self.amount and self.settled_amount else None
+                round(net / self.settled_amount, 6)
+                if net and self.settled_amount else None
             ),
             "is_personal_expense": 1 if self.is_personal_expense else 0,
             "personal_description": self.personal_description,
@@ -322,5 +346,56 @@ class WhatsAppOutgoingSettlement(UUIDMixin, Base):
             "operation_uuid": op.uuid if op else None,
             "operation_status": op.status.value if op and op.status else None,
             "pair_symbol": cp.pair_symbol if cp else None,
+            "created_at": self.created_at,
+        }
+
+
+class WhatsAppOutgoingRefund(UUIDMixin, Base):
+    """
+    Lo que el cliente DEVOLVIÓ de un pago saliente hecho de más.
+
+    El caso (saliente 5917, 2026-09-13): se tecleó en el banco la cifra en COP en vez de la de
+    bolívares y salieron 28.900 Bs por una operación que pedía 8.324,88; el beneficiario
+    devolvió 20.500 Bs minutos después (entrante 636). Sin esto el excedente quedaba como
+    saldo libre del saliente, ofreciéndose a otras operaciones, y la devolución como un
+    entrante suelto sin destino.
+
+    Con una fila aquí el pago cuenta por su NETO (`WhatsAppOutgoingPayment.net_amount`) para
+    cubrir operaciones, y el entrante —si llegó como comprobante— queda con destino. Puede
+    no haber entrante (devolución en efectivo o no registrada): entonces la nota es el rastro.
+    Va en la moneda del saliente.
+    """
+    __tablename__ = "whatsapp_outgoing_refunds"
+
+    id = Column(Integer, primary_key=True, index=True)
+    outgoing_payment_id = Column(
+        Integer, ForeignKey("whatsapp_outgoing_payments.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    #: El comprobante de la devolución, si llegó. Un entrante sólo puede ser una devolución.
+    incoming_payment_id = Column(
+        Integer, ForeignKey("whatsapp_incoming_payments.id", ondelete="SET NULL"),
+        nullable=True, unique=True, index=True,
+    )
+    amount = Column(Float, nullable=False)
+    currency = Column(String(10), nullable=True)
+    note = Column(Text, nullable=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    payment = relationship("WhatsAppOutgoingPayment", back_populates="refunds")
+    incoming_payment = relationship("WhatsAppIncomingPayment", foreign_keys=[incoming_payment_id])
+
+    def dict(self):
+        inc = self.incoming_payment
+        return {
+            "uuid": self.uuid,
+            "outgoing_payment_id": self.outgoing_payment_id,
+            "incoming_payment_id": self.incoming_payment_id,
+            "incoming_reference": inc.reference if inc else None,
+            "incoming_created_at": inc.created_at if inc else None,
+            "amount": self.amount,
+            "currency": self.currency,
+            "note": self.note,
             "created_at": self.created_at,
         }

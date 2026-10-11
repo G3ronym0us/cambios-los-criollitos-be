@@ -21,6 +21,7 @@ from app.repositories.whatsapp_client_repository import WhatsAppClientRepository
 from app.schemas.client import (
     ClientCreate,
     ClientList,
+    ClientPending,
     ClientResponse,
     ClientUpdate,
     PendingDeliveryCreate,
@@ -262,6 +263,22 @@ async def update_client(
     db.commit()
     db.refresh(client)
     return ClientResponse(**client.dict())
+
+
+@router.get("/{client_uuid}/pending", response_model=ClientPending)
+async def get_client_pending(
+    client_uuid: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_moderator_user),
+):
+    """
+    Lo pendiente del cliente —por par y operación a operación—, con la misma regla que el
+    directorio. La ficha no lo calcula: lo lee de aquí.
+    """
+    try:
+        return ClientPendingService(db).client_pending(client_uuid)
+    except QuoteServiceError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
 
 @router.get("/{client_uuid}/pending/deliveries")

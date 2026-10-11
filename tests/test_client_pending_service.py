@@ -8,6 +8,7 @@ pruebas: pasa igual en los dos, que es lo que hace fiable correrlo aquí en SQLi
 
 import os
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 os.environ.setdefault("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
 os.environ.setdefault("JWT_SECRET_KEY", "x" * 40)
@@ -49,6 +50,11 @@ from app.models.whatsapp_payment import (
     WhatsAppPaymentAllocation,
 )
 from app.schemas.whatsapp import WhatsAppOperationResponse
+from app.models.whatsapp_pending_delivery import (
+    DELIVERY_KIND,
+    WhatsAppPendingDelivery,
+    WhatsAppPendingDeliveryItem,
+)
 from app.services.client_pending_service import ClientPendingService
 from app.services.whatsapp_quote_service import QuoteServiceError
 
@@ -252,8 +258,14 @@ class TestAggregation:
 
 
 class TestDeliver:
-    def test_marcar_suma_al_hueco_y_deja_rastro(self, db, world):
-        op = make_op(db, world["client"], world["usd_ves"], amount=100)
+    """
+    Marcar a mano es SÓLO para los pares de efectivo: allí se anota que el cliente trajo los
+    billetes. Cualquier otro par se salda con su comprobante de salida (o de entrada y
+    salida), no con una marca. En producción nunca se marcó otra cosa que USD-VES.
+    """
+
+    def test_marcar_deja_rastro(self, db, world, cash_pair):
+        op = make_op(db, world["client"], cash_pair, amount=100, incoming_at=None)
         db.commit()
 
         batch = ClientPendingService(db).deliver(
@@ -264,56 +276,26 @@ class TestDeliver:
         )
 
         db.refresh(op)
-        assert op.uncovered_amount == 100
-        assert op.uncovered_reason == "CASH"
+        assert op.collected_amount == 100
         assert batch["amount"] == 100
         assert batch["operations"] == 1
         assert batch["created_by_username"] == "op"
-        assert batch["items"][0]["previous_uncovered"] is None
+        assert batch["items"][0]["previous_collected"] is None
 
-    def test_una_segunda_entrega_parcial_se_suma_a_la_primera(self, db, world):
+    def test_un_par_que_no_es_de_efectivo_no_se_marca(self, db, world):
         op = make_op(db, world["client"], world["usd_ves"], amount=100)
-        db.commit()
-        service = ClientPendingService(db)
-
-        service.deliver(
-            world["client"].uuid, [{"operation_uuid": str(op.uuid), "amount": 40}], None,
-            world["actor"],
-        )
-        db.refresh(op)
-        assert op.uncovered_amount == 40
-
-        # El segundo lote no reemplaza al primero: lo acumula.
-        service.deliver(
-            world["client"].uuid, [{"operation_uuid": str(op.uuid), "amount": 60}], None,
-            world["actor"],
-        )
-        db.refresh(op)
-        assert op.uncovered_amount == 100
-
-    def test_no_se_puede_entregar_mas_de_lo_que_se_debe(self, db, world):
-        op = make_op(db, world["client"], world["usd_ves"], amount=100)
-        db.commit()
-
-        with pytest.raises(QuoteServiceError) as exc:
-            ClientPendingService(db).deliver(
-                world["client"].uuid, [{"operation_uuid": str(op.uuid), "amount": 150}], None,
-                world["actor"],
-            )
-        assert exc.value.code == "amount_exceeds_pending"
-
-    def test_sin_beneficiario_no_se_entrega(self, db, world):
-        op = make_op(db, world["client"], world["usd_ves"], beneficiary=None)
         db.commit()
 
         with pytest.raises(QuoteServiceError) as exc:
             ClientPendingService(db).deliver(
                 world["client"].uuid, [{"operation_uuid": str(op.uuid)}], None, world["actor"]
             )
-        assert exc.value.code == "operation_without_beneficiary"
+        assert exc.value.code == "settles_with_receipt"
+        db.refresh(op)
+        assert op.uncovered_amount is None
 
-    def test_una_operacion_de_otro_cliente_no_entra(self, db, world):
-        ajena = make_op(db, world["other"], world["usd_ves"], amount=100)
+    def test_una_operacion_de_otro_cliente_no_entra(self, db, world, cash_pair):
+        ajena = make_op(db, world["other"], cash_pair, amount=100, incoming_at=None)
         db.commit()
 
         with pytest.raises(QuoteServiceError) as exc:
@@ -322,9 +304,9 @@ class TestDeliver:
             )
         assert exc.value.code == "operation_client_mismatch"
 
-    def test_el_lote_es_todo_o_nada(self, db, world):
-        buena = make_op(db, world["client"], world["usd_ves"], amount=100)
-        trabada = make_op(db, world["client"], world["usd_ves"], amount=50, beneficiary=None)
+    def test_el_lote_es_todo_o_nada(self, db, world, cash_pair):
+        buena = make_op(db, world["client"], cash_pair, amount=100, incoming_at=None)
+        normal = make_op(db, world["client"], world["usd_ves"], amount=50)
         db.commit()
 
         with pytest.raises(QuoteServiceError):
@@ -332,7 +314,7 @@ class TestDeliver:
                 world["client"].uuid,
                 [
                     {"operation_uuid": str(buena.uuid)},
-                    {"operation_uuid": str(trabada.uuid)},
+                    {"operation_uuid": str(normal.uuid)},
                 ],
                 None,
                 world["actor"],
@@ -341,13 +323,13 @@ class TestDeliver:
         db.rollback()
         db.refresh(buena)
         # La primera NO quedó marcada aunque su turno pasó sin problemas.
-        assert buena.uncovered_amount is None
+        assert buena.collected_amount is None
 
 
 class TestUndo:
-    def test_deshacer_repone_lo_que_habia_y_no_borra_el_lote(self, db, world):
-        # Ya tenía 30 declarados de antes: deshacer no puede poner cero.
-        op = make_op(db, world["client"], world["usd_ves"], amount=100, uncovered=30)
+    def test_deshacer_repone_lo_que_habia_y_no_borra_el_lote(self, db, world, cash_pair):
+        # Ya tenía 30 cobrados de antes: deshacer no puede poner cero.
+        op = make_op(db, world["client"], cash_pair, amount=100, collected=30, incoming_at=None)
         db.commit()
         service = ClientPendingService(db)
 
@@ -356,16 +338,16 @@ class TestUndo:
             world["actor"],
         )
         db.refresh(op)
-        assert op.uncovered_amount == 100
+        assert op.collected_amount == 100
 
         undone = service.undo(world["client"].uuid, batch["uuid"], world["actor"])
         db.refresh(op)
-        assert op.uncovered_amount == 30
+        assert op.collected_amount == 30
         assert undone["undone_at"] is not None
         assert undone["undone_by_username"] == "op"
 
-    def test_no_se_deshace_dos_veces(self, db, world):
-        op = make_op(db, world["client"], world["usd_ves"], amount=100)
+    def test_no_se_deshace_dos_veces(self, db, world, cash_pair):
+        op = make_op(db, world["client"], cash_pair, amount=100, incoming_at=None)
         db.commit()
         service = ClientPendingService(db)
         batch = service.deliver(
@@ -377,8 +359,8 @@ class TestUndo:
             service.undo(world["client"].uuid, batch["uuid"], world["actor"])
         assert exc.value.code == "already_undone"
 
-    def test_el_lote_de_otro_cliente_no_se_deshace(self, db, world):
-        op = make_op(db, world["client"], world["usd_ves"], amount=100)
+    def test_el_lote_de_otro_cliente_no_se_deshace(self, db, world, cash_pair):
+        op = make_op(db, world["client"], cash_pair, amount=100, incoming_at=None)
         db.commit()
         service = ClientPendingService(db)
         batch = service.deliver(
@@ -389,19 +371,25 @@ class TestUndo:
             service.undo(world["other"].uuid, batch["uuid"], world["actor"])
         assert exc.value.code == "delivery_not_found"
 
-    def test_la_deuda_vuelve_a_aparecer_tras_deshacer(self, db, world):
-        op = make_op(db, world["client"], world["usd_ves"], amount=100)
-        db.commit()
-        service = ClientPendingService(db)
-        batch = service.deliver(
-            world["client"].uuid, [{"operation_uuid": str(op.uuid)}], None, world["actor"]
+    def test_un_lote_viejo_de_entrega_se_sigue_deshaciendo(self, db, world):
+        """
+        Los lotes de entrega (`DELIVERY`, hueco declarado en un par normal) ya no se crean,
+        pero deshacer uno que exista tiene que seguir reponiendo el hueco previo.
+        """
+        op = make_op(db, world["client"], world["usd_ves"], amount=100, uncovered=100)
+        delivery = WhatsAppPendingDelivery(client_id=world["client"].id)
+        delivery.items.append(
+            WhatsAppPendingDeliveryItem(
+                whatsapp_operation_id=op.id, amount=70, kind=DELIVERY_KIND,
+                previous_uncovered=30, previous_uncovered_reason=None,
+            )
         )
-        assert service.pending_by_client_ids([world["client"].id]) == {}
+        db.add(delivery)
+        db.commit()
 
-        service.undo(world["client"].uuid, batch["uuid"], world["actor"])
-        assert service.pending_by_client_ids([world["client"].id])[world["client"].id][0][
-            "amount"
-        ] == 100
+        ClientPendingService(db).undo(world["client"].uuid, delivery.uuid, world["actor"])
+        db.refresh(op)
+        assert op.uncovered_amount == 30
 
 
 class TestUndoParcial:
@@ -411,8 +399,11 @@ class TestUndoParcial:
     volver a marcar las 28 buenas.
     """
 
-    def _lote(self, db, world):
-        ops = [make_op(db, world["client"], world["usd_ves"], amount=a) for a in (100, 50, 20)]
+    def _lote(self, db, world, cash_pair):
+        ops = [
+            make_op(db, world["client"], cash_pair, amount=a, incoming_at=None)
+            for a in (100, 50, 20)
+        ]
         db.commit()
         service = ClientPendingService(db)
         batch = service.deliver(
@@ -421,8 +412,8 @@ class TestUndoParcial:
         )
         return service, batch, ops
 
-    def test_deshace_solo_las_pedidas_y_el_lote_sigue_en_pie(self, db, world):
-        service, batch, (a, b, c) = self._lote(db, world)
+    def test_deshace_solo_las_pedidas_y_el_lote_sigue_en_pie(self, db, world, cash_pair):
+        service, batch, (a, b, c) = self._lote(db, world, cash_pair)
 
         out = service.undo(
             world["client"].uuid, batch["uuid"], world["actor"], operation_uuids=[str(b.uuid)]
@@ -430,16 +421,16 @@ class TestUndoParcial:
 
         for op in (a, b, c):
             db.refresh(op)
-        assert b.uncovered_amount is None
-        assert a.uncovered_amount == 100 and c.uncovered_amount == 20
+        assert b.collected_amount is None
+        assert a.collected_amount == 100 and c.collected_amount == 20
         assert out["undone_at"] is None
         assert out["operations"] == 2
         assert out["amount"] == 120
         deshecho = next(i for i in out["items"] if i["operation_uuid"] == b.uuid)
         assert deshecho["undone_at"] is not None
 
-    def test_al_deshacer_la_ultima_el_lote_queda_deshecho(self, db, world):
-        service, batch, (a, b, c) = self._lote(db, world)
+    def test_al_deshacer_la_ultima_el_lote_queda_deshecho(self, db, world, cash_pair):
+        service, batch, (a, b, c) = self._lote(db, world, cash_pair)
         service.undo(world["client"].uuid, batch["uuid"], world["actor"], operation_uuids=[str(a.uuid)])
 
         out = service.undo(world["client"].uuid, batch["uuid"], world["actor"])
@@ -448,10 +439,10 @@ class TestUndoParcial:
         assert out["operations"] == 0
         for op in (b, c):
             db.refresh(op)
-            assert op.uncovered_amount is None
+            assert op.collected_amount is None
 
-    def test_una_ya_deshecha_no_se_deshace_otra_vez(self, db, world):
-        service, batch, (a, _, _) = self._lote(db, world)
+    def test_una_ya_deshecha_no_se_deshace_otra_vez(self, db, world, cash_pair):
+        service, batch, (a, _, _) = self._lote(db, world, cash_pair)
         service.undo(world["client"].uuid, batch["uuid"], world["actor"], operation_uuids=[str(a.uuid)])
 
         with pytest.raises(QuoteServiceError) as exc:
@@ -807,18 +798,6 @@ class TestParesDeEfectivo:
         assert op.collected_amount == 100
         assert batch["operations"] == 1
 
-    def test_en_un_par_normal_el_beneficiario_se_sigue_exigiendo(self, db, world, cash_pair):
-        """La exención es del efectivo, no de todos: allí sí vamos a mandarle plata a alguien."""
-        op = make_op(db, world["client"], world["usd_ves"], amount=100, beneficiary=None)
-        db.commit()
-
-        with pytest.raises(QuoteServiceError) as exc:
-            ClientPendingService(db).deliver(
-                world["client"].uuid, [{"operation_uuid": str(op.uuid)}], None, world["actor"]
-            )
-        assert exc.value.code == "operation_without_beneficiary"
-
-
 class TestCobroDelEfectivo:
     """
     Marcar que el CLIENTE pagó, que es el gesto de un par de efectivo.
@@ -933,31 +912,6 @@ class TestCobroDelEfectivo:
         db.refresh(op)
         assert op.uncovered_amount is None
 
-    def test_un_lote_puede_llevar_un_cobro_y_una_entrega(self, db, world, cash_pair):
-        """
-        Un cliente tiene las dos cosas a la vez y salda de una vez. El gesto lo decide el par
-        de cada operación, así que cada fila escribe en su columna.
-        """
-        efectivo = make_op(db, world["client"], cash_pair, amount=100, incoming_at=None)
-        normal = make_op(db, world["client"], world["usd_ves"], amount=70)
-        db.commit()
-
-        batch = ClientPendingService(db).deliver(
-            world["client"].uuid,
-            [
-                {"operation_uuid": str(efectivo.uuid)},
-                {"operation_uuid": str(normal.uuid)},
-            ],
-            None,
-            world["actor"],
-        )
-
-        db.refresh(efectivo)
-        db.refresh(normal)
-        assert (efectivo.collected_amount, efectivo.uncovered_amount) == (100, None)
-        assert (normal.uncovered_amount, normal.collected_amount) == (70, None)
-        assert {item["kind"] for item in batch["items"]} == {"COLLECTION", "DELIVERY"}
-
 
 class TestLoQueLlegaAlFront:
     """Lo que la operación serializa: sin esto la pantalla no puede aplicar la regla."""
@@ -987,3 +941,41 @@ class TestLoQueLlegaAlFront:
         assert response.pending_amount == 35
         assert response.settles_in_cash is True
         assert response.first_incoming_payment_at is None
+
+
+class TestClientPending:
+    """La cola de UN cliente, que es lo que la ficha lee en vez de calcularlo."""
+
+    def test_devuelve_las_operaciones_con_lo_que_falta_de_la_mas_vieja_a_la_nueva(
+        self, db, world, cash_pair
+    ):
+        nueva = make_op(db, world["client"], world["usd_ves"], amount=100, uncovered=30)
+        vieja = make_op(
+            db, world["client"], cash_pair, amount=40, collected=10, incoming_at=None,
+            created_at=NOW - timedelta(days=3),
+        )
+        make_op(db, world["client"], world["usd_ves"], status=WhatsAppOperationStatus.COMPLETED)
+        make_op(db, world["other"], world["usd_ves"])
+        db.commit()
+
+        result = ClientPendingService(db).client_pending(world["client"].uuid)
+
+        assert [
+            (o["uuid"], o["outstanding_amount"]) for o in result["operations"]
+        ] == [(vieja.uuid, 30), (nueva.uuid, 70)]
+        assert result["operations"][0]["pending_since"] is not None
+        assert {e["pair_symbol"]: e["amount"] for e in result["by_pair"]} == {
+            "USD-COP efectivo": 30,
+            "USD/VES": 70,
+        }
+
+    def test_sin_deuda_devuelve_listas_vacias(self, db, world):
+        assert ClientPendingService(db).client_pending(world["other"].uuid) == {
+            "by_pair": [],
+            "operations": [],
+        }
+
+    def test_cliente_inexistente_es_404(self, db, world):
+        with pytest.raises(QuoteServiceError) as exc:
+            ClientPendingService(db).client_pending(uuid4())
+        assert exc.value.http_status == 404

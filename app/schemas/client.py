@@ -12,6 +12,8 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
+from app.schemas.whatsapp import WhatsAppOperationResponse
+
 
 class ClientPendingByPair(BaseModel):
     """
@@ -34,6 +36,21 @@ class ClientPendingByPair(BaseModel):
     oldest_at: Optional[datetime] = None
     payout_currency: Optional[str] = None
     payout_amount: Optional[float] = None
+
+
+class ClientPendingOperation(WhatsAppOperationResponse):
+    """Una operación de la cola del cliente, con lo que el servidor calculó de ella."""
+    #: Lo que falta, del lado que toca: lo nuestro en un par normal, el efectivo del
+    #: cliente en uno de efectivo. En la moneda del valor.
+    outstanding_amount: float
+    #: Desde cuándo espera: el primer entrante, si no la primera salida, si no la operación.
+    pending_since: Optional[datetime] = None
+
+
+class ClientPending(BaseModel):
+    """Lo pendiente de un cliente: agregado por par y la cola, de la más vieja a la nueva."""
+    by_pair: List[ClientPendingByPair] = []
+    operations: List[ClientPendingOperation] = []
 
 
 class ClientResponse(BaseModel):

@@ -98,8 +98,7 @@ def ves_rates(db):
     db.flush()
     # `get_cached_bcv_rate` cachea en una global del módulo; sin limpiarla, la tasa de un
     # test se cuela en el siguiente.
-    bcv_service._cached_rate = None
-    bcv_service._cached_expiry = 0.0
+    bcv_service._reset_cache_for_test()
 
 
 @pytest.fixture

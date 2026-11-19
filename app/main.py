@@ -6,7 +6,7 @@ from typing import List, Optional
 from datetime import datetime
 from contextlib import asynccontextmanager
 from app.services.scraper_service import BinanceP2PScraperService
-from app.routers import scraping, auth, currency, currency_pair, binance, rates, transaction, user, commission_config, fund, notifications, whatsapp, clients, client_accounts, operations, payments, analyses, admin
+from app.routers import scraping, auth, currency, currency_pair, binance, rates, transaction, user, commission_config, fund, notifications, whatsapp, clients, client_accounts, operations, payments, analyses, admin, bcv
 from app.core.errors import ServerErrorsAsJSON
 from app.database.connection import get_db
 
@@ -95,6 +95,7 @@ app.include_router(commission_config.router)
 app.include_router(fund.router)
 app.include_router(notifications.router)
 app.include_router(whatsapp.router)
+app.include_router(bcv.router)
 app.include_router(clients.router)
 app.include_router(client_accounts.router)
 app.include_router(operations.router)

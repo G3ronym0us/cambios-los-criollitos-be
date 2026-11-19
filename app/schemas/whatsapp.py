@@ -3,6 +3,8 @@ from datetime import datetime
 from typing import Optional, List, Literal
 from uuid import UUID
 
+from app.schemas.bcv import BcvRateResponse
+
 
 # ===== Client =====
 
@@ -722,15 +724,7 @@ class WhatsAppCorrectedPayment(BaseModel):
 
 
 # ===== BCV =====
-
-class BcvRateResponse(BaseModel):
-    rate: float
-    source: str
-    fetched_at: datetime
-
-    class Config:
-        from_attributes = True
-
+# `BcvRateResponse` vive en app.schemas.bcv y se re-exporta aquí por compatibilidad.
 
 # ===== Reparto del margen de una operación =====
 

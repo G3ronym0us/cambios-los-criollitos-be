@@ -82,13 +82,27 @@ def historical_convert(
     return float(converted), rate_at
 
 
-def historical_bcv(db: Session, at: datetime) -> tuple[Optional[float], Optional[datetime]]:
-    row = (
+def historical_bcv_row(db: Session, at: datetime, currency: str = "USD") -> Optional[BcvRate]:
+    """
+    Registro BCV vigente inmediatamente antes de `at` para la moneda pedida.
+
+    Filtrar por `currency` no es opcional: USD y EUR son series distintas y
+    sin el filtro una consulta en euros devolvería la del dólar (o al revés).
+    """
+    return (
         db.query(BcvRate)
-        .filter(BcvRate.fetched_at <= at)
+        .filter(BcvRate.currency == currency, BcvRate.fetched_at <= at)
         .order_by(BcvRate.fetched_at.desc())
         .first()
     )
+
+
+def historical_bcv(
+    db: Session,
+    at: datetime,
+    currency: str = "USD",
+) -> tuple[Optional[float], Optional[datetime]]:
+    row = historical_bcv_row(db, at, currency)
     if row is None or row.rate <= 0:
         return None, None
     return float(row.rate), row.fetched_at

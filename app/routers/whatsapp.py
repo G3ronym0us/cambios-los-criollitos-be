@@ -56,7 +56,7 @@ from app.schemas.operation_match import (
 )
 from app.services.analysis_log_service import AnalysisLogService
 from app.services.bank_email_service import BankEmailService
-from app.services.bcv_service import fetch_bcv_rate, get_cached_bcv_rate
+from app.services.bcv_service import fetch_bcv_rate, get_cached_bcv_rate, latest_bcv_rate
 from app.services.operation_match_service import (
     ForwardedCriteria,
     OperationMatchService,
@@ -778,12 +778,10 @@ def get_bcv(
     db: Session = Depends(get_db),
     principal: BotPrincipal = Depends(get_bot_principal),
 ):
-    from app.models.bcv_rate import BcvRate
-    latest = db.query(BcvRate).order_by(BcvRate.fetched_at.desc()).first()
+    latest = latest_bcv_rate(db, "USD")
     if latest is None:
         return None
     return BcvRateResponse.model_validate(latest.dict())
-
 
 @router.post("/bcv/refresh", response_model=Optional[BcvRateResponse])
 async def refresh_bcv(
@@ -791,9 +789,8 @@ async def refresh_bcv(
     principal: BotPrincipal = Depends(get_bot_principal),
 ):
     """Forzar refresh sincrónico de la tasa BCV (útil para ops sin Celery worker)."""
-    rate = await fetch_bcv_rate(db)
+    rate = await fetch_bcv_rate(db, "USD")
     if rate is None:
         return None
-    from app.models.bcv_rate import BcvRate
-    latest = db.query(BcvRate).order_by(BcvRate.fetched_at.desc()).first()
+    latest = latest_bcv_rate(db, "USD")
     return BcvRateResponse.model_validate(latest.dict()) if latest else None
